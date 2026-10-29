@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package siteflow_proto;
+
+message Empty {}
+
+// Backend-only requests. Never carry worker capabilities or lease tokens.
+message SecretProviderRequest {
+  int64 job_id = 1;
+  int64 site_id = 2;
+  string step_key = 3;
+  string site_origin = 4;
+  string match_mode = 5;
+  string custom_match = 6;
+  string service_hint = 7;
+  string username_hint = 8;
+}
+message CredentialResult {
+  string username = 1;
+  string password = 2;
+}
+message TotpResult { string code = 1; }
+service SecretProvider {
+  rpc ResolveCredential(SecretProviderRequest) returns (CredentialResult);
+  rpc GenerateTotp(SecretProviderRequest) returns (TotpResult);
+}
+
+message HealthStatus {
+  bool ok = 1;
+  string plugin_id = 2;
+  string version = 3;
+  uint32 protocol_version = 4;
+  string message = 5;
+}
+
+message Manifest {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  uint32 protocol_version = 4;
+  string entrypoint = 5;
+  repeated string capabilities = 6;
+}
+
+message FeatureDefinition {
+  string key = 1;
+  string name = 2;
+  string category = 3;
+  string cardinality = 4;
+  uint32 version = 5;
+  string description = 6;
+  string config_schema_json = 7;
+  repeated string requires = 8;
+}
+
+message FeatureList {
+  repeated FeatureDefinition features = 1;
+}
+
+message CaptchaMethod {
+  string key = 1;
+  string label = 2;
+  string description = 3;
+  bool supports_vision = 4;
+}
+
+message CaptchaMethodList {
+  repeated CaptchaMethod methods = 1;
+}
+
+message ReloadRequest {
+  string reason = 1;
+}
+
+message ReloadResult {
+  bool ok = 1;
+  string version = 2;
+  string message = 3;
+}
+
+message BrokerInfo {
+  string url = 1;
+  string token = 2;
+}
+
+message StepRequest {
+  string execution_id = 1;
+  string plugin_id = 2;
+  string feature_key = 3;
+  string config_json = 4;
+  string site_origin = 5;
+  string current_url = 6;
+  uint32 deadline_ms = 7;
+  BrokerInfo broker = 8;
+}
+
+message StepResult {
+  string status = 1;
+  string message = 2;
+  string data_json = 3;
+}
+
+message CaptchaRequest {
+  string method_key = 1;
+  bytes image = 2;
+  string charset = 3;
+  uint32 length = 4;
+}
+
+message CaptchaResult {
+  string text = 1;
+  float confidence = 2;
+  int32 margin = 3;
+  string meta_json = 4;
+}
+
+service PluginControl {
+  rpc Health(Empty) returns (HealthStatus);
+  rpc GetManifest(Empty) returns (Manifest);
+  rpc ListFeatures(Empty) returns (FeatureList);
+  rpc ListCaptchaMethods(Empty) returns (CaptchaMethodList);
+  rpc Reload(ReloadRequest) returns (ReloadResult);
+}
+
+service PluginExecution {
+  rpc ExecuteStep(StepRequest) returns (StepResult);
+  rpc RecognizeCaptcha(CaptchaRequest) returns (CaptchaResult);
+}

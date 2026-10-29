@@ -1,0 +1,7 @@
+[
+  {"name": "timeout", "mode": "long", "timeout": 2},
+  {"name": "cancel", "mode": "long", "timeout": 30},
+  {"name": "delayed-action", "mode": "delayed", "timeout": 2},
+  {"name": "revoke", "mode": "long", "timeout": 30},
+  {"name": "unavailable", "mode": "drop", "timeout": 5}
+]

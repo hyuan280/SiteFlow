@@ -1,0 +1,27 @@
+FROM node:22-alpine
+
+ENV NODE_ENV=production \
+    HOME=/data \
+    BW_PORT=8090
+
+WORKDIR /app
+
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ARG BW_CLI_VERSION=2026.10.0
+RUN npm install -g --no-audit --no-fund --registry="$NPM_REGISTRY" "@bitwarden/cli@${BW_CLI_VERSION}" \
+    && npm cache clean --force \
+    && rm -rf /data/.npm /root/.npm /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-* \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg \
+    && find /usr/local/lib/node_modules/@bitwarden -type f \( -name '*.map' -o -name '*.ts' \) -delete
+
+COPY bitwarden/server.mjs /app/server.mjs
+
+RUN mkdir -p /data /app && chown -R node:node /data /app
+USER node
+
+EXPOSE 8090
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+    CMD node -e "fetch('http://127.0.0.1:8090/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "/app/server.mjs"]

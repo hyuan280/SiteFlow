@@ -1,0 +1,35 @@
+{
+  "format": "siteflow.export",
+  "version": 1,
+  "kind": "sites",
+  "sites": [
+    {
+      "name": "Demo Plugin End-to-End", "base_url": "http://demo-site:8099",
+      "enabled": false, "support_resign": false, "bitwarden_enabled": false,
+      "credential_provider_id": "plugin.demo",
+      "template_name": null, "lane_policy": "general", "tags": ["demo"],
+      "notes": "Sequential local scenarios. Popup following is step-local; frame document opens top-level because broker iframe traversal is unsupported.",
+      "steps": [
+        {"step_key": "login_open", "feature_type": "flow.open", "position": 100, "config": {"url": "{base_url}/login"}},
+        {"step_key": "login_totp", "feature_type": "challenge.2fa", "position": 200, "config": {"totp_provider_id": "plugin.demo", "service_hint": "SiteFlow Demo", "username_hint": "admin", "code_selector": ["input[name='code']"], "submit_selector": []}},
+        {"step_key": "login_submit", "feature_type": "auth.form_login", "position": 300, "config": {"success_selector": ["#login-success"]}},
+        {"step_key": "login_assert", "feature_type": "plugin.demo.demo_checkin", "position": 400, "config": {"button_selector": ["#login-confirm"], "success_selector": ["#login-success"], "expected_text": "Demo login verified: credentials and 2FA"}},
+        {"step_key": "checkin_open", "feature_type": "action.navigate", "position": 1000, "config": {"url": "{base_url}/checkin"}},
+        {"step_key": "checkin_verify", "feature_type": "plugin.demo.demo_checkin", "position": 2000, "config": {"button_selector": ["#sign"], "success_selector": ["#success"], "expected_text": "Demo checkin successful"}},
+        {"step_key": "form_open", "feature_type": "action.navigate", "position": 3000, "config": {"url": "{base_url}/form"}},
+        {"step_key": "form_fill", "feature_type": "action.fill", "position": 4000, "config": {"selector": ["#message"], "value": "Local demo"}},
+        {"step_key": "form_verify", "feature_type": "plugin.demo.demo_checkin", "position": 5000, "config": {"button_selector": ["#sign"], "success_selector": ["#success"], "expected_text": "Demo form submitted"}},
+        {"step_key": "popup_open", "feature_type": "action.navigate", "position": 6000, "config": {"url": "{base_url}/popup"}},
+        {"step_key": "popup_verify", "feature_type": "plugin.demo.demo_checkin", "position": 7000, "config": {"popup_selector": ["#popup"], "button_selector": ["#sign"], "success_selector": ["#success"], "expected_text": "Demo checkin successful"}},
+        {"step_key": "frame_open", "feature_type": "action.navigate", "position": 8000, "config": {"url": "{base_url}/frame"}},
+        {"step_key": "frame_verify", "feature_type": "plugin.demo.demo_checkin", "position": 9000, "config": {"button_selector": ["#sign"], "success_selector": ["#success"], "expected_text": "Demo checkin successful"}},
+        {"step_key": "captcha_150_open", "feature_type": "action.navigate", "position": 10000, "config": {"url": "{base_url}/captcha"}},
+        {"step_key": "captcha_150_recognize", "feature_type": "challenge.image_captcha", "position": 11000, "config": {"image_selector": ["#captcha"], "input_selector": ["#answer"], "captcha_method": "plugin.demo.gd5", "charset": "alnum", "length": 6}},
+        {"step_key": "captcha_150_verify", "feature_type": "plugin.demo.demo_checkin", "position": 12000, "config": {"button_selector": ["#sign"], "success_selector": ["#success"], "expected_text": "Captcha verified"}},
+        {"step_key": "captcha_151_open", "feature_type": "action.navigate", "position": 13000, "config": {"url": "{base_url}/captcha?scaled=1"}},
+        {"step_key": "captcha_151_recognize", "feature_type": "challenge.image_captcha", "position": 14000, "config": {"image_selector": ["#captcha"], "input_selector": ["#answer"], "captcha_method": "plugin.demo.gd5", "charset": "alnum", "length": 6}},
+        {"step_key": "captcha_151_verify", "feature_type": "plugin.demo.demo_checkin", "position": 15000, "config": {"button_selector": ["#sign"], "success_selector": ["#success"], "expected_text": "Captcha verified"}}
+      ]
+    }
+  ]
+}

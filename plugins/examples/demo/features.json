@@ -1,0 +1,48 @@
+{
+  "features": [
+    {
+      "key": "plugin.demo.demo_checkin",
+      "name": "Demo 示例签到",
+      "category": "sign",
+      "cardinality": "multiple",
+      "version": 1,
+      "description": "示例插件签到：点击配置的按钮，并可读取成功文本。",
+      "config_schema": {
+        "type": "object",
+        "properties": {
+          "popup_selector": {
+            "type": "array", "items": {"type": "string"}, "default": [],
+            "description": "Optional same-origin popup opener, followed within this step."
+          },
+          "expected_text": {
+            "type": "string", "default": "",
+            "description": "Exact expected success text; mismatch fails the step."
+          },
+          "button_selector": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "#sign"
+            ],
+            "title": "签到按钮选择器"
+          },
+          "success_selector": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "title": "成功文本选择器"
+          }
+        },
+        "required": [
+          "button_selector"
+        ],
+        "additionalProperties": false
+      },
+      "requires": []
+    }
+  ]
+}

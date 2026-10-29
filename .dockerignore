@@ -1,0 +1,17 @@
+.git
+.venv
+.env
+data
+docs
+scripts
+frontend/node_modules
+**/__pycache__
+**/*.pyc
+.pytest_cache
+local
+*.db
+*.sqlite
+*.log
+.build-resources/**
+!.build-resources/worker/
+!.build-resources/worker/**

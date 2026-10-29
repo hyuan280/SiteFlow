@@ -1,0 +1,27 @@
+:80 {
+	encode gzip
+
+	@api path /api/*
+	handle @api {
+		@secrets path /api/v1/internal/*
+		respond @secrets 404
+		@plugin_runtime path_regexp plugin_control ^/api/v1/plugin-runtime/(register|heartbeat|unregister)/?$
+		respond @plugin_runtime 404
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		header Cache-Control "no-cache"
+		file_server
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

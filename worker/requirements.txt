@@ -1,0 +1,10 @@
+cloakbrowser==0.6.3
+playwright==1.64.0
+fastapi==0.143.1
+uvicorn==0.54.0
+httpx==0.28.1
+websockets==17.2
+ddddocr==1.6.1
+grpcio==1.85.0
+protobuf==6.33.6
+mss==10.1.0

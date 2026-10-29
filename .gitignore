@@ -1,0 +1,29 @@
+data/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.venv/
+backend/data/
+.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# local-only archives (machine-specific results, paths, credentials)
+local/
+.build-resources/
+
+# runtime databases / logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.DS_Store
+.ruff_cache/
+.mypy_cache/
+*.tsbuildinfo
+coverage/
+*.swp
+*.swo

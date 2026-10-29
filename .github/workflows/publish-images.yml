@@ -1,0 +1,129 @@
+name: Publish Component Image
+
+on:
+  push:
+    tags:
+      - api-v*
+      - worker-v*
+      - web-v*
+      - bitwarden-v*
+  workflow_dispatch:
+    inputs:
+      component:
+        description: Component to publish
+        required: true
+        type: choice
+        options:
+          - api
+          - worker
+          - web
+          - bitwarden
+      version:
+        description: Image version (for example v1.0 or v1.0.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.inputs.component || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve Component and Version
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_COMPONENT: ${{ inputs.component }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == push ]]; then
+            component="${REF_NAME%%-v*}"
+            version="${REF_NAME#"$component"-}"
+          else
+            component="$INPUT_COMPONENT"
+            version="$INPUT_VERSION"
+          fi
+          case "$component" in
+            api|worker|web|bitwarden) ;;
+            *) echo 'Unsupported component' >&2; exit 1 ;;
+          esac
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo 'Expected a version such as v1.0, v1.0.1 or v1.0-rc.1' >&2
+            exit 1
+          fi
+          image="ghcr.io/${REPOSITORY_OWNER,,}/siteflow-$component"
+          {
+            echo "component=$component"
+            echo "version=$version"
+            echo "image=$image"
+            echo 'tags<<TAGS'
+            echo "$image:$version"
+            if [[ "$version" != *-* ]]; then echo "$image:latest"; fi
+            echo 'TAGS'
+          } >> "$GITHUB_OUTPUT"
+      - name: Check Browser Redistribution Authorization
+        if: steps.release.outputs.component == 'worker'
+        env:
+          AUTHORIZED: ${{ vars.CLOAKBROWSER_REDISTRIBUTION_ALLOWED }}
+        run: |
+          if [[ "$AUTHORIZED" != true ]]; then
+            echo 'Worker bundles the CloakBrowser binary. Confirm upstream redistribution rights, then set repository variable CLOAKBROWSER_REDISTRIBUTION_ALLOWED=true.' >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.release.outputs.component == 'web'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build Frontend
+        if: steps.release.outputs.component == 'web'
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run type-check
+          npm run build
+      - name: Cache Worker Resources
+        if: steps.release.outputs.component == 'worker'
+        uses: actions/cache@v4
+        with:
+          path: .build-resources/worker/amd64
+          key: worker-amd64-${{ hashFiles('ops/download-worker-resources.sh', 'ops/corefonts.sha256', 'ops/install-worker-browser.py') }}
+      - name: Prepare Worker Resources
+        if: steps.release.outputs.component == 'worker'
+        run: bash ops/download-worker-resources.sh amd64
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ops/Dockerfile.${{ steps.release.outputs.component }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.release.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+          build-args: |
+            PIP_INDEX_URL=https://pypi.org/simple
+          cache-from: type=gha,scope=${{ steps.release.outputs.component }}
+          cache-to: type=gha,mode=max,scope=${{ steps.release.outputs.component }}

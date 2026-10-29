@@ -1,0 +1,69 @@
+name: siteflow
+
+services:
+  api:
+    image: ghcr.io/${SITEFLOW_IMAGE_OWNER:-hyuan280}/siteflow-api:${SITEFLOW_API_VERSION:-latest}
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-sqlite:////app/data/siteflow.db}"
+      SITEFLOW_COOKIE_SECURE: "${SITEFLOW_COOKIE_SECURE:-false}"
+      SITEFLOW_WORKER_URL: http://worker:6300
+      SITEFLOW_ARTIFACT_ROOT: /app/artifacts
+    volumes:
+      - siteflow_data:/app/data
+      - siteflow_artifacts:/app/artifacts
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  worker:
+    image: ghcr.io/${SITEFLOW_IMAGE_OWNER:-hyuan280}/siteflow-worker:${SITEFLOW_WORKER_VERSION:-latest}
+    env_file:
+      - .env
+    environment:
+      SITEFLOW_WORKER_DATA: /app/data
+      SITEFLOW_ARTIFACT_ROOT: /app/artifacts
+      SITEFLOW_PLUGIN_BROKER_URL: http://worker:6300/plugin-broker
+      CLOAKBROWSER_AUTO_UPDATE: "false"
+    volumes:
+      - worker_data:/app/data
+      - siteflow_artifacts:/app/artifacts
+    shm_size: "1gb"
+    expose:
+      - "6300"
+      - "6310"
+      - "6311"
+      - "6312"
+      - "6313"
+    restart: unless-stopped
+
+  bitwarden:
+    image: ghcr.io/${SITEFLOW_IMAGE_OWNER:-hyuan280}/siteflow-bitwarden:${SITEFLOW_BITWARDEN_VERSION:-latest}
+    env_file:
+      - .env
+    environment:
+      HOME: /data
+      BW_PORT: "8090"
+    volumes:
+      - bitwarden_data:/data
+    expose:
+      - "8090"
+    restart: unless-stopped
+
+  web:
+    image: ghcr.io/${SITEFLOW_IMAGE_OWNER:-hyuan280}/siteflow-web:${SITEFLOW_WEB_VERSION:-latest}
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    ports:
+      - "${SITEFLOW_WEB_PORT:-8088}:80"
+    restart: unless-stopped
+
+volumes:
+  siteflow_data:
+  worker_data:
+  siteflow_artifacts:
+  bitwarden_data:

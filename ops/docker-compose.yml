@@ -1,0 +1,152 @@
+name: siteflow
+
+services:
+  api:
+    image: siteflow-api
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile.api
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-sqlite:////app/data/siteflow.db}"
+      SITEFLOW_COOKIE_SECURE: "${SITEFLOW_COOKIE_SECURE:-false}"
+      SITEFLOW_WORKER_URL: "http://worker:6300"
+      SITEFLOW_ARTIFACT_ROOT: /app/artifacts
+      SITEFLOW_PLUGIN_TOKENS: '${SITEFLOW_PLUGIN_TOKENS:-{"demo":"siteflow-demo-token"}}'
+    volumes:
+      - siteflow_data:/app/data
+      - siteflow_artifacts:/app/artifacts
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Demo gRPC plugin. It registers itself with the API, then waits for the
+  # first-time check and permission approval in 插件管理.
+  plugin-demo:
+    build:
+      context: ..
+      dockerfile: plugins/examples/demo/Dockerfile
+    image: siteflow-plugin-demo
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      SITEFLOW_CONTROL_URL: "http://api:8000"
+      SITEFLOW_PLUGIN_ID: demo
+      SITEFLOW_PLUGIN_ENDPOINT: "plugin-demo:7000"
+      SITEFLOW_PLUGIN_TOKEN_FILE: ""
+      SITEFLOW_PLUGIN_TOKEN: "${SITEFLOW_PLUGIN_DEMO_TOKEN:-siteflow-demo-token}"
+    expose:
+      - "7000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cpus: "0.25"
+    mem_limit: "256m"
+    pids_limit: 128
+    restart: unless-stopped
+
+  demo-site:
+    build:
+      context: ..
+      dockerfile: plugins/examples/demo/site.Dockerfile
+    ports:
+      - "127.0.0.1:8099:8099"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    restart: unless-stopped
+
+  worker:
+    image: siteflow-worker
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile.worker
+    env_file:
+      - ../.env
+    environment:
+      SITEFLOW_WORKER_DATA: /app/data
+      SITEFLOW_ARTIFACT_ROOT: /app/artifacts
+      SITEFLOW_PLUGIN_BROKER_URL: "http://worker:6300/plugin-broker"
+      CLOAKBROWSER_AUTO_UPDATE: "false"
+    volumes:
+      - worker_data:/app/data
+      - siteflow_artifacts:/app/artifacts
+    shm_size: "1gb"
+    expose:
+      - "6300"
+      - "6310"
+      - "6311"
+      - "6312"
+      - "6313"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6300/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # Optional Bitwarden CLI HTTP wrapper. SiteFlow detects this service at
+  # http://bitwarden:8090 unless configured with env/DB overrides.
+  bitwarden:
+    image: siteflow-bitwarden
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile.bitwarden
+    env_file:
+      - ../.env
+    environment:
+      HOME: /data
+      BW_PORT: "8090"
+    volumes:
+      - bitwarden_data:/data
+    expose:
+      - "8090"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8090/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # Run ops/build.sh first: the web image copies the host-built frontend/dist.
+  web:
+    image: siteflow-web
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile.web
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    ports:
+      - "8088:80"
+    restart: unless-stopped
+
+volumes:
+  siteflow_data:
+  worker_data:
+  siteflow_artifacts:
+  bitwarden_data:

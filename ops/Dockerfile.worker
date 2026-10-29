@@ -1,0 +1,64 @@
+FROM python:3.12-slim-bookworm
+
+# Standalone headed browser runtime; no Manager or stock Playwright browser.
+ARG TARGETARCH
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+COPY ops/debian.sources /etc/apt/sources.list.d/debian.sources
+RUN --mount=type=bind,source=.build-resources/worker/${TARGETARCH},target=/tmp/worker-assets \
+    cd /tmp/worker-assets && sha256sum -c kasmvnc.sha256 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates xdotool xclip procps \
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdbus-1-3 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
+        libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+        libcairo2 libasound2 libx11-xcb1 libfontconfig1 libx11-6 \
+        libxcb1 libxext6 libxshmfence1 libgtk-3-0 libxss1 libxtst6 \
+        fonts-liberation fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+        fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf \
+        libgl1-mesa-dri libegl-mesa0 cabextract \
+    && apt-get install -y --no-install-recommends /tmp/worker-assets/kasmvnc.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Same core fonts as Manager; archives are host-cached and checksum-pinned.
+RUN --network=none \
+    --mount=type=bind,source=.build-resources/worker/${TARGETARCH},target=/tmp/font-assets \
+    --mount=type=bind,source=ops/corefonts.sha256,target=/tmp/corefonts.sha256 \
+    set -eu; cd /tmp/font-assets && sha256sum -c /tmp/corefonts.sha256 \
+    && mkdir -p /usr/local/share/fonts/msttcorefonts /usr/share/doc/siteflow-corefonts \
+    && for archive in *.exe; do \
+         cabextract -q -F '*.ttf' -d /usr/local/share/fonts/msttcorefonts "$archive"; \
+         cabextract -q -F '*.TXT' -d /usr/share/doc/siteflow-corefonts "$archive"; \
+       done \
+    && fc-cache -f
+
+# Playwright's Manager image also includes X11 bitmap and Type1 fonts.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xfonts-base xfonts-scalable \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CLOAKBROWSER_AUTO_UPDATE=false \
+    CLOAKBROWSER_VERSION=146.0.7680.177.5 \
+    CLOAKBROWSER_CACHE_DIR=/root/.cloakbrowser \
+    SITEFLOW_WORKER_DATA=/app/data \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY worker/requirements.txt /app/worker-requirements.txt
+RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" -r /app/worker-requirements.txt
+RUN --network=none \
+    --mount=type=bind,source=.build-resources/worker/${TARGETARCH},target=/tmp/browser-assets \
+    --mount=type=bind,source=ops/install-worker-browser.py,target=/tmp/install-worker-browser.py \
+    python /tmp/install-worker-browser.py
+# Fail closed if the bundled browser is missing; no runtime downloads or key lookup.
+ENV CLOAKBROWSER_BINARY_PATH=/root/.cloakbrowser/chromium-146.0.7680.177.5/chrome
+COPY worker /app/worker
+COPY proto/siteflow_proto /app/siteflow_proto
+
+EXPOSE 6300 6310-6313
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=5 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6300/health', timeout=2)"
+
+ENTRYPOINT ["uvicorn", "worker.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "6300"]

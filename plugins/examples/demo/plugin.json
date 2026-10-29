@@ -1,0 +1,14 @@
+{
+  "id": "demo",
+  "name": "Demo Plugin",
+  "version": "1.0.0",
+  "protocol_version": 1,
+  "entrypoint": "plugin:register",
+  "capabilities": [
+    "features",
+    "captcha_methods",
+    "browser_actions",
+    "secret.credentials",
+    "secret.totp"
+  ]
+}
