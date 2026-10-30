@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     )
 
     master_key: SecretStr | None = Field(default=None, validation_alias="SITEFLOW_MASTER_KEY")
+    browser_token: SecretStr | None = Field(default=None, validation_alias="SITEFLOW_BROWSER_TOKEN")
     proxy_url: SecretStr | None = Field(default=None, validation_alias="SITEFLOW_PROXY_URL")
     twofauth_url: str | None = Field(default=None, validation_alias="SITEFLOW_TWOFAUTH_URL")
     twofauth_token: SecretStr | None = Field(default=None, validation_alias="SITEFLOW_TWOFAUTH_TOKEN")

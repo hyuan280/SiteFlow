@@ -10,6 +10,7 @@ services:
       SITEFLOW_COOKIE_SECURE: "${SITEFLOW_COOKIE_SECURE:-false}"
       SITEFLOW_WORKER_URL: http://worker:6300
       SITEFLOW_ARTIFACT_ROOT: /app/artifacts
+      SITEFLOW_CFBOX_API_KEY: "${SITEFLOW_CFBOX_API_KEY:-}"
     volumes:
       - siteflow_data:/app/data
       - siteflow_artifacts:/app/artifacts
@@ -25,17 +26,18 @@ services:
       SITEFLOW_WORKER_DATA: /app/data
       SITEFLOW_ARTIFACT_ROOT: /app/artifacts
       SITEFLOW_PLUGIN_BROKER_URL: http://worker:6300/plugin-broker
-      CLOAKBROWSER_AUTO_UPDATE: "false"
+      SITEFLOW_BROWSER_BACKEND: cloak-manager
+      SITEFLOW_BROWSER_URL: http://browser:8080
+      SITEFLOW_BROWSER_TOKEN: "${SITEFLOW_BROWSER_TOKEN:?Set SITEFLOW_BROWSER_TOKEN}"
     volumes:
       - worker_data:/app/data
       - siteflow_artifacts:/app/artifacts
-    shm_size: "1gb"
+      - browser_x11:/tmp/.X11-unix:ro
+    depends_on:
+      browser:
+        condition: service_healthy
     expose:
       - "6300"
-      - "6310"
-      - "6311"
-      - "6312"
-      - "6313"
     restart: unless-stopped
 
   bitwarden:
@@ -49,6 +51,36 @@ services:
       - bitwarden_data:/data
     expose:
       - "8090"
+    restart: unless-stopped
+
+  browser:
+    image: cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989
+    environment:
+      AUTH_TOKEN: "${SITEFLOW_BROWSER_TOKEN:?Set SITEFLOW_BROWSER_TOKEN}"
+      CLOAKBROWSER_AUTO_UPDATE: "false"
+      CLOAKBROWSER_BINARY_PATH: /root/.cloakbrowser/chromium-146.0.7680.177.5/chrome
+    volumes:
+      - browser_data:/data
+      - browser_x11:/tmp/.X11-unix
+    shm_size: "1gb"
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  cfbox:
+    image: ghcr.io/hyuan280/cfbox:${SITEFLOW_CFBOX_VERSION:-latest}
+    environment:
+      CFBOX_API_KEY: "${SITEFLOW_CFBOX_API_KEY:-}"
+      CFBOX_IDLE_UNLOAD_SECONDS: "${CFBOX_IDLE_UNLOAD_SECONDS:-300}"
+      CFBOX_LOAD_ON_STARTUP: "${CFBOX_LOAD_ON_STARTUP:-true}"
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   web:
@@ -67,3 +99,5 @@ volumes:
   worker_data:
   siteflow_artifacts:
   bitwarden_data:
+  browser_data:
+  browser_x11:

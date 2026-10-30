@@ -136,7 +136,6 @@ SITEFLOW_CFBOX_API_KEY=          # 可选
 - 页面「系统设置 → CFbox」可保存、测试、清除；API Key 只显示掩码。
 - 测试通过 `POST /predict` 发送空图片：认证通过时返回 400 `empty_image` 视为连通。
 - 未配置 CFbox 时，`challenge.turnstile` 功能块保存会返回 422。
-- 后续 Compose 内置 CFbox 时仍保留外部 URL 配置，容器内可直接使用服务名。
 
 ### 3.5 站点登录凭据
 

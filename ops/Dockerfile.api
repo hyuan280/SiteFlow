@@ -13,6 +13,7 @@ RUN apt-get update \
 COPY backend/requirements.txt /app/requirements.txt
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" -r /app/requirements.txt
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/siteflow/
 
 COPY backend/app /app/app
 COPY proto/siteflow_proto /app/siteflow_proto

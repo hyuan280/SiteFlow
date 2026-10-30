@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import threading
 import time
 import uuid
@@ -17,6 +16,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
+from worker.browser_backend import Desktop
 
 WAIT_UNTIL = {"domcontentloaded", "load", "networkidle"}
 SYSTEM_RESIGN_SIGNAL_KEY = "sys_resign_pending"
@@ -51,6 +51,10 @@ CF_VISIBLE_MARKER_SCRIPT = """() => {
                 && Number(style.opacity || 1) !== 0;
         })
     );
+}"""
+CF_PAGE_TEXT_SCRIPT = """() => {
+    if (!document.body) throw new Error('CF page body unavailable');
+    return document.body.innerText;
 }"""
 PAGE_ERROR_MARKERS = (
     "bad gateway",
@@ -368,7 +372,19 @@ async def _cf_page_state(page: Any) -> dict[str, Any]:
     except Exception:
         pass
     try:
-        text = await _page_text(page, strict=True)
+        # Health/state reads must not run the SDK's humanized action pipeline.
+        parts = [await asyncio.wait_for(page.title(), timeout=FRAME_OP_TIMEOUT_SECONDS)]
+        parts.append(await asyncio.wait_for(page.evaluate(CF_PAGE_TEXT_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS))
+        for frame in _page_frames(page):
+            if frame is getattr(page, "main_frame", page):
+                continue
+            element = await asyncio.wait_for(frame.frame_element(), timeout=FRAME_OP_TIMEOUT_SECONDS)
+            if not await asyncio.wait_for(element.is_visible(), timeout=FRAME_OP_TIMEOUT_SECONDS):
+                continue
+            parts.append(await asyncio.wait_for(frame.evaluate(CF_PAGE_TEXT_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS))
+        if not all(isinstance(part, str) for part in parts):
+            raise ValueError("Invalid CF page text")
+        text = "\n".join(parts).casefold()
         text_readable = True
     except Exception:
         text = ""
@@ -414,6 +430,22 @@ async def _cf_page_state(page: Any) -> dict[str, Any]:
     }
 
 
+def _image_dimensions(image: bytes, fallback: tuple[int, int]) -> tuple[int, int]:
+    """Use the submitted image, not a remote page's absent viewport metadata."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        with Image.open(BytesIO(image)) as decoded:
+            width, height = decoded.size
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        pass
+    return fallback
+
+
 def _cf_url_key(value: Any) -> str:
     return str(value or "").split("#", 1)[0]
 
@@ -437,38 +469,6 @@ def _cf_progress_reason(
     if "__cf_chl_" in current_lower or "challenge-platform" in current_lower:
         return None
     return "页面已跳转"
-
-
-def _x11_screenshot(display: str) -> bytes | None:
-    try:
-        import mss
-        from mss.tools import to_png
-
-        # Each capture owns its X connection; never change process-wide DISPLAY.
-        with mss.mss(display=display) as capture:
-            frame = capture.grab({"left": 0, "top": 0, "width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
-            return to_png(frame.rgb, frame.size)
-    except Exception:
-        return None
-
-
-def _x11_click(display: str, x: float, y: float) -> None:
-    subprocess.run(
-        [
-            "xdotool",
-            "mousemove",
-            str(int(round(x))),
-            str(int(round(y))),
-            "sleep",
-            "0.1",
-            "click",
-            "1",
-        ],
-        env={**os.environ, "DISPLAY": display},
-        capture_output=True,
-        timeout=5,
-        check=False,
-    )
 
 
 async def _scroll_cf_into_view(page: Any) -> None:
@@ -843,18 +843,21 @@ async def _run_turnstile(
     config: dict[str, Any],
     cfbox: dict[str, Any] | None,
     cancel: asyncio.Event | None,
-    xdisplay: str | None,
+    xdisplay: Desktop | None,
     lane_key: str,
     log: Callable[[str, str], None] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     wait_seconds = max(1, min(120, int(config.get("wait_seconds") or 15)))
+    diagnostics: dict[str, Any] = {"state": "unknown", "phase": "page_check"}
     try:
         async with asyncio.timeout(wait_seconds):
             return await _run_turnstile_detection(
-                page, config, cfbox, cancel, xdisplay, lane_key, log
+                page, config, cfbox, cancel, xdisplay, lane_key, log, diagnostics
             )
     except TimeoutError:
-        return "unknown", f"Turnstile 双重确认超时（{wait_seconds}s）", {"state": "unknown"}
+        if log:
+            log("WARN", f"Cloudflare 超时诊断：{json.dumps(diagnostics, ensure_ascii=False)}")
+        return "unknown", f"Turnstile 双重确认超时（{wait_seconds}s）", diagnostics
 
 
 async def _run_turnstile_detection(
@@ -862,9 +865,10 @@ async def _run_turnstile_detection(
     config: dict[str, Any],
     cfbox: dict[str, Any] | None,
     cancel: asyncio.Event | None,
-    xdisplay: str | None,
+    xdisplay: Desktop | None,
     lane_key: str,
     log: Callable[[str, str], None] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     note = log or (lambda _level, _message: None)
     if not cfbox or not cfbox.get("url"):
@@ -885,6 +889,7 @@ async def _run_turnstile_detection(
     use_x_fallback = False
     last_click: dict[str, float] | None = None
     last_click_at: float | None = None
+    page_click_started_at: float | None = None
     initial_url = _cf_url_key(getattr(page, "url", ""))
     previous_token_length = 0
     states: list[str] = []
@@ -893,10 +898,14 @@ async def _run_turnstile_detection(
     first_pass = True
     reported_state: str | None = None
     challenge_reported = False
+    reported_blockers: tuple[str, ...] | None = None
+    diagnostics = diagnostics if diagnostics is not None else {}
     while time.monotonic() < deadline:
         if cancel is not None and cancel.is_set():
             return "canceled", "已取消", {}
+        diagnostics["phase"] = "page_check"
         state = await _cf_page_state(page)
+        diagnostics["page"] = {key: state[key] for key in ("marker", "challenge_text", "url_challenge", "text_readable")}
         current_url = _cf_url_key(getattr(page, "url", ""))
         token_length = int(state.get("token_length") or 0)
         has_cf = (
@@ -949,8 +958,9 @@ async def _run_turnstile_detection(
                 not use_x_fallback
                 and page_click_count >= 2
                 and last_state == "unchecked"
-                and last_click_at is not None
-                and time.monotonic() - last_click_at >= 4
+                and page_click_started_at is not None
+                # Measure from the first click: each click refreshes last_click_at.
+                and time.monotonic() - page_click_started_at >= 4
             ):
                 if lane_key not in {"interaction", "proxy_interaction"}:
                     note(
@@ -979,19 +989,22 @@ async def _run_turnstile_detection(
             if use_x_fallback and not xdisplay:
                 return "fail", "需要 X fallback，但车道没有 display", {}
             try:
+                diagnostics["phase"] = "screenshot"
                 if use_x_fallback and xdisplay:
-                    image = await asyncio.to_thread(_x11_screenshot, xdisplay)
-                    width, height = SCREEN_WIDTH, SCREEN_HEIGHT
+                    image = await xdisplay.screenshot()
+                    fallback_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
                 else:
                     image = await page.screenshot(type="png")
-                    viewport = page.viewport_size or {
-                        "width": SCREEN_WIDTH,
-                        "height": SCREEN_HEIGHT,
-                    }
-                    width, height = viewport["width"], viewport["height"]
+                    viewport = page.viewport_size or {}
+                    fallback_size = (
+                        int(viewport.get("width") or SCREEN_WIDTH),
+                        int(viewport.get("height") or SCREEN_HEIGHT),
+                    )
+                width, height = _image_dimensions(image, fallback_size)
                 if not image:
                     return "fail", "CF 截图为空", {}
                 async with httpx.AsyncClient(timeout=20) as client:
+                    diagnostics["phase"] = "cfbox_request"
                     response = await client.post(
                         f"{str(cfbox['url']).rstrip('/')}/predict",
                         headers=headers,
@@ -1010,11 +1023,14 @@ async def _run_turnstile_detection(
                 }:
                     return "fail", "CFbox 响应状态无效", {}
                 states.append(last_state)
+                diagnostics.update(state=last_state, predictions=len(states), clicked=clicked, click_count=click_count)
                 if last_state != reported_state:
                     note("INFO", f"CFbox 识别状态：{last_state}")
                     reported_state = last_state
                 # Navigation or widget rendering may occur during inference.
+                diagnostics["phase"] = "page_recheck"
                 state = await _cf_page_state(page)
+                diagnostics["page"] = {key: state[key] for key in ("marker", "challenge_text", "url_challenge", "text_readable")}
                 has_cf = bool(
                     state["marker"] or state["challenge_text"] or state["url_challenge"]
                 )
@@ -1022,6 +1038,7 @@ async def _run_turnstile_detection(
                 ready = await page.evaluate(
                     "() => document.readyState !== 'loading' && !!document.body"
                 )
+                diagnostics["ready"] = bool(ready)
                 if last_state == "verified":
                     seen_cf = True
                 # A solved Turnstile can remain visible with its response token.
@@ -1039,6 +1056,8 @@ async def _run_turnstile_detection(
                     # Unknown visual inference falls back to a readable, clear page.
                     and last_state in {"absent", "verified", "unknown"}
                 ):
+                    diagnostics["blockers"] = []
+                    reported_blockers = None
                     if no_cf_since is None:
                         no_cf_since = time.monotonic()
                     if time.monotonic() - no_cf_since >= 2:
@@ -1057,6 +1076,19 @@ async def _run_turnstile_detection(
                         }
                 else:
                     no_cf_since = None
+                    blockers = tuple(reason for reason, blocked in (
+                        ("visible_widget", bool(state["marker"]) and not solved_widget),
+                        ("challenge_text", state["challenge_text"]),
+                        ("challenge_url", state["url_challenge"]),
+                        ("marker_unreadable", state["marker"] is None),
+                        ("text_unreadable", not state["text_readable"]),
+                        ("page_not_ready", not ready),
+                        ("cfbox_unresolved", last_state not in {"absent", "verified", "unknown"}),
+                    ) if blocked)
+                    diagnostics["blockers"] = list(blockers)
+                    if blockers != reported_blockers:
+                        note("INFO", f"Cloudflare 等待原因：{', '.join(blockers)}（CFbox={last_state}）")
+                        reported_blockers = blockers
                 if last_state not in {"absent", "verified", "unknown"}:
                     seen_cf = True
                 if last_state == "absent" and has_cf:
@@ -1072,12 +1104,14 @@ async def _run_turnstile_detection(
                         x = width * x_pct / 100
                         y = height * y_pct / 100
                         if use_x_fallback and xdisplay:
-                            await asyncio.to_thread(_x11_click, xdisplay, x, y)
+                            await xdisplay.click(x, y)
                             x_click_count += 1
                             click_mode = "x"
                         else:
                             await page.mouse.click(x, y)
                             page_click_count += 1
+                            if page_click_started_at is None:
+                                page_click_started_at = time.monotonic()
                             click_mode = "page"
                         clicked = True
                         click_count += 1
@@ -1090,6 +1124,7 @@ async def _run_turnstile_detection(
                         )
             except Exception as exc:
                 return "fail", f"CFbox 识别失败: {type(exc).__name__}: {str(exc)[:300]}", {}
+        diagnostics["phase"] = "poll_wait"
         if not await _sleep(1, cancel):
             return "canceled", "已取消", {}
     suffix = "，已点击复选框" if clicked else ""
@@ -2341,6 +2376,12 @@ async def _detect_page_error(
     return reason
 
 
+class _NavigationPageError(RuntimeError):
+    def __init__(self, reason: str):
+        super().__init__(f"站点错误页面：{reason}")
+        self.reason = reason
+
+
 async def _goto_if_needed(
     page: Any,
     url: str,
@@ -2350,34 +2391,64 @@ async def _goto_if_needed(
     *,
     retry_count: int = 0,
     retry_interval_seconds: float = 1.0,
+    check_error_page: bool = False,
 ) -> bool:
     current = str(getattr(page, "url", "") or "")
-    if _same_navigation_url(current, url):
+    skip_navigation = _same_navigation_url(current, url)
+    if skip_navigation and not check_error_page:
         log("INFO", f"当前页面已是目标地址，跳过{label}导航：{current}")
         return False
     retry_count = max(0, min(int(retry_count), 20))
     attempts = retry_count + 1
     log("INFO", f"{label}访问 {url}（最多尝试 {attempts} 次）")
-    for attempt in range(1, attempts + 1):
-        try:
-            await page.goto(url, wait_until=wait_until, timeout=PAGE_TIMEOUT_MS)
-            log("INFO", f"页面加载完成，当前地址 {page.url}")
-            return True
-        except Exception as exc:
-            if attempt >= attempts or not _retryable_navigation_error(exc):
+    cache_session = None
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                if attempt == 1 and skip_navigation:
+                    log("INFO", f"当前页面已是目标地址，检查页面状态：{current}")
+                else:
+                    await page.goto(url, wait_until=wait_until, timeout=PAGE_TIMEOUT_MS)
+                    log("INFO", f"页面加载完成，当前地址 {page.url}")
+                if check_error_page:
+                    reason = await _detect_page_error(page, log)
+                    if reason:
+                        raise _NavigationPageError(reason)
+                return not (attempt == 1 and skip_navigation)
+            except Exception as exc:
+                error_page = isinstance(exc, _NavigationPageError)
+                if attempt >= attempts or not (error_page or _retryable_navigation_error(exc)):
+                    log(
+                        "ERROR",
+                        f"{label}打开失败（第 {attempt}/{attempts} 次）："
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    raise
+                if error_page and cache_session is None:
+                    # Scope cache bypass to this task's target, not the shared
+                    # profile; never clear another task's cookies or cache.
+                    cache_session = await page.context.new_cdp_session(page)
+                    await cache_session.send("Network.enable")
+                    await cache_session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+                    log("INFO", "检测到站点错误页，已临时禁用当前标签页缓存，后续尝试强制重新访问")
                 log(
-                    "ERROR",
+                    "WARN",
                     f"{label}打开失败（第 {attempt}/{attempts} 次）："
-                    f"{type(exc).__name__}: {exc}",
+                    f"{type(exc).__name__}: {str(exc)[:300]}；"
+                    f"{retry_interval_seconds:g} 秒后重试",
                 )
-                raise
-            log(
-                "WARN",
-                f"{label}打开失败（第 {attempt}/{attempts} 次）："
-                f"{type(exc).__name__}: {str(exc)[:300]}；"
-                f"{retry_interval_seconds:g} 秒后重试",
-            )
-            await asyncio.sleep(max(0.0, retry_interval_seconds))
+                await asyncio.sleep(max(0.0, retry_interval_seconds))
+    finally:
+        if cache_session is not None:
+            try:
+                await cache_session.send("Network.setCacheDisabled", {"cacheDisabled": False})
+            except Exception:
+                log("WARN", "恢复当前标签页缓存设置失败")
+            finally:
+                try:
+                    await cache_session.detach()
+                except Exception:
+                    pass
     return False
 
 
@@ -3026,7 +3097,7 @@ async def _run_step(
     twofauth: dict[str, Any] | None,
     cfbox: dict[str, Any] | None,
     cancel: asyncio.Event | None,
-    xdisplay: str | None,
+    xdisplay: Desktop | None,
     lane_key: str,
     log: Callable[[str, str], None] | None = None,
     resign_pending_dates: list[str] | None = None,
@@ -3068,19 +3139,20 @@ async def _run_step(
             return "fail", "地址为空", {}
         wait_until = await _wait_until(page, str(config.get("wait_until") or "domcontentloaded"))
         retry_count = int(config.get("retry_count") or 0) if feature == "flow.open" else 0
-        await _goto_if_needed(
-            page,
-            url,
-            wait_until,
-            note,
-            "页面",
-            retry_count=retry_count,
-        )
-        error_page = await _detect_page_error(page, note)
-        if error_page:
-            return "fail", f"站点错误页面：{error_page}", {
+        try:
+            await _goto_if_needed(
+                page,
+                url,
+                wait_until,
+                note,
+                "页面",
+                retry_count=retry_count,
+                check_error_page=True,
+            )
+        except _NavigationPageError as exc:
+            return "fail", str(exc), {
                 "url": page.url,
-                "error_page": error_page,
+                "error_page": exc.reason,
             }
         return "success", f"已打开 {page.url}", {"url": page.url}
 
@@ -3183,12 +3255,20 @@ async def _run_step(
         if secret_payload is not None:
             require_site_origin(page.url, secret_payload["base_url"])
         try:
+            note("INFO", "开始填写登录用户名")
             await username.fill(credentials["username"], timeout=PAGE_TIMEOUT_MS)
+            if await username.input_value(timeout=PAGE_TIMEOUT_MS) != credentials["username"]:
+                raise RuntimeError("Username input verification failed")
+            note("INFO", "用户名填写完成并校验，开始填写密码")
             await password.fill(credentials["password"], timeout=PAGE_TIMEOUT_MS)
+            if await password.input_value(timeout=PAGE_TIMEOUT_MS) != credentials["password"]:
+                raise RuntimeError("Password input verification failed")
+            note("INFO", "密码填写完成并校验")
         except Exception:
             raise RuntimeError("Sensitive login fill failed") from None
         finally:
             credentials = None
+        note("INFO", "开始点击登录按钮")
         await submit.click(timeout=PAGE_TIMEOUT_MS)
         note("INFO", "已填写登录凭据并提交")
         success = list(config.get("success_selector") or [])
@@ -3377,23 +3457,34 @@ async def execute_job(
             return {"status": "canceled", "message": "已取消", "steps": []}
         if on_step is not None:
             await on_step({"status": "running", "message": "执行中", "steps": []})
-        if cancel is None:
-            return await _execute_admitted_job(manager, payload, cancel, on_step)
+        async def wait_for_disconnect():
+            while True:
+                session = getattr(lane, "session", None)
+                if session is not None and session.disconnected and lane.in_use:
+                    return
+                await asyncio.sleep(.2)
+
         execution = asyncio.create_task(_execute_admitted_job(manager, payload, cancel, on_step))
         watcher = asyncio.create_task(cancel.wait()) if cancel is not None else None
+        backend_watcher = asyncio.create_task(wait_for_disconnect())
         try:
-            if watcher is not None:
-                done, _ = await asyncio.wait({execution, watcher}, return_when=asyncio.FIRST_COMPLETED)
-                if watcher in done:
-                    execution.cancel()
-                    await asyncio.gather(execution, return_exceptions=True)
-                    return {"status": "canceled", "message": "已取消", "steps": []}
+            done, _ = await asyncio.wait(
+                {execution, backend_watcher, *([watcher] if watcher else [])},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if backend_watcher in done or (watcher is not None and watcher in done):
+                execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
+                if backend_watcher in done:
+                    return {"status": "error", "message": "Browser backend disconnected; task was not replayed", "steps": []}
+                return {"status": "canceled", "message": "已取消", "steps": []}
             return await execution
         finally:
             execution.cancel()
             if watcher is not None:
                 watcher.cancel()
-            await asyncio.gather(execution, *([watcher] if watcher is not None else []), return_exceptions=True)
+            backend_watcher.cancel()
+            await asyncio.gather(execution, backend_watcher, *([watcher] if watcher is not None else []), return_exceptions=True)
 
 
 async def _execute_admitted_job(
@@ -3454,14 +3545,18 @@ async def _execute_admitted_job(
         try:
             await lane.context.add_cookies(cookie_rows)
             job_artifacts.log("INFO", f"已注入站点 Cookie {len(cookie_rows)} 条")
+        except asyncio.CancelledError:
+            await manager.release_lane(lane_key, lease_id)
+            raise
         except Exception as exc:
             await manager.release_lane(lane_key, lease_id)
+            # Browser errors can include cookie values in their call logs.
             job_artifacts.log(
-                "ERROR", f"导入站点 Cookie 失败: {type(exc).__name__}: {exc}"
+                "ERROR", f"导入站点 Cookie 失败: {type(exc).__name__}"
             )
             return finish(
                 "fail",
-                f"导入站点 Cookie 失败: {type(exc).__name__}: {str(exc)[:300]}",
+                f"导入站点 Cookie 失败: {type(exc).__name__}",
                 [],
                 [],
             )
@@ -3649,7 +3744,7 @@ async def _execute_admitted_job(
                             twofauth,
                             cfbox,
                             cancel,
-                            lane.display,
+                            lane.session.desktop if getattr(lane, "session", None) else None,
                             lane_key,
                             job_artifacts.log,
                             list(payload.get("resign_pending_dates") or []),

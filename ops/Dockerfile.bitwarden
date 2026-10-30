@@ -15,6 +15,7 @@ RUN npm install -g --no-audit --no-fund --registry="$NPM_REGISTRY" "@bitwarden/c
     && find /usr/local/lib/node_modules/@bitwarden -type f \( -name '*.map' -o -name '*.ts' \) -delete
 
 COPY bitwarden/server.mjs /app/server.mjs
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/siteflow/
 
 RUN mkdir -p /data /app && chown -R node:node /data /app
 USER node

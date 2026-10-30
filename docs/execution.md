@@ -42,7 +42,7 @@ Web POST /api/v1/runs
 - 同一时间只允许一个调度运行在执行；站点配置只保留 `checkin_after` 单次时间。
 - cron 和随机范围按 `SITEFLOW_SCHEDULER_TIMEZONE` 计算，默认 `Asia/Shanghai`；不依赖容器系统时区。
 
-Turnstile/滑块/图形验证码优先在站点配置的车道用 Playwright 截图和鼠标点击执行。Turnstile 连续两次点击仍未生效时，任务自动改到交互车道重试，并使用 FFmpeg + xdotool fallback。
+Turnstile/滑块/图形验证码优先在站点配置的车道用 Playwright 截图和鼠标点击执行。Turnstile 连续两次点击仍未生效时，任务自动改到交互车道重试，并使用浏览器后端的桌面能力（当前为 mss + xdotool）fallback。
 
 API 与 worker 不共享数据库。API 负责本地凭据解密、Bitwarden 查询参数和状态持久化；启用 Bitwarden 的站点会把查询参数随任务下发，worker 在任务启动后后台预取，真正到 `auth.form_login` 时使用，任务上下文结束后丢弃。凭据不写日志。
 
@@ -91,7 +91,7 @@ post.buy_card
 post.resign
 ```
 
-- `flow.open`、`action.navigate`：导航完成后检测页面标题和正文中的错误页特征，例如 Bad Gateway、Service Unavailable、502/503/522、Internal Server Error、404、网站维护/正在维护/关闭维护、The website has been stopped 等；命中时步骤返回 `fail`，并记录 `error_page` 数据，随后按该步骤的错误策略 `stop`/`continue`/`defer`/`escalate_interaction` 处理。
+- `flow.open`、`action.navigate`：导航完成后检测页面标题和正文中的错误页特征，例如 Bad Gateway、Service Unavailable、502/503/522、Internal Server Error、404、网站维护/正在维护/关闭维护、The website has been stopped 等，即使 HTTP 返回 200 也会检测。`flow.open` 的网络异常和错误页共用 `retry_count` 次额外重试（总尝试次数为 `1 + retry_count`）；错误页重试临时禁用当前任务标签页的缓存，强制重新访问原目标地址，不因 URL 相同而跳过，步骤结束后恢复缓存。不会清除 Cookie 或整个 profile 的缓存。`retry_count=0` 和 `action.navigate` 不额外重试。次数耗尽仍是错误页时返回 `fail` 和 `error_page` 数据，随后按该步骤的错误策略 `stop`/`continue`/`defer`/`escalate_interaction` 处理。
 - `challenge.2fa`：通过 2FAuth 按 `service_hint` 匹配账号并获取 OTP；多个候选或没有候选时返回 `waiting_human`。
 - `challenge.turnstile`：先检查 `.cf-turnstile`、`cf-turnstile-response`、`cf-chl-widget`、CF iframe、挑战文案；存在挑战时截图调用 CFbox，按复选框中心点击。CFbox 返回 `absent` 但 DOM 仍有挑战时继续等待，不直接判成功；完全没有 CF 标记约 2 秒后才视为无挑战。`wait_seconds` 是从步骤开始计算的总等待上限，包含 DOM 检测、CFbox 调用和点击后的等待，不是固定延时；未配置 CFbox 返回 `waiting_human`。
 - `challenge.altcha`：定位 ALTCHA 组件并点击复选框，等待组件进入 `verified` 状态或写入 Token；`wait_seconds` 控制最长等待时间。
@@ -196,8 +196,8 @@ Turnstile 点击先用 Playwright 截图和鼠标点击。只有页面上的可�
 连续两次点击后仍为 `unchecked` 时，会再等待约 4 秒确认状态：
 
 - 当前是普通/代理普通车道：任务改到交互/代理交互车道重试。
-- 当前已经是交互车道：直接切换 FFmpeg X11 截图 + xdotool 点击。
-- X fallback 使用交互车道的 Xvnc display。
+- 当前已经是交互车道：切换桌面截图与系统坐标点击。
+- X fallback 使用后端为该车道分配的 display，Worker 只保留 mss/xdotool 客户端。
 
 ## 8. Artifact
 
@@ -220,6 +220,10 @@ Turnstile 点击先用 Playwright 截图和鼠标点击。只有页面上的可�
 - 其他视觉识别/识图能力（图形验证码已支持 ddddocr、视觉模型和 NexusPHP GD 5）。
 - 截图/日志 artifact、站点每日状态、趋势报表。
 # Cloudflare 双重确认
+
+浏览器读取与交互统一分离：Page/Frame/Locator/ElementHandle 的正文、属性、HTML、输入值使用原生 Playwright；等待、可见性、数量检查与截图亦为原生路径。点击、填写、键盘、鼠标和滚动仍使用已有 SDK 交互包装（SDK 未包装的输入方法保持原有行为）。此策略同时覆盖工作流信号、验证码读取和插件 broker，不更改选择器、iframe、等待及权限语义。缺失元素仍按调用方超时处理，失败不能静默变为“不存在”。
+
+页面文本检测通过有界 DOM 读取执行，不走拟人输入/读取包装；隐藏子 iframe 不参与挑战文本判断，可见子 iframe 或主页面读取失败仍阻止放行。点击坐标按实际提交给 CFbox 的截图尺寸换算，不依赖远程 CDP 可能缺失的 viewport 信息。等待原因变化时记录组件、挑战文字/URL、读取状态等标志；总超时时保留当前阶段及最后一次检测摘要，不记录 token 值、Cookie 或完整页面正文。
 
 `challenge.turnstile` 每轮同时检查可见页面标记、标题/正文挑战文字、挑战 URL，以及 CFbox `/predict` 截图识别。页面未命中不再跳过 CFbox；任一侧检测到挑战都会继续处理。隐藏组件、残留响应字段和隐藏 iframe 不单独视为挑战。
 

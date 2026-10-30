@@ -9,6 +9,7 @@ import ExportSelectionDialog from "@/components/ExportSelectionDialog.vue";
 import SignalEditor from "@/components/SignalEditor.vue";
 import WorkflowStepEditor from "@/components/WorkflowStepEditor.vue";
 import { useAuthStore } from "@/stores/auth";
+import { usePersistedSearch } from "@/utils/persistedSearch";
 import type { ExportItem } from "@/types/export";
 import type {
   Feature,
@@ -53,7 +54,7 @@ interface EditorForm {
 const auth = useAuthStore();
 const router = useRouter();
 const templates = ref<TemplateSummary[]>([]);
-const templateSearch = ref("");
+const templateSearch = usePersistedSearch("siteflow:templates:search");
 const features = ref<Feature[]>([]);
 const cfboxEnabled = ref(false);
 const loading = ref(true);

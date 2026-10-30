@@ -14,18 +14,18 @@ web (Caddy)
                          └── /api/v1/lanes/{key}/vnc
                                      │ WebSocket
                                      ▼
-                              worker:6310-6313
+                               worker:6300/lanes/{key}/vnc
                                      │
-                              KasmVNC / Xvnc
+                               browser:8080/api/profiles/{id}/vnc
                                      │
-                              CloakBrowser
+                               KasmVNC / browser (official Manager)
 ```
 
 - 只有 `web` 发布宿主机端口 `8088`。
-- `api:8000`、`worker:6300`、KasmVNC `6310-6313` 都只在 Compose 内部网络可见。
+- `api:8000`、`worker:6300`、`browser:8080` 都只在 Compose 内部网络可见。
 - 不使用 host 网络。
-- Xvnc、xdotool、ffmpeg 全部在 worker 容器内部执行。
-- KasmVNC 使用 `SecurityTypes None`，但端口只绑定在 Compose 内部网络，**不要**把 `6310-6313` 发布到宿主机；访问入口只有带管理员会话的 API WebSocket。
+- Xvnc 和浏览器在外部 browser 容器；mss/xdotool 通过专用 X11 socket 卷操作显示。
+- KasmVNC 仅绑定 browser 容器内部 loopback；Manager API 使用随机令牌。不要公开 browser 管理端口或 X11 socket。
 
 ## 2. 车道
 
@@ -38,7 +38,7 @@ web (Caddy)
 
 - `SITEFLOW_PROXY_URL` 未配置时，两条代理车道显示为「未启用」，不会启动。
 - worker 启动时**不启动任何浏览器**，所有车道初始为 `stopped`。
-- 前端点击「启动浏览器」或任务执行器申请 lease 时才启动对应 Xvnc + CloakBrowser。
+- 前端点击「启动浏览器」或任务 lease 才通过后端启动专用 profile；显示号动态分配。
 - 状态包含：`status`、`browser`、`display`、`vnc_available`、`in_use`、`can_start`、`can_stop`、`error`。
 
 ## 3. 状态 API
@@ -89,7 +89,7 @@ POST /api/v1/lanes/{key}/stop
   - `can_start=true` → 启动浏览器
   - `running` 且 `can_stop=true` → 关闭浏览器
   - `in_use>0` → 显示「任务运行中（N），禁止关闭浏览器」，关闭按钮禁用
-- 关闭浏览器会关闭 CloakBrowser context 和 Xvnc，释放资源；不会影响 SQLite 中的登录 Cookie。
+- 关闭车道会断开 CDP 并调用后端停止专用 profile；不会删除持久化 profile 或 SQLite 中的登录 Cookie。
 
 worker 内部任务接口（不对外暴露）：
 
@@ -145,13 +145,8 @@ WS /api/v1/lanes/{lane_key}/vnc
 
 - 校验管理员会话 Cookie。
 - 校验同源 Origin。
-- 从 worker 获取该车道 KasmVNC 的 `ws_port`。
-- 连接 `ws://worker:<ws_port>/websockify`，子协议 `binary`。
-- 处理 KasmVNC 1.3.3 与 noVNC 1.7 的兼容：
-  - 过滤 KasmVNC 不支持的扩展 RFB 消息；
-  - 白名单化 SetEncodings；
-  - 将 6 字节 PointerEvent 重写为 KasmVNC 的 11 字节格式；
-  - 将 KasmVNC BinaryClipboard 转为标准 ServerCutText。
+- 连接 Worker 的固定车道 WebSocket，由 Worker 使用令牌转发到 Manager 的 profile VNC，子协议 `binary`。
+- Manager 负责 Kasm 兼容消息改写；SiteFlow 两层代理仅透传，不重复转换指针和剪贴板。
 - 前端关闭弹窗或点击「退出 VNC」时，只断开 RFB/WebSocket，不停止车道。
 
 ## 5. 前端
@@ -190,7 +185,7 @@ docker compose -f ops/docker-compose.yml up -d
 docker compose -f ops/docker-compose.yml ps
 ```
 
-worker 启动后所有车道为「已停止」。在「车道状态」页点击「启动浏览器」或由任务 lease 后，才会启动对应 Xvnc 和 CloakBrowser profile。代理未配置时两条代理车道不可启动。
+worker 启动后所有车道为「已停止」。在「车道状态」页点击「启动浏览器」或由任务 lease 后，才通过后端启动专用 profile。代理未配置时两条代理车道不可启动。后端说明见 `docs/browser-backends.md`。
 
 查看 worker 状态：
 

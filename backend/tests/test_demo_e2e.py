@@ -94,12 +94,35 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
     api_port = api_socket.getsockname()[1]
     api_server = None
     api_thread = None
+    browser_name = name + "-browser"
+    x11_volume = name + "-x11"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        browser_port = probe.getsockname()[1]
+    browser_image = os.environ.get("SITEFLOW_DEMO_BROWSER_IMAGE", "cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989")
     try:
+        subprocess.run(["docker", "run", "--rm", "-d", "--name", browser_name, "--network", "host",
+            "--shm-size", "1g", "--tmpfs", "/data", "--tmpfs", "/tmp",
+            "-v", f"{x11_volume}:/tmp/.X11-unix",
+            "-e", "AUTH_TOKEN=isolated-browser-token", "-e", "CLOAKBROWSER_AUTO_UPDATE=false",
+            "-e", "CLOAKBROWSER_BINARY_PATH=/root/.cloakbrowser/chromium-146.0.7680.177.5/chrome",
+            "--entrypoint", "uvicorn", browser_image, "backend.main:app", "--host", "127.0.0.1", "--port", str(browser_port)], check=True, capture_output=True)
+        for _ in range(120):
+            try:
+                if httpx.get(f"http://127.0.0.1:{browser_port}/api/health").is_success:
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.5)
+        else:
+            pytest.fail("isolated browser backend did not start: " + subprocess.check_output(["docker", "logs", browser_name], stderr=subprocess.STDOUT).decode())
         subprocess.run(["docker", "run", "--rm", "-d", "--name", name, "--network", "host",
+            "-e", f"SITEFLOW_BROWSER_URL=http://127.0.0.1:{browser_port}", "-e", "SITEFLOW_BROWSER_TOKEN=isolated-browser-token",
+            "-v", f"{x11_volume}:/tmp/.X11-unix:ro",
             "-e", "SITEFLOW_PLUGIN_BROKER_URL=http://127.0.0.1:16300/plugin-broker",
             "-e", f"SITEFLOW_SECRET_API_URL=http://127.0.0.1:{api_port}/api/v1/internal/secrets/resolve",
             "-e", f"SITEFLOW_PLUGIN_AUTH_API_URL=http://127.0.0.1:{api_port}/api/v1/internal/plugins/authorize",
-            "-e", "SITEFLOW_WORKER_DATA=/tmp/demo-worker", "-e", "CLOAKBROWSER_AUTO_UPDATE=false",
+            "-e", "SITEFLOW_WORKER_DATA=/tmp/demo-worker",
             "-v", f"{ROOT}/worker:/app/worker:ro", "-v", f"{ROOT}/proto/siteflow_proto:/app/siteflow_proto:ro",
             "--entrypoint", "uvicorn", os.environ.get("SITEFLOW_DEMO_WORKER_IMAGE", "siteflow-worker"), "worker.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "16300"], check=True, capture_output=True)
         for _ in range(120):
@@ -111,7 +134,12 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
             time.sleep(0.5)
         else:
             pytest.fail("isolated worker did not start: " + subprocess.check_output(["docker", "logs", name], stderr=subprocess.STDOUT).decode())
+        smoke = subprocess.run(["docker", "exec", "-i", name, "python"],
+            input=(ROOT / "backend/tests/remote_browser_smoke.py").read_text(),
+            capture_output=True, text=True, timeout=120)
+        assert smoke.returncode == 0, smoke.stdout + smoke.stderr
         settings = make_settings(tmp_path, worker_url="http://127.0.0.1:16300", worker_timeout=180,
+            browser_token="isolated-browser-token",
             plugin_runtime_tokens='{"demo":"isolated-demo-token"}', plugin_resolve_endpoint=False,
             plugin_endpoint_allowlist=f"127.0.0.1:{port}", execution_max_jobs=1)
         with TestClient(create_app(settings)) as client:
@@ -155,7 +183,10 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
                 if result["status"] not in {"queued", "running"}:
                     break
                 time.sleep(0.5)
-            assert result["status"] == "success", result
+            if result["status"] != "success":
+                logs = subprocess.run(["docker", "exec", name, "python", "-c",
+                    "from pathlib import Path; print('\\n'.join(p.read_text() for p in Path('/app/artifacts').glob('run-1/job-*/job.log')))"], capture_output=True, text=True)
+                pytest.fail(str(result) + "\n" + logs.stdout)
             assert len(result["jobs"]) == 1
             for job in result["jobs"]:
                 assert job["status"] == "success", job
@@ -170,8 +201,32 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
             assert calls.count("credentials") == calls.count("totp") == 1
             assert demo_site.Handler.login_results[-1] is True
             assert not client.app.state.executor.secret_providers.leases
+            # Manager normalizes RFB. SiteFlow must forward without Kasm rewriting.
+            with client.websocket_connect("/api/v1/lanes/general/vnc", subprotocols=["binary"]) as viewer:
+                assert viewer.receive_bytes().startswith(b"RFB ")
+                viewer.send_bytes(b"RFB 003.008\n")
+                security = viewer.receive_bytes()
+                assert 1 in security[1:]
+                viewer.send_bytes(b"\x01")
+                assert viewer.receive_bytes() == b"\x00\x00\x00\x00"
+                viewer.send_bytes(b"\x01")
+                initialized = viewer.receive_bytes()
+                assert int.from_bytes(initialized[:2], "big") == 1920
+                assert int.from_bytes(initialized[2:4], "big") == 1080
+                # Ask for standard raw framebuffer data and send a mouse event.
+                # Manager, not SiteFlow, performs the Kasm pointer translation.
+                viewer.send_bytes(b"\x02\x00\x00\x01\x00\x00\x00\x00")
+                viewer.send_bytes(b"\x05\x00\x00\x64\x00\x64")
+                viewer.send_bytes(b"\x03\x00\x00\x00\x00\x00\x00\x40\x00\x40")
+                assert viewer.receive_bytes()[0] == 0
             assert "isolated-demo-token" not in json.dumps(result)
             assert "123456" not in json.dumps(result)
+            picker = client.post("/api/v1/picker/sessions", json={
+                "url": f"http://127.0.0.1:{fixture.server_port}/fault", "lane_key": "interaction"})
+            assert picker.is_success, picker.text
+            picker_id = picker.json()["session_id"]
+            assert client.get(f"/api/v1/picker/sessions/{picker_id}").is_success
+            assert client.delete(f"/api/v1/picker/sessions/{picker_id}").is_success
             print("PASS: one imported site, 19 ordered steps, server-verified login, real credential/TOTP gRPC through leases")
             negative = rows[0]
             negative["base_url"] = f"http://127.0.0.1:{fixture.server_port}"
@@ -271,6 +326,30 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
                     if scenario["name"] == "revoke":
                         response = client.post("/api/v1/plugin-runtime/plugins/demo/approve", json={})
                         assert response.is_success, response.text
+                # Killing the external Manager must terminate an in-flight job;
+                # no browser restart or job replay is allowed while it holds a lease.
+                # Use a browser-only wait instead of relying on that RPC.
+                row["steps"][-1] = {"step_key": "backend_wait", "feature_type": "action.wait",
+                    "position": 2000, "config": {"seconds": 5}}
+                row["steps"].append({"step_key": "backend_click", "feature_type": "action.click",
+                    "position": 3000, "config": {"selector": ["#delayed-action"]}})
+                assert client.put(f"/api/v1/sites/{ids[0]}", json=row).is_success
+                response = client.post("/api/v1/runs", json={"site_ids": ids, "force": True})
+                backend_run = response.json()["id"]
+                for _ in range(100):
+                    current = client.get(f"/api/v1/runs/{backend_run}").json()
+                    if any(s["step_key"] == "backend_wait" for j in current["jobs"] for s in j["steps"]):
+                        break
+                    time.sleep(.1)
+                subprocess.run(["docker", "stop", "-t", "1", browser_name], check=True, capture_output=True)
+                for _ in range(150):
+                    current = client.get(f"/api/v1/runs/{backend_run}").json()
+                    if current["status"] not in {"queued", "running"}:
+                        break
+                    time.sleep(.1)
+                assert current["status"] not in {"success", "queued", "running"}, current
+                status = httpx.get("http://127.0.0.1:16300/status").json()
+                assert all(lane["in_use"] == 0 and lane["task_pages"] == 0 for lane in status["lanes"])
     finally:
         if api_server:
             api_server.should_exit = True
@@ -278,6 +357,8 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
             api_thread.join(timeout=10)
         api_socket.close()
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", browser_name], capture_output=True)
+        subprocess.run(["docker", "volume", "rm", x11_volume], capture_output=True)
         fixture.shutdown()
         fixture.server_close()
         thread.join()

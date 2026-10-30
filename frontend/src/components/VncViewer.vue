@@ -103,7 +103,7 @@ async function connect(): Promise<void> {
       errorMessage.value = "VNC 安全校验失败";
     });
     client.addEventListener("credentialsrequired", () => {
-      // KasmVNC is exposed without VNC-level auth; the API WebSocket is authenticated.
+      // Authentication is handled by the API and browser backend, not RFB credentials.
     });
   } catch (error) {
     if (generation !== connectionGeneration) return;

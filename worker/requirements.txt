@@ -1,3 +1,4 @@
+# Adapter-side humanization only; never download or launch its browser in worker.
 cloakbrowser==0.6.3
 playwright==1.64.0
 fastapi==0.143.1

@@ -11,6 +11,7 @@ import SignalEditor from "@/components/SignalEditor.vue";
 import WorkflowStepEditor from "@/components/WorkflowStepEditor.vue";
 import { useAuthStore } from "@/stores/auth";
 import { formatServerDateTime } from "@/utils/datetime";
+import { usePersistedSearch } from "@/utils/persistedSearch";
 import type { ExportItem } from "@/types/export";
 import type {
   Feature,
@@ -72,7 +73,7 @@ interface EditorForm {
 const auth = useAuthStore();
 const router = useRouter();
 const sites = ref<SiteSummary[]>([]);
-const siteSearch = ref("");
+const siteSearch = usePersistedSearch("siteflow:sites:search");
 const templates = ref<TemplateSummary[]>([]);
 const features = ref<Feature[]>([]);
 const cfboxEnabled = ref(false);

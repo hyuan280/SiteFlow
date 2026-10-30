@@ -13,5 +13,3 @@ local
 *.sqlite
 *.log
 .build-resources/**
-!.build-resources/worker/
-!.build-resources/worker/**

@@ -3,7 +3,7 @@
 ## 1. 前置条件
 
 - Docker + Docker Compose。
-- GHCR 镜像部署无需 Node.js；源码构建另需 Node.js 22/npm、curl 和 sha256sum。
+- GHCR 镜像部署无需 Node.js；源码构建另需 Node.js 22/npm。
 - 可选：可达的 SOCKS5/HTTP(S) 代理、2FAuth 服务、Bitwarden 自托管保险库。
 - 图形验证码的 ddddocr 和 NexusPHP GD 5 模板识别已内置在 worker 镜像中，无需额外服务或配置；视觉模型方式需要配置大模型。
 - 元素拾取器使用交互车道 + VNC；拾取会话默认 15 分钟过期，可用 `SITEFLOW_PICKER_TTL_SECONDS` 调整。
@@ -15,12 +15,14 @@
 cp .env.example .env
 chmod 600 .env
 openssl rand -base64 32   # 填入 SITEFLOW_MASTER_KEY
+openssl rand -hex 32     # 填入 SITEFLOW_BROWSER_TOKEN（不是许可证密钥）
 ```
 
 最少配置：
 
 ```dotenv
 SITEFLOW_MASTER_KEY=<base64 32 bytes>
+SITEFLOW_BROWSER_TOKEN=<random token>
 ```
 
 可选：
@@ -67,7 +69,7 @@ docker compose -f ops/docker-compose.yml ps
 
 访问 `http://localhost:8088`。
 
-`ops/build.sh` 先准备本地缓存资源，在宿主机执行 `npm ci && npm run build`，再直接使用 `docker build` 构建并加载四个运行时镜像。默认使用标准构建网络；需要 host 构建网络时运行 `bash ops/build.sh --host`，脚本同时传入 `--network=host` 和 `--allow=network.host`，无需 Compose 覆盖文件，也不改变容器运行网络。需要支持 Buildx/BuildKit 的 Docker。Python 包默认使用清华 PyPI 源，npm 使用公共 registry；单独构建时可通过 `--build-arg PIP_INDEX_URL=...` 或 `--build-arg NPM_REGISTRY=...` 覆盖。
+`ops/build.sh` 在宿主机执行 `npm ci && npm run build`，再直接使用 `docker build` 构建并加载四个 SiteFlow 镜像。浏览器官方镜像由 Compose 直接拉取，不在项目内构建。默认使用标准构建网络；需要 host 构建网络时运行 `bash ops/build.sh --host`，脚本同时传入 `--network=host` 和 `--allow=network.host`，也不改变容器运行网络。需要支持 Buildx/BuildKit 的 Docker。Python 包默认使用清华 PyPI 源，npm 使用公共 registry。
 
 ## 4. 服务与端口
 
@@ -75,11 +77,13 @@ docker compose -f ops/docker-compose.yml ps
 |------|------------|----------|------|
 | web | 8088 | 80 | Caddy，SPA + `/api` 反代 |
 | api | 无 | 8000 | FastAPI，SQLite |
-| worker | 无 | 6300, 6310-6313 | 车道、KasmVNC |
+| worker | 无 | 6300 | 工作流与浏览器后端客户端 |
+| browser | 无 | 8080 | 官方 Manager，CDP/VNC 转发与浏览器 |
+| cfbox | 无 | 8000 | `ghcr.io/hyuan280/cfbox`，截图识别与内置 ONNX 模型 |
 | bitwarden | 无 | 8090 | 可选，`bw` CLI HTTP 包装服务；API 自动检测 |
 
 - 不使用 host 网络。
-- 只有 web 对宿主机暴露；bitwarden 仅在 compose 网络内提供 8090，外部部署时由 SiteFlow 数据库配置 URL。
+- 只有 web 对宿主机暴露；cfbox、bitwarden、browser 仅在 compose 内部网络提供端口。
 - KasmVNC 端口不要发布；VNC 通过 API WebSocket 代理访问。
 
 ## 5. 首次登录
@@ -99,7 +103,9 @@ docker compose -f ops/docker-compose.yml logs api | sed -n 's/^api-1  | password
 
 - `siteflow_data`：SQLite、API 数据。
 - `bitwarden_data`：Bitwarden CLI 登录状态与本地配置；保险库数据仍在远端 Bitwarden 服务。
-- `worker_data`：CloakBrowser profiles、Xvnc 日志、车道运行数据。
+- `worker_data`：浏览器 profile ID 映射及车道运行数据。
+- `browser_data`：外部浏览器 profiles 和 Manager 数据，需与 worker 映射一起备份。
+- `browser_x11`：仅供 browser/worker 的 X11 socket，不是持久化业务数据。
 - `siteflow_artifacts`：任务日志和失败截图，API/worker 共享挂载到 `/app/artifacts`。
 - 备份时需要同时备份 `.env` 中的 `SITEFLOW_MASTER_KEY`；主密钥丢失则数据库中的加密配置不可恢复。
 - 如需保留日志和截图，同时备份 `siteflow_artifacts` 卷（实际卷名通常为 `siteflow_siteflow_artifacts`）。
@@ -139,7 +145,7 @@ docker compose -f ops/docker-compose.yml down -v
 ## 9. 故障排查
 
 - `worker` 不可达：检查 `api` 内 `SITEFLOW_WORKER_URL`、Compose 网络、worker 健康状态。
-- 车道启动失败：查看 worker 日志和 `/app/data/logs/xvnc-*.log`。
+- 车道启动失败：查看 worker 与 browser 服务日志、令牌是否一致及 keyless 版本检查。
 - VNC 黑屏：检查 `.vnc-screen` 容器、noVNC target 是否为 div、WebSocket 是否建立。
 - 代理站点失败：确认 `SITEFLOW_PROXY_URL`；系统不会回退直连。
 - 2FAuth 失败：确认 URL/Token，或查看 `docs/verification.md` 的绑定说明。

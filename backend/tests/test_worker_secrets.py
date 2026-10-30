@@ -62,15 +62,29 @@ def test_plugin_step_never_resolves_secret(monkeypatch):
     assert result == ("success", "ok", {})
 
 
-def test_login_fill_errors_do_not_echo_password(monkeypatch):
+@pytest.mark.parametrize("failure", ["username", "password", "mismatch"])
+def test_login_fill_errors_do_not_echo_password(monkeypatch, failure):
     import worker.executor as executor
     import worker.secret_client as client
     from types import SimpleNamespace
     class Locator:
+        def __init__(self, name):
+            self.name = name
+
         async def fill(self, value, **kwargs):
-            raise RuntimeError(f"browser call log value={value}")
+            self.value = value
+            if self.name == failure:
+                raise RuntimeError(f"browser call log value={value}")
+
+        async def input_value(self, **kwargs):
+            return "" if failure == "mismatch" and self.name == "password" else self.value
+
+        async def click(self, **kwargs):
+            raise AssertionError("Must not submit a failed or unverified fill")
+
+    locators = iter(Locator(name) for name in ("username", "password", "submit"))
     async def locate(*args, **kwargs):
-        return Locator()
+        return next(locators)
     async def secret(*args):
         return {"username": "private-user", "password": "private-password"}
     monkeypatch.setattr(executor, "_find_locator", locate)

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -13,11 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
+import websockets
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from worker.executor import execute_job
+from worker.browser_backend import BrowserSession, create_backend
 from worker.plugin_broker import (
     BrokerActionError,
     BrokerDenied,
@@ -34,8 +36,6 @@ logging.basicConfig(
 logger = logging.getLogger("siteflow.worker")
 
 DATA_DIR = Path(os.environ.get("SITEFLOW_WORKER_DATA", "/app/data"))
-PROFILE_ROOT = DATA_DIR / "cloak" / "profiles"
-LOG_ROOT = DATA_DIR / "logs"
 PROXY_URL = os.environ.get("SITEFLOW_PROXY_URL", "").strip()
 PLUGIN_BROKER_URL = os.environ.get(
     "SITEFLOW_PLUGIN_BROKER_URL", "http://worker:6300/plugin-broker"
@@ -48,8 +48,6 @@ LANE_DEFINITIONS: list[dict[str, Any]] = [
     {"key": "proxy_interaction", "label": "代理交互", "proxy": True},
 ]
 
-BASE_DISPLAY = int(os.environ.get("SITEFLOW_LANE_BASE_DISPLAY", "120"))
-BASE_WS_PORT = int(os.environ.get("SITEFLOW_LANE_BASE_WS_PORT", "6310"))
 LANE_CONCURRENCY = {
     "general": max(1, int(os.environ.get("SITEFLOW_LANE_GENERAL_CONCURRENCY", "5"))),
     "interaction": 1,
@@ -107,15 +105,12 @@ class LaneRuntime:
     key: str
     label: str
     proxy: bool
-    display_num: int
-    ws_port: int
-    profile: Path
     enabled: bool = True
     status: str = "stopped"  # stopped / starting / running / stopping / error / disabled
     browser: str = "stopped"
     error: str | None = None
     started_at: str | None = None
-    xvnc: subprocess.Popen | None = None
+    session: BrowserSession | None = None
     context: Any = None
     page: Any = None
     task_pages: dict[str, Any] = field(default_factory=dict)
@@ -130,8 +125,8 @@ class LaneRuntime:
     )
 
     @property
-    def display(self) -> str:
-        return f":{self.display_num}"
+    def display(self) -> str | None:
+        return self.session.display if self.session else None
 
     @property
     def in_use(self) -> int:
@@ -156,9 +151,8 @@ class LaneRuntime:
             "status": self.status,
             "browser": self.browser,
             "display": self.display if active else None,
-            "ws_port": self.ws_port if self.status == "running" else None,
             "profile": f"profiles/{self.key}",
-            "vnc_available": self.status == "running",
+            "vnc_available": self.status == "running" and self.session is not None and not self.session.disconnected,
             "in_use": self.in_use,
             "task_pages": len(self.task_pages),
             "browser_pages": len(self.context.pages) if self.context is not None else 0,
@@ -175,15 +169,13 @@ class LaneRuntime:
 
 class LaneManager:
     def __init__(self) -> None:
+        self.backend = create_backend(DATA_DIR)
         self.lanes: dict[str, LaneRuntime] = {}
-        for index, definition in enumerate(LANE_DEFINITIONS):
+        for definition in LANE_DEFINITIONS:
             lane = LaneRuntime(
                 key=definition["key"],
                 label=definition["label"],
                 proxy=bool(definition["proxy"]),
-                display_num=BASE_DISPLAY + index,
-                ws_port=BASE_WS_PORT + index,
-                profile=PROFILE_ROOT / definition["key"],
                 max_concurrency=LANE_CONCURRENCY.get(definition["key"], 1),
             )
             lane.execution_semaphore.resize(lane.max_concurrency)
@@ -203,8 +195,7 @@ class LaneManager:
 
     async def start(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
-        LOG_ROOT.mkdir(parents=True, exist_ok=True)
+        await self.backend.prepare()
         # Lanes are deliberately not started here. They are started by the UI
         # or leased by a task runner.
         self._idle_task = asyncio.create_task(self._idle_monitor(), name="lane-idle-monitor")
@@ -220,6 +211,7 @@ class LaneManager:
         for lane in self.lanes.values():
             async with lane.lock:
                 await self._stop_lane_locked(lane, force=True)
+        await self.backend.close()
 
     def update_settings(
         self,
@@ -253,9 +245,22 @@ class LaneManager:
     async def _idle_monitor(self) -> None:
         while True:
             await asyncio.sleep(1)
-            if self.idle_stop_seconds <= 0:
-                continue
             for lane in list(self.lanes.values()):
+                if lane.session is not None and lane.session.disconnected:
+                    async with lane.lock:
+                        if lane.session is None or not lane.session.disconnected:
+                            continue
+                        lane.status = "error"
+                        lane.browser = "error"
+                        lane.error = "Browser backend disconnected"
+                        if not lane.in_use:
+                            try:
+                                await self._stop_lane_locked(lane)
+                            except Exception:
+                                logger.warning("disconnected stop failed for %s; will retry", lane.key)
+                    continue
+                if self.idle_stop_seconds <= 0:
+                    continue
                 if lane.status != "running" or lane.in_use or lane.viewers:
                     continue
                 if time.monotonic() - lane.last_activity_at < lane.idle_stop_seconds:
@@ -269,7 +274,10 @@ class LaneManager:
                     ):
                         continue
                     logger.info("auto-stopping idle lane %s after %ss", lane.key, lane.idle_stop_seconds)
-                    await self._stop_lane_locked(lane)
+                    try:
+                        await self._stop_lane_locked(lane)
+                    except Exception:
+                        logger.warning("idle stop failed for %s; lane remains in error", lane.key)
 
     def get(self, key: str) -> LaneRuntime:
         lane = self.lanes.get(key)
@@ -282,6 +290,10 @@ class LaneManager:
         if not lane.enabled:
             raise LaneDisabledError(lane.error or "车道未启用")
         async with lane.lock:
+            if lane.session is not None and lane.session.disconnected:
+                if lane.in_use:
+                    raise LaneStartError("Browser backend disconnected; active tasks are terminating")
+                lane.status = "error"
             if lane.status == "running":
                 return lane.view()
             await self._start_lane_locked(lane)
@@ -304,6 +316,10 @@ class LaneManager:
         if not lane.enabled:
             raise LaneDisabledError(lane.error or "车道未启用")
         async with lane.lock:
+            if lane.session is not None and lane.session.disconnected:
+                if lane.in_use:
+                    raise LaneStartError("Browser backend disconnected; active tasks are terminating")
+                lane.status = "error"
             if lane.status != "running":
                 await self._start_lane_locked(lane)
             lease_id = uuid.uuid4().hex
@@ -364,23 +380,23 @@ class LaneManager:
     async def _start_lane_locked(self, lane: LaneRuntime) -> None:
         if lane.status == "running":
             return
-        await self._cleanup_locked(lane)
+        await self._cleanup_locked(lane, strict=True)
         lane.status = "starting"
         lane.browser = "starting"
         lane.error = None
         lane.started_at = _now_iso()
         try:
-            self._clean_profile_locks(lane.profile)
-            await self._start_xvnc(lane)
             await self._start_browser(lane)
             lane.status = "running"
             lane.browser = "running"
-            logger.info("lane %s started display=%s ws=%s", lane.key, lane.display, lane.ws_port)
-        except Exception as exc:
+            logger.info("lane %s connected display=%s", lane.key, lane.display)
+        except BaseException as exc:
             lane.error = f"{type(exc).__name__}: {exc}"
             await self._cleanup_locked(lane)
             lane.status = "error"
             lane.browser = "error"
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             logger.exception("lane %s failed to start", lane.key)
             raise LaneStartError(lane.error) from exc
 
@@ -391,7 +407,13 @@ class LaneManager:
             raise LaneBusyError(f"车道 {lane.key} 正在执行任务，禁止关闭")
         lane.status = "stopping"
         lane.browser = "stopping"
-        await self._cleanup_locked(lane)
+        try:
+            await self._cleanup_locked(lane, strict=not force)
+        except Exception:
+            lane.status = "error"
+            lane.browser = "error"
+            lane.error = "Browser backend stop failed"
+            raise LaneStartError(lane.error) from None
         lane.status = "stopped"
         lane.browser = "stopped"
         lane.started_at = None
@@ -400,97 +422,21 @@ class LaneManager:
         lane.viewers.clear()
         logger.info("lane %s stopped", lane.key)
 
-    async def _cleanup_locked(self, lane: LaneRuntime) -> None:
-        if lane.context is not None:
+    async def _cleanup_locked(self, lane: LaneRuntime, *, strict: bool = False) -> None:
+        if lane.session is not None:
             try:
-                await asyncio.wait_for(lane.context.close(), timeout=10)
+                await asyncio.wait_for(self.backend.stop(lane.session), timeout=20)
             except Exception:
-                logger.warning("failed to close context for %s", lane.key, exc_info=True)
-            lane.context = None
-            lane.page = None
-        if lane.xvnc is not None:
-            try:
-                lane.xvnc.terminate()
-                lane.xvnc.wait(timeout=5)
-            except Exception:
-                try:
-                    lane.xvnc.kill()
-                except Exception:
-                    pass
-            lane.xvnc = None
-
-    @staticmethod
-    def _clean_profile_locks(profile: Path) -> None:
-        profile.mkdir(parents=True, exist_ok=True)
-        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            try:
-                (profile / name).unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    async def _start_xvnc(self, lane: LaneRuntime) -> None:
-        log_path = LOG_ROOT / f"xvnc-{lane.key}.log"
-        log_file = open(log_path, "w", encoding="utf-8")
-        cmd = [
-            "Xvnc",
-            lane.display,
-            "-websocketPort", str(lane.ws_port),
-            "-rfbport", "-1",
-            "-geometry", "1920x1080",
-            "-depth", "24",
-            "-SecurityTypes", "None",
-            "-DisableBasicAuth",
-            "-interface", "0.0.0.0",
-            "-publicIP", "127.0.0.1",
-            "-AlwaysShared",
-            "-httpd", "/usr/share/kasmvnc/www",
-        ]
-        process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-        log_file.close()
-        lane.xvnc = process
-        env = {**os.environ, "DISPLAY": lane.display}
-        deadline = time.monotonic() + 20
-        last = ""
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise RuntimeError(f"Xvnc exited with {process.returncode}")
-            probe = subprocess.run(
-                ["xdotool", "getdisplaygeometry"],
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=3,
-                check=False,
-            )
-            if probe.returncode == 0 and probe.stdout.strip():
-                return
-            last = (probe.stderr or probe.stdout or "").strip()
-            await asyncio.sleep(0.25)
-        raise RuntimeError(f"Xvnc display not ready: {last}")
+                logger.warning("failed to stop browser backend for %s", lane.key)
+                if strict:
+                    raise
+            lane.session = None
+        lane.context = None
+        lane.page = None
 
     async def _start_browser(self, lane: LaneRuntime) -> None:
-        from cloakbrowser import launch_persistent_context_async
-
-        env = {**os.environ, "DISPLAY": lane.display}
-        proxy = PROXY_URL if lane.proxy else None
-        context = await launch_persistent_context_async(
-            user_data_dir=str(lane.profile),
-            headless=False,
-            proxy=proxy or None,
-            viewport={"width": 1920, "height": 947},
-            args=[
-                "--use-angle=swiftshader",
-                "--fingerprint-platform=windows",
-                "--fingerprint-gpu-vendor=Intel",
-                "--fingerprint-screen-width=1920",
-                "--fingerprint-screen-height=1080",
-            ],
-            env=env,
-            timezone="Asia/Shanghai",
-            locale="zh-CN",
-            humanize=True,
-            human_preset="default",
-        )
+        lane.session = await self.backend.start(lane.key, PROXY_URL if lane.proxy else None)
+        context = lane.session.context
         lane.context = context
         page = context.pages[0] if context.pages else await context.new_page()
         lane.page = page
@@ -759,6 +705,8 @@ def create_app() -> FastAPI:
             return await app.state.manager.stop_lane(key)
         except LaneBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LaneStartError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post("/lanes/{key}/lease")
     async def lease_lane(key: str) -> dict[str, Any]:
@@ -794,6 +742,45 @@ def create_app() -> FastAPI:
         except LaneNotRunningError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"focused": True, "lane": lane}
+
+    @app.websocket("/lanes/{key}/vnc")
+    async def vnc(websocket: WebSocket, key: str) -> None:
+        token = os.environ.get("SITEFLOW_BROWSER_TOKEN", "")
+        authorization = websocket.headers.get("authorization", "")
+        if (websocket.headers.get("origin") is not None or not token
+                or not secrets.compare_digest(authorization, f"Bearer {token}")):
+            await websocket.close(code=4403, reason="Unauthorized internal viewer")
+            return
+        lane = app.state.manager.get(key)
+        if lane.session is None or lane.session.disconnected:
+            await websocket.close(code=4404)
+            return
+        await websocket.accept(subprotocol="binary" if "binary" in websocket.scope.get("subprotocols", []) else None)
+        url, headers = app.state.manager.backend.vnc_connection(lane.session)
+        try:
+            async with websockets.connect(url, additional_headers=headers, subprotocols=["binary"],
+                                          max_size=None, compression=None, ping_interval=None) as upstream:
+                async def forward():
+                    while True:
+                        message = await websocket.receive()
+                        if message["type"] == "websocket.disconnect":
+                            return
+                        data = message.get("bytes")
+                        if data is not None:
+                            await upstream.send(data)
+                async def backward():
+                    async for data in upstream:
+                        if isinstance(data, bytes):
+                            await websocket.send_bytes(data)
+                tasks = [asyncio.create_task(forward()), asyncio.create_task(backward())]
+                try:
+                    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            await websocket.close(code=1011, reason="Browser viewer unavailable")
 
     @app.put("/settings")
     async def update_settings(payload: IdleSettings) -> dict[str, Any]:

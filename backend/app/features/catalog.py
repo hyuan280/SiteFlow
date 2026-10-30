@@ -35,7 +35,7 @@ class FlowOpenConfig(FeatureConfig):
         default=5,
         ge=0,
         le=20,
-        description="页面打开失败后的重试次数；遇到网络错误时按次数重试",
+        description="首次访问失败后的重试次数；网络错误或站点错误页均重试，错误页重试时临时禁用当前标签页缓存；0 表示不重试",
     )
 
 

@@ -11,7 +11,6 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_session, get_db, get_settings, require_csrf
 from app.core.auth import SESSION_COOKIE
 from app.core.config import Settings
-from app.core.rfb import build_server_cut_text, filter_client_messages, parse_kasmvnc_clipboard
 from app.models.auth import AuthSession
 from app.schemas.lane import LaneFocusRequest, LaneStatus, LanesResponse
 from app.services.auth import AuthService
@@ -112,7 +111,6 @@ def _authenticate_websocket(websocket: WebSocket, session: Session, settings: Se
 
 
 async def _client_to_worker(websocket: WebSocket, upstream) -> None:
-    handshake = 0
     try:
         while True:
             message = await websocket.receive()
@@ -121,8 +119,7 @@ async def _client_to_worker(websocket: WebSocket, upstream) -> None:
             data = message.get("bytes")
             if not data:
                 continue
-            handshake += 1
-            payload = data if handshake <= 3 else filter_client_messages(data)
+            payload = data
             if payload:
                 await upstream.send(payload)
     except Exception:
@@ -133,11 +130,6 @@ async def _worker_to_client(websocket: WebSocket, upstream) -> None:
     try:
         async for message in upstream:
             if isinstance(message, bytes):
-                if message and message[0] == 180:
-                    text = parse_kasmvnc_clipboard(message)
-                    if text:
-                        await websocket.send_bytes(build_server_cut_text(text))
-                    continue
                 await websocket.send_bytes(message)
             else:
                 await websocket.send_text(message)
@@ -170,7 +162,7 @@ async def lane_vnc(websocket: WebSocket, lane_key: str) -> None:
         await websocket.close(code=4404, reason="Worker unavailable")
         return
     lane = next((item for item in status.get("lanes") or [] if item.get("key") == lane_key), None)
-    if lane is None or not lane.get("vnc_available") or not lane.get("ws_port"):
+    if lane is None or not lane.get("vnc_available"):
         await websocket.close(code=4404, reason="Lane VNC unavailable")
         return
 
@@ -181,12 +173,16 @@ async def lane_vnc(websocket: WebSocket, lane_key: str) -> None:
         await websocket.close(code=4404, reason=str(exc))
         return
 
-    worker_url = service.ws_url(int(lane["ws_port"]))
+    worker_url = service.ws_url(lane_key)
     try:
+        token = settings.browser_token.get_secret_value() if settings.browser_token else ""
+        if not token:
+            await websocket.close(code=1011, reason="Viewer authentication not configured")
+            return
         async with websockets.connect(
             worker_url,
+            additional_headers={"Authorization": f"Bearer {token}"},
             subprotocols=["binary"],
-            origin=f"http://127.0.0.1:{lane['ws_port']}",
             max_size=None,
             ping_interval=None,
             ping_timeout=None,

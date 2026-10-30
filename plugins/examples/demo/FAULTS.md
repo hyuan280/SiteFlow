@@ -6,15 +6,19 @@ Run from `backend`:
 SITEFLOW_DEMO_E2E=1 SITEFLOW_DEMO_FAULTS=1 ../.venv/bin/pytest -q -s tests/test_demo_e2e.py
 ```
 
-Requires the existing `siteflow-worker` image and frontend Node dependencies.
-The harness creates a disposable worker, temporary API database, local HTTP fixture,
+Requires the remote-backend `siteflow-worker` image, the pinned official Manager
+image and frontend Node dependencies. Set `SITEFLOW_DEMO_WORKER_IMAGE` to test an
+alternate local worker tag. The harness creates a disposable worker and Manager,
+dedicated X11 socket volume, temporary API database, local HTTP fixture,
 and local gRPC server. Only the isolated demo registration is approved. No live
 provider or external website is contacted. `faults.json` is separate from the normal
 single-site import; the normal 19-step demo is unchanged.
 
 Coverage: normal ordered execution, wrong result, wrong OTP, popup followed by
 built-in click (the opener has no matching button), long cooperative RPC timeout,
-cancel, delayed broker click timeout, revoke during execution, and dropped plugin.
+cancel, delayed broker click timeout, revoke during execution, dropped plugin and
+external browser backend loss. It also validates remote profile/cookie reuse,
+humanized input, desktop capture/click, picker sessions and VNC framebuffer/input.
 Fault cases assert terminal non-success, RPC handler settlement where applicable,
 zero lane leases, zero broker sessions, zero task-page mappings, and at most the
 lane home page remaining. Unit tests cover ownership isolation, cross-origin and

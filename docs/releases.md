@@ -22,8 +22,8 @@ git tag api-v1.0
 git push origin api-v1.0
 ```
 
-Web 发布会先构建前端。Worker 发布会先下载固定浏览器、KasmVNC 和字体资源，
-资源及构建层使用 GitHub Actions 缓存；这些二进制资源不提交到 Git。
+Web 发布会先构建前端。Worker 不下载或打包浏览器、KasmVNC 服务端和字体，
+仅构建执行器及远程后端客户端；构建层使用 GitHub Actions 缓存。
 CI 使用官方 PyPI，宿主机构建仍默认使用清华 PyPI、阿里云 apt 源。
 
 ## GitHub 配置
@@ -35,14 +35,13 @@ CI 使用官方 PyPI，宿主机构建仍默认使用清华 PyPI、阿里云 apt
 - Fork 自动使用小写的仓库所有者命名镜像；部署时设置 `SITEFLOW_IMAGE_OWNER`。
 - 也可在 Actions 手工运行工作流，选择组件与版本。应选定发布提交，避免覆盖已有正式版本。
 
-Worker 内含 CloakBrowser 浏览器二进制和微软核心字体。keyless 不代表允许向第三方
-分发浏览器。发布前须核实上游再分发/OEM 授权及字体许可；确认后才可将 GitHub 仓库
-变量 `CLOAKBROWSER_REDISTRIBUTION_ALLOWED` 设为 `true`。未确认时 Worker 发布会失败，
-API、Web、Bitwarden 不受影响。该变量只是发布检查，不授予任何第三方许可。
+Worker 不包含 CloakBrowser 二进制，因此不再要求原预装方案的
+`CLOAKBROWSER_REDISTRIBUTION_ALLOWED` 变量。官方 Manager 镜像由用户在部署时直接拉取，
+SiteFlow 不重新打包、托管或发布该镜像。其上游许可独立适用；MIT 不覆盖浏览器和字体。
 
 ## 使用发布镜像
 
-将 `.env.example` 复制为 `.env`，设置加密主密钥，并按需要固定各组件版本：
+将 `.env.example` 复制为 `.env`，设置加密主密钥、随机 `SITEFLOW_BROWSER_TOKEN`，并按需要固定各组件版本：
 
 ```dotenv
 SITEFLOW_API_VERSION=v1.0

@@ -467,7 +467,7 @@ GET  /api/v1/plugin-runtime/plugins/{plugin_id}
   "current_url": "https://pt.example.com/index.php",
   "deadline_ms": 30000,
   "broker": {
-    "url": "https://worker:6310/plugin-broker",
+    "url": "http://worker:6300/plugin-broker",
     "token": "step-scoped-token"
   }
 }

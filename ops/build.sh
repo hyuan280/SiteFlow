@@ -14,7 +14,6 @@ if (( $# > 1 )); then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bash "$ROOT/ops/download-worker-resources.sh"
 cd "$ROOT/frontend"
 
 npm ci --no-audit --no-fund

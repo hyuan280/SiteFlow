@@ -123,7 +123,7 @@ docker compose -f ops/docker-compose.yml logs -f api
 - 前端在宿主机执行 `npm ci && npm run build`，Docker 只把 `frontend/dist` 复制进 Caddy 镜像；容器构建不访问 npm registry。
 - 只有 `web` 发布宿主机端口 `8088`；`api` 仅在 Compose 内部 `expose: 8000`，不对宿主机暴露。
 - 不使用 host 网络；`api` 与 `web` 都运行在 `siteflow_default` bridge 网络。
-- `worker` 同样不使用 host 网络：Xvnc、xdotool、ffmpeg 全部在 worker 容器内部执行，只通过内部网络向 `api` 提供状态和 KasmVNC WebSocket。
+- `worker` 与浏览器后端不使用 host 网络。浏览器和 Xvnc 在官方 browser 容器内，Worker 仅通过 CDP/Manager API、VNC 和专用共享 X11 socket 访问；Manager API 使用独立随机令牌，外部仍由 SiteFlow 管理员会话鉴权。
 - 车道状态与 noVNC 见 `docs/vnc.md`。
 - SQLite 使用命名卷 `siteflow_siteflow_data`。
 - 本地 HTTP 使用 `SITEFLOW_COOKIE_SECURE=false`；生产 HTTPS 应设为 `true`。

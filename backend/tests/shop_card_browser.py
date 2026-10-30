@@ -1,4 +1,4 @@
-"""Isolated regression: run in worker image, no production volumes or network needed."""
+"""Isolated regression: worker + dedicated remote backend, never production profiles."""
 import asyncio
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -6,7 +6,7 @@ from threading import Thread
 from urllib.parse import parse_qs
 from unittest.mock import patch
 
-from cloakbrowser import launch_async
+from worker.browser_backend import ManagerBackend
 from worker.executor import _extract_card_info, _purchase_cards
 
 
@@ -39,9 +39,10 @@ async def main():
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
-    browser = await launch_async(headless=True, args=['--no-sandbox'])
+    backend = ManagerBackend(Path('/tmp/shop-browser-smoke'))
+    session = await backend.start('shop-smoke', None)
     try:
-        page = await browser.new_page()
+        page = await session.context.new_page()
         url = f'http://127.0.0.1:{server.server_port}/mybonus.php'
         await page.goto(url)
         log = lambda *_args: None
@@ -74,7 +75,8 @@ async def main():
         assert await _extract_card_info(page, {}, log) is None
         print('PASS: browser DOM, legacy table, scoped coin price, zero option, hidden fields, button text, limits, refreshed CSRF, local POST, cross-origin rejection, ambiguity')
     finally:
-        await browser.close()
+        await backend.stop(session)
+        await backend.close()
         server.shutdown()
 
 

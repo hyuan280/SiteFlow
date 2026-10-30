@@ -131,3 +131,43 @@ def test_stop_lane_busy(client: TestClient, monkeypatch) -> None:
     response = client.post("/api/v1/lanes/general/stop")
     assert response.status_code == 409
     assert "任务运行中" in response.json()["detail"]
+
+
+def test_viewer_proxy_authenticates_internal_connection(client: TestClient, monkeypatch) -> None:
+    from pydantic import SecretStr
+    from starlette.websockets import WebSocketDisconnect
+    import pytest
+
+    monkeypatch.setattr(client.app.state.settings, "browser_token", SecretStr("fixture-viewer-token"))
+    async def status(_self):
+        return {"lanes": [{"key": "general", "vnc_available": True}]}
+
+    async def viewer(_self, *_args):
+        return {}
+
+    connections = []
+    class Upstream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    def connect(url, **kwargs):
+        connections.append(kwargs)
+        return Upstream()
+
+    monkeypatch.setattr(LaneService, "raw_status", status)
+    monkeypatch.setattr(LaneService, "viewer_acquire", viewer)
+    monkeypatch.setattr(LaneService, "viewer_release", viewer)
+    monkeypatch.setattr("app.api.v1.lanes.websockets.connect", connect)
+    with client.websocket_connect("/api/v1/lanes/general/vnc") as socket:
+        with pytest.raises(WebSocketDisconnect):
+            socket.receive_bytes()
+    assert connections[0]["additional_headers"] == {"Authorization": "Bearer fixture-viewer-token"}

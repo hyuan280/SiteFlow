@@ -26,9 +26,9 @@ class LaneService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def _post(self, path: str, payload: dict | None = None) -> dict:
+    async def _post(self, path: str, payload: dict | None = None, *, timeout: float | None = None) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=self.settings.worker_timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout or self.settings.worker_timeout) as client:
                 response = await client.post(
                     f"{self.settings.worker_url.rstrip('/')}{path}",
                     json=payload,
@@ -67,20 +67,20 @@ class LaneService:
             return False
 
     async def start_lane(self, key: str) -> dict:
-        return await self._post(f"/lanes/{key}/start")
+        return await self._post(f"/lanes/{key}/start", timeout=max(120, self.settings.worker_timeout))
 
     async def stop_lane(self, key: str) -> dict:
-        return await self._post(f"/lanes/{key}/stop")
+        return await self._post(f"/lanes/{key}/stop", timeout=max(30, self.settings.worker_timeout))
 
     async def lease_lane(self, key: str) -> dict:
-        return await self._post(f"/lanes/{key}/lease")
+        return await self._post(f"/lanes/{key}/lease", timeout=max(120, self.settings.worker_timeout))
 
     async def release_lane(self, key: str, lease_id: str) -> dict:
         return await self._post(f"/lanes/{key}/release", {"lease_id": lease_id})
 
     async def open_picker(self, url: str, lane_key: str = "interaction") -> dict:
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=180.0) as client:
                 response = await client.post(
                     f"{self.settings.worker_url.rstrip('/')}/picker/open",
                     json={"url": url, "lane_key": lane_key},
@@ -204,7 +204,7 @@ class LaneService:
             )
         return LanesResponse(worker_connected=True, lanes=lanes)
 
-    def ws_url(self, ws_port: int) -> str:
+    def ws_url(self, lane_key: str) -> str:
         parsed = urlparse(self.settings.worker_url)
-        host = parsed.hostname or "worker"
-        return f"ws://{host}:{ws_port}/websockify"
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return f"{scheme}://{parsed.netloc}{parsed.path.rstrip('/')}/lanes/{lane_key}/vnc"

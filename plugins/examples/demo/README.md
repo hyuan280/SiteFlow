@@ -67,7 +67,8 @@ Isolated browser verification (does not approve or call the deployed plugin):
 
 Requires the existing `siteflow-worker` image, Docker on Linux (host networking),
 the project `.venv` with backend test dependencies and `frontend/node_modules`.
-The test starts its own disposable worker container, local HTTP fixture and real
+The test starts disposable remote-backend worker and official Manager containers,
+with a dedicated X11 socket volume, local HTTP fixture and real
 authenticated gRPC control/execution runtime. A temporary TestClient API database
 registers and approves only that isolated plugin, imports via the actual UI
 parser/payload expression and backend SiteWrite/workflow resolver, then enables

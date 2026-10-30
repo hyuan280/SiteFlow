@@ -1,4 +1,5 @@
 FROM caddy:2-alpine
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/siteflow/
 
 COPY ops/Caddyfile /etc/caddy/Caddyfile
 COPY frontend/dist /srv

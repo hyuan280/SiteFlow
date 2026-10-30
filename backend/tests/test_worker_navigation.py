@@ -4,6 +4,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from worker.executor import (  # noqa: E402
@@ -16,6 +18,7 @@ from worker.executor import (  # noqa: E402
     _export_site_cookies,
     _fetch_bitwarden_credentials,
     _goto_if_needed,
+    _NavigationPageError,
     _run_flow_jump,
     _run_step,
     _same_navigation_url,
@@ -441,6 +444,8 @@ class _CfStatePage:
         self.url = url
 
     async def evaluate(self, script: str):
+        if "CF page body unavailable" in script:
+            return "欢迎回来"
         if "cf-turnstile-response" in script:
             return self.token_length
         return self.marker
@@ -697,6 +702,111 @@ def test_flow_open_returns_failure_for_error_page() -> None:
     assert status == "fail"
     assert "bad gateway" in message
     assert data["error_page"] == "bad gateway"
+
+
+class _CachedErrorPage(_ErrorPage):
+    def __init__(self, outcomes, *, same_url=False):
+        super().__init__("The website has been stopped", "")
+        self.url = "https://pt.example.com/" if same_url else "about:blank"
+        self.outcomes = iter(outcomes)
+        self.visits = []
+        self.commands = []
+        self.detached = False
+        self.context = self
+
+    async def goto(self, url, **_kwargs):
+        self.visits.append(url)
+        self.url = url
+        outcome = next(self.outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        self.title_text = outcome
+
+    async def new_cdp_session(self, page):
+        assert page is self
+        return self
+
+    async def send(self, method, params=None):
+        self.commands.append((method, params))
+
+    async def detach(self):
+        self.detached = True
+
+
+@pytest.mark.parametrize("same_url", [False, True])
+def test_open_error_page_retries_same_target_without_cache(same_url):
+    async def run():
+        page = _CachedErrorPage(
+            ["Welcome"] if same_url else ["The website has been stopped", "Welcome"],
+            same_url=same_url,
+        )
+        assert await _goto_if_needed(
+            page, "https://pt.example.com/", "domcontentloaded", lambda *_: None,
+            "页面", retry_count=1, retry_interval_seconds=0, check_error_page=True,
+        )
+        assert len(page.visits) == (1 if same_url else 2)
+        assert set(page.visits) == {"https://pt.example.com/"}
+        assert page.commands == [
+            ("Network.enable", None),
+            ("Network.setCacheDisabled", {"cacheDisabled": True}),
+            ("Network.setCacheDisabled", {"cacheDisabled": False}),
+        ]
+        assert page.detached
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("retry_count", [0, 2])
+def test_open_error_page_exhausts_retry_budget_and_preserves_failure_data(monkeypatch, retry_count):
+    async def no_wait(_seconds):
+        pass
+
+    monkeypatch.setattr("worker.executor.asyncio.sleep", no_wait)
+    page = _CachedErrorPage(["The website has been stopped"] * (retry_count + 1))
+    status, message, data = asyncio.run(_run_step(
+        page, {"feature_type": "flow.open", "config": {
+            "url": "https://pt.example.com/", "retry_count": retry_count,
+        }}, None, None, None, None, None, "general",
+    ))
+    assert status == "fail"
+    assert "the website has been stopped" in message
+    assert data == {"url": page.url, "error_page": "the website has been stopped"}
+    assert len(page.visits) == retry_count + 1
+    assert page.detached == bool(retry_count)
+    if not retry_count:
+        assert page.commands == []
+
+
+def test_open_network_and_page_errors_share_one_retry_budget():
+    async def run():
+        page = _CachedErrorPage([
+            RuntimeError("Page.goto: net::ERR_CONNECTION_RESET"),
+            "The website has been stopped",
+            "The website has been stopped",
+        ])
+        with pytest.raises(_NavigationPageError):
+            await _goto_if_needed(
+                page, "https://pt.example.com/", "domcontentloaded", lambda *_: None,
+                "页面", retry_count=2, retry_interval_seconds=0, check_error_page=True,
+            )
+        assert len(page.visits) == 3
+        assert page.detached
+
+    asyncio.run(run())
+
+
+def test_open_cache_setting_restored_on_cancellation():
+    async def run():
+        page = _CachedErrorPage(["The website has been stopped", asyncio.CancelledError()])
+        with pytest.raises(asyncio.CancelledError):
+            await _goto_if_needed(
+                page, "https://pt.example.com/", "domcontentloaded", lambda *_: None,
+                "页面", retry_count=1, retry_interval_seconds=0, check_error_page=True,
+            )
+        assert page.commands[-1] == ("Network.setCacheDisabled", {"cacheDisabled": False})
+        assert page.detached
+
+    asyncio.run(run())
 
 
 def test_non_success_step_statuses_capture_screenshot(monkeypatch, tmp_path) -> None:
