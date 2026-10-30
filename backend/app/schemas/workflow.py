@@ -6,7 +6,13 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.features.base import CAPTCHA_DEFAULT_PROMPT, ErrorPolicy, Lane, LanePolicy
+from app.features.base import (
+    CAPTCHA_DEFAULT_PROMPT,
+    RESULT_DEFAULT_PROMPT,
+    ErrorPolicy,
+    Lane,
+    LanePolicy,
+)
 from app.schemas.credential import SiteCredentialView
 
 
@@ -18,6 +24,16 @@ class FeatureExecutionSettings(BaseModel):
         min_length=1,
         max_length=4000,
     )
+
+
+class ResultExecutionSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    llm_enabled: bool = Field(default=False, strict=True)
+    use_vision: bool = Field(default=True, strict=True)
+    judgment_scope: Literal["success_only", "all"] = "success_only"
+    model: str = Field(default="", max_length=256)
+    llm_prompt: str = Field(default=RESULT_DEFAULT_PROMPT, min_length=1, max_length=4000)
 
 
 class FeatureView(BaseModel):
@@ -33,7 +49,7 @@ class FeatureView(BaseModel):
     required_fields: list[str] = Field(default_factory=list)
     base_required_fields: list[str] = Field(default_factory=list)
     customized: bool = False
-    execution_settings: FeatureExecutionSettings | None = None
+    execution_settings: FeatureExecutionSettings | ResultExecutionSettings | None = None
     source: str = "builtin"
 
 

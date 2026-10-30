@@ -56,6 +56,7 @@ export function categoryLabel(category: string): string {
 
 export function featureSupportsLlm(feature: Feature | undefined | null): boolean {
   if (!feature) return false;
+  if (feature.key === "flow.result") return true;
   if (feature.requires.includes("vision")) return true;
   return (feature.config_schema.properties?.captcha_method?.enum ?? []).includes("vision");
 }
@@ -66,6 +67,13 @@ export function stepUsesLlm(
   inherited?: ConfigObject | null,
 ): boolean {
   if (!feature) return false;
+  if (feature.key === "flow.result") {
+    const effective = mergeConfig(inherited ?? {}, config);
+    if (feature.execution_settings?.llm_enabled !== true || effective.llm_enabled !== true) return false;
+    const outputValue = effective.output_value ??
+      feature.defaults.output_value ?? feature.config_schema.properties?.output_value?.default ?? true;
+    return feature.execution_settings.judgment_scope === "all" || outputValue === true;
+  }
   if (feature.requires.includes("vision")) return true;
   const method =
     config.captcha_method ??

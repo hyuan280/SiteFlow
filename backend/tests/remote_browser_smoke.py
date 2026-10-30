@@ -1,6 +1,7 @@
 """Executed inside the isolated worker by test_demo_e2e, never on live profiles."""
 import asyncio
 import io
+import json
 import shutil
 import time
 import threading
@@ -11,7 +12,7 @@ from PIL import Image
 
 from worker.browser_backend import ManagerBackend
 from worker.app import _inject_picker
-from worker.executor import _goto_if_needed
+from worker.executor import _goto_if_needed, _run_step
 from cloakbrowser.human.engine import Human
 from cloakbrowser.human.patch import original
 from playwright import async_api
@@ -175,6 +176,18 @@ async def main():
         class CacheFixture(BaseHTTPRequestHandler):
             stopped = True
             requests = 0
+            model_requests = []
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                self.model_requests.append(body)
+                content = body['messages'][1]['content']
+                is_image = any(part['type'] == 'image_url' for part in content)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'choices': [{'message': {
+                    'content': 'False' if is_image else 'True'}, 'finish_reason': 'stop'}]}).encode())
 
             def do_GET(self):
                 if self.path != "/":
@@ -213,6 +226,23 @@ async def main():
             await page.goto(url)
             assert CacheFixture.requests == 2, "Cache must be restored after recovery"
             print("PASS cached HTTP-200 error page recovers within retry budget; cache restored")
+            for visual in (True, False):
+                status, _, data = await _run_step(page, {
+                    'feature_type': 'flow.result', 'config': {'output_value': True, 'llm_enabled': True},
+                }, None, None, None, None, None, 'general', vision={
+                    'base_url': url.rstrip('/'), 'model': 'fixture', 'api_key': 'fixture-token',
+                    'supports_vision': True, 'execution_settings': {
+                        'llm_enabled': True, 'use_vision': visual, 'judgment_scope': 'all',
+                    },
+                })
+                assert status == 'success'
+                assert data['value'] is (not visual)
+            image_content = CacheFixture.model_requests[0]['messages'][1]['content']
+            assert 'Welcome' not in image_content[0]['text']
+            assert image_content[1]['image_url']['url'].startswith('data:image/png;base64,')
+            text_content = CacheFixture.model_requests[1]['messages'][1]['content']
+            assert len(text_content) == 1 and 'Welcome' in text_content[0]['text']
+            print('PASS result judgement with real page screenshot/text and isolated model HTTP responses')
         finally:
             fixture.shutdown()
             fixture.server_close()

@@ -25,12 +25,18 @@ IMAGE_CAPTCHA_FEATURES = frozenset(
     {"challenge.image_captcha", "sign.iframe.image_captcha"}
 )
 VISION_FEATURES = IMAGE_CAPTCHA_FEATURES | {"sign.image_quiz"}
+EXECUTION_SETTINGS_FEATURES = VISION_FEATURES | {"flow.result"}
 CAPTCHA_DEFAULT_PROMPT = (
     "Read the captcha in this image. Return only its characters, without "
     "explanation, spaces, or Markdown. Preserve letter case."
 )
 IMAGE_QUIZ_DEFAULT_PROMPT = (
     "你是一个识图答题助手。根据图片内容回答题目，选择最符合图片的选项。"
+)
+RESULT_DEFAULT_PROMPT = (
+    "检查这个页面，判断网站是否已登录，并仔细检查是否存在未签到的标记。"
+    "如果没有登录或尚未签到，则输出 False；只有明确已登录且已签到才输出 True。"
+    "必须明确输出结论，只返回 True 或 False，不要解释。"
 )
 
 
@@ -117,6 +123,8 @@ FIELD_TITLES: dict[str, str] = {
     "ajax_date_param": "补签日期参数",
     "output_value": "输出值",
     "message": "输出信息",
+    "llm_enabled": "大模型结果判断",
+    "llm_prompt": "判断提示词（可选）",
 }
 
 

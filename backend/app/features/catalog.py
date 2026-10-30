@@ -451,6 +451,15 @@ class FlowResultConfig(FeatureConfig):
         max_length=2000,
         description="写入步骤结果和站点任务结果的信息；留空时使用输出值",
     )
+    llm_enabled: bool = Field(
+        default=False,
+        strict=True,
+        description="启用本步骤的大模型结果判断；还需启用全局大模型判断开关，模型必须只输出 True 或 False",
+    )
+    llm_prompt: Annotated[str, StringConstraints(strip_whitespace=True, max_length=4000)] = Field(
+        default="",
+        description="可选的本步骤判断提示词；留空时使用全局提示词；需同时启用全局和本步骤大模型判断，模型必须只输出 True 或 False",
+    )
 
 
 class PostBuyCardConfig(FeatureConfig):

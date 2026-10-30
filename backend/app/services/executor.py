@@ -418,15 +418,39 @@ class ExecutionManager:
                 if resign_days
                 else []
             )
-            from app.features.base import VISION_FEATURES
+            from app.features.base import EXECUTION_SETTINGS_FEATURES
             from app.features.catalog import get_feature
             from app.services.feature_settings import FeatureSettingsService
 
-            feature_execution_settings = {
-                key: FeatureSettingsService(session).execution_settings(get_feature(key)).model_dump(mode="json")
-                for key in {step.feature_type for step in resolved.steps if step.enabled}
-                if key in VISION_FEATURES
-            }
+            feature_settings = FeatureSettingsService(session)
+            feature_execution_settings = {}
+            for key in {step.feature_type for step in resolved.steps if step.enabled}:
+                if key not in EXECUTION_SETTINGS_FEATURES:
+                    continue
+                behavior = feature_settings.execution_settings(get_feature(key))
+                if key == "flow.result" and not (
+                    behavior.llm_enabled
+                    and any(
+                        step.enabled
+                        and step.feature_type == key
+                        and step.config.get("llm_enabled") is True
+                        and (
+                            behavior.judgment_scope == "all"
+                            or step.config.get("output_value") is True
+                        )
+                        for step in resolved.steps
+                    )
+                ):
+                    continue
+                feature_execution_settings[key] = behavior.model_dump(mode="json")
+            needs_vision_runtime = "flow.result" in feature_execution_settings or any(
+                step.enabled
+                and (
+                    step.feature_type == "sign.image_quiz"
+                    or step.config.get("captcha_method") == "vision"
+                )
+                for step in resolved.steps
+            )
             payload = {
                 "job_id": job.id,
                 "run_id": run.id,
@@ -440,14 +464,7 @@ class ExecutionManager:
                 "cookies": cookies,
                 "cfbox": cfbox,
                 "feature_execution_settings": feature_execution_settings,
-                "vision": integrations.vision_runtime() if any(
-                    step.enabled
-                    and (
-                        step.feature_type == "sign.image_quiz"
-                        or step.config.get("captcha_method") == "vision"
-                    )
-                    for step in resolved.steps
-                ) else None,
+                "vision": integrations.vision_runtime() if needs_vision_runtime else None,
                 "resign_pending_dates": resign_pending,
                 "resign_max_days": resign_days,
                 "plugin_runtimes": plugin_runtimes,

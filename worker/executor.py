@@ -3161,6 +3161,44 @@ async def _run_step(
 
     if feature in {"flow.result", "action.result"}:
         value = bool(config.get("output_value", True))
+        behavior = (vision or {}).get("execution_settings") or {}
+        if (behavior.get("llm_enabled") is True and config.get("llm_enabled") is True
+                and (value or behavior.get("judgment_scope") == "all")):
+            from worker.vision import DEFAULT_RESULT_PROMPT, judge_result
+
+            model = {**(vision or {})}
+            if behavior.get("model"):
+                model["model"] = behavior["model"]
+            if not all(model.get(key) for key in ("base_url", "model", "api_key")):
+                return "fail", "未配置大模型，无法判断输出结果", {"reason": "model_unavailable"}
+            use_vision = behavior.get("use_vision", True)
+            if use_vision and not model.get("supports_vision", True):
+                return "fail", "大模型未开启视觉支持，无法判断输出结果", {"reason": "vision_not_supported"}
+            note("INFO", f"大模型判断输出结果开始，输入方式：{'页面截图（不含页面文本）' if use_vision else '页面文本'}")
+            try:
+                if use_vision:
+                    evidence = {"image": await page.screenshot(type="png", timeout=PAGE_TIMEOUT_MS)}
+                else:
+                    # innerText excludes input values and hidden DOM; bound what
+                    # leaves the browser and treat page content as untrusted data.
+                    text = await asyncio.wait_for(page.evaluate(
+                        "() => document.body ? document.body.innerText.slice(0, 24000) : ''"
+                    ), timeout=5)
+                    if not isinstance(text, str) or not text.strip():
+                        raise ValueError()
+                    evidence = {"page_text": text}
+                prompt = str(config.get("llm_prompt") or "").strip()
+                judged = await judge_result(model, prompt or behavior.get("llm_prompt") or DEFAULT_RESULT_PROMPT, **evidence)
+                if type(judged) is not bool:
+                    raise ValueError()
+            except Exception:
+                return "fail", "大模型判断失败或未返回明确的 True/False 结论", {"reason": "model_judgment_failed"}
+            message = f"大模型判断结果: {str(judged).lower()}"
+            note("INFO", message)
+            if judged == value:
+                message = str(config.get("message") or "").strip() or f"输出结果: {str(value).lower()}"
+            return "success", message, {"value": judged, "message": message,
+                                         "original_value": value, "judged_by": "llm"}
         message = str(config.get("message") or "").strip()
         if not message:
             message = f"输出结果: {str(value).lower()}"
@@ -3710,6 +3748,11 @@ async def _execute_admitted_job(
                         timeout = min(
                             3600, max(30, (retry_count + 1) * (PAGE_TIMEOUT_MS // 1000 + 2))
                         )
+                    elif feature_type in {"flow.result", "action.result"} and (
+                        (payload.get("feature_execution_settings") or {}).get(feature_type, {}).get("llm_enabled")
+                        and (step.get("config") or {}).get("llm_enabled") is True
+                    ):
+                        timeout = min(3600, max(30, float((payload.get("vision") or {}).get("timeout") or 30) + 35))
                     else:
                         timeout = 30
                 step_key_value = str(step.get("step_key") or "") or None

@@ -8,6 +8,7 @@ import { type ConfigObject, type JsonSchema, effectiveValue } from "@/utils/sche
 import {
   categoryLabel,
   collectConditionLeaves,
+  mergeConfig,
   parseConditionExpr,
 } from "@/utils/workflow";
 
@@ -36,7 +37,32 @@ const emit = defineEmits<{
   (event: "feature-change"): void;
 }>();
 
-const schema = computed<JsonSchema>(() => props.feature?.config_schema ?? {});
+const isResult = computed(() => props.step.feature_type === "flow.result");
+const schema = computed<JsonSchema>(() => {
+  const source = props.feature?.config_schema ?? {};
+  if (!isResult.value) return source;
+  return {
+    ...source,
+    properties: Object.fromEntries(Object.entries(source.properties ?? {})
+      .filter(([key]) => key !== "llm_enabled" && key !== "llm_prompt")),
+    required: source.required?.filter((key) => key !== "llm_enabled" && key !== "llm_prompt"),
+  };
+});
+const globalLlmEnabled = computed(() => props.feature?.execution_settings?.llm_enabled === true);
+const resultConfig = computed(() => mergeConfig(props.inherited ?? {}, props.step.config));
+const llmEnabled = computed({
+  get: () => resultConfig.value.llm_enabled === true,
+  set: (value: boolean) => { props.step.config = { ...props.step.config, llm_enabled: value }; },
+});
+const llmPrompt = computed({
+  get: () => typeof resultConfig.value.llm_prompt === "string" ? resultConfig.value.llm_prompt : "",
+  set: (value: string) => { props.step.config = { ...props.step.config, llm_prompt: value }; },
+});
+function resetResultField(key: "llm_enabled" | "llm_prompt"): void {
+  const next = { ...props.step.config };
+  delete next[key];
+  props.step.config = next;
+}
 const conditionOpen = ref(false);
 const conditionMode = ref<"all" | "any">("all");
 const conditionRows = ref<
@@ -154,8 +180,14 @@ function errorValue(): string {
       <span>执行条件：{{ conditionLabel() }}</span>
       <span>错误策略：{{ ERROR_POLICIES.find((item) => item.value === errorValue())?.label }}</span>
       <span v-if="step.timeout_seconds">超时时间：{{ step.timeout_seconds }}s</span>
+      <span v-if="isResult">
+        开启模型判断：{{ llmEnabled ? "是" : "否" }}{{ !Object.hasOwn(step.config, 'llm_enabled') && inherited?.llm_enabled !== undefined ? '（继承）' : '' }}{{ !globalLlmEnabled ? '（全局关闭，当前不生效）' : '' }}
+      </span>
     </div>
     <div class="readonly-grid">
+      <FloatingField v-if="isResult && llmEnabled" label="模型判断提示词" :has-value="true">
+        <span class="readonly-value">{{ llmPrompt.trim() ? llmPrompt : '使用全局提示词' }}{{ !Object.hasOwn(step.config, 'llm_prompt') && inherited?.llm_prompt !== undefined ? '（继承）' : '' }}</span>
+      </FloatingField>
       <FloatingField
         v-for="entry in entries"
         :key="entry.key"
@@ -308,6 +340,40 @@ function errorValue(): string {
       </FloatingField>
     </div>
 
+    <div v-if="isResult" class="config-block result-llm">
+      <div class="config-head">
+        <label class="result-toggle">
+          <span>开启模型判断</span>
+          <el-switch v-model="llmEnabled" :disabled="!globalLlmEnabled" aria-label="开启模型判断" />
+        </label>
+        <el-button
+          v-if="Object.hasOwn(step.config, 'llm_enabled')"
+          size="small" text :disabled="!globalLlmEnabled"
+          @click="resetResultField('llm_enabled')"
+        >{{ inherited?.llm_enabled !== undefined ? '恢复继承' : '恢复默认关闭' }}</el-button>
+        <span v-else-if="inherited?.llm_enabled !== undefined" class="muted">继承模板设置</span>
+      </div>
+      <p v-if="!globalLlmEnabled" class="muted">全局模型判断已关闭，当前步骤配置不生效；已保存的开关和提示词会保留。</p>
+      <p v-else class="muted">默认关闭；仅当前步骤开启后，才会按全局判断范围调用模型。</p>
+      <template v-if="llmEnabled">
+        <div class="config-head">
+          <span>自定义判断提示词（可选）</span>
+          <el-button
+            v-if="Object.hasOwn(step.config, 'llm_prompt')"
+            size="small" text :disabled="!globalLlmEnabled"
+            @click="resetResultField('llm_prompt')"
+          >{{ inherited?.llm_prompt !== undefined ? '恢复继承提示词' : '使用全局提示词' }}</el-button>
+          <span v-else-if="inherited?.llm_prompt !== undefined" class="muted">继承模板提示词</span>
+        </div>
+        <el-input
+          v-model="llmPrompt" type="textarea" :rows="4" :maxlength="4000" show-word-limit
+          :disabled="!globalLlmEnabled" placeholder="留空使用全局结果判断提示词"
+          aria-label="步骤模型判断提示词"
+        />
+        <p class="muted">最多 4000 字符，留空使用全局提示词。自定义提示词必须明确要求以 True 或 False 作结论。</p>
+      </template>
+    </div>
+
     <div v-if="feature" class="config-block">
       <div class="config-head">
         <strong>功能字段</strong>
@@ -315,7 +381,7 @@ function errorValue(): string {
       </div>
       <SchemaConfigForm
         v-model="step.config"
-        :schema="feature.config_schema"
+        :schema="schema"
         :inherited="inherited ?? null"
         :picker-base-url="pickerBaseUrl"
         :step-options="stepOptions"
@@ -521,6 +587,19 @@ function errorValue(): string {
 
 .config-head span {
   font-size: 12px;
+}
+
+.result-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.result-llm .muted {
+  margin: 6px 0;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 @media (max-width: 900px) {

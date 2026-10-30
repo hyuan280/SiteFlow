@@ -6,9 +6,9 @@ from sqlalchemy.orm import Session
 
 from app.features.base import (
     CAPTCHA_DEFAULT_PROMPT,
+    EXECUTION_SETTINGS_FEATURES,
     FeatureConfigError,
     IMAGE_QUIZ_DEFAULT_PROMPT,
-    VISION_FEATURES,
 )
 from app.features.plugin_registry import (
     RemoteFeature,
@@ -16,7 +16,7 @@ from app.features.plugin_registry import (
     schema_required,
 )
 from app.models.setting import AppSetting
-from app.schemas.workflow import FeatureView, FeatureExecutionSettings
+from app.schemas.workflow import FeatureView, FeatureExecutionSettings, ResultExecutionSettings
 
 
 def _is_remote(feature) -> bool:
@@ -97,16 +97,18 @@ class FeatureSettingsService:
         return result
 
     def execution_settings(self, feature):
-        if feature.key not in VISION_FEATURES:
+        if feature.key not in EXECUTION_SETTINGS_FEATURES:
             return None
         row = self.session.get(AppSetting, f"feature.{feature.key}")
         policy = json.loads(row.value_json) if row else {}
+        stored = policy.get("execution_settings") or {}
+        if feature.key == "flow.result":
+            return ResultExecutionSettings.model_validate(stored)
         default_prompt = (
             IMAGE_QUIZ_DEFAULT_PROMPT
             if feature.key == "sign.image_quiz"
             else CAPTCHA_DEFAULT_PROMPT
         )
-        stored = policy.get("execution_settings") or {}
         prompt = stored.get("llm_prompt")
         if not isinstance(prompt, str) or not prompt:
             prompt = default_prompt
@@ -136,14 +138,19 @@ class FeatureSettingsService:
         )
 
     def update(self, feature, defaults, required, execution_settings=None):
-        if execution_settings is not None and feature.key not in VISION_FEATURES:
+        if execution_settings is not None and feature.key not in EXECUTION_SETTINGS_FEATURES:
             raise FeatureConfigError("Execution settings are not supported for this feature")
         if execution_settings is not None:
             values = dict(execution_settings)
             if feature.key == "sign.image_quiz":
                 values.setdefault("llm_prompt", IMAGE_QUIZ_DEFAULT_PROMPT)
             try:
-                behavior = FeatureExecutionSettings.model_validate(values)
+                settings_model = (
+                    ResultExecutionSettings
+                    if feature.key == "flow.result"
+                    else FeatureExecutionSettings
+                )
+                behavior = settings_model.model_validate(values)
             except ValidationError:
                 raise FeatureConfigError(
                     "Invalid execution settings: must satisfy code type and constraints"

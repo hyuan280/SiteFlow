@@ -2,6 +2,10 @@ import type { JsonSchema } from "@/utils/schema";
 
 export interface FeatureExecutionSettings {
   llm_prompt: string;
+  llm_enabled?: boolean;
+  use_vision?: boolean;
+  judgment_scope?: "success_only" | "all";
+  model?: string;
 }
 
 export interface Feature {
