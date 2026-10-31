@@ -84,6 +84,7 @@ challenge.2fa
 challenge.turnstile
 challenge.altcha
 challenge.slider
+challenge.grid_captcha
 action.navigate / action.wait / action.click / action.fill
 flow.result
 sign.button / sign.iframe.image_captcha / sign.image_quiz / sign.unit3d_claim
@@ -96,6 +97,9 @@ post.resign
 - `challenge.turnstile`：先检查 `.cf-turnstile`、`cf-turnstile-response`、`cf-chl-widget`、CF iframe、挑战文案；存在挑战时截图调用 CFbox，按复选框中心点击。CFbox 返回 `absent` 但 DOM 仍有挑战时继续等待，不直接判成功；完全没有 CF 标记约 2 秒后才视为无挑战。`wait_seconds` 是从步骤开始计算的总等待上限，包含 DOM 检测、CFbox 调用和点击后的等待，不是固定延时；未配置 CFbox 返回 `waiting_human`。
 - `challenge.altcha`：定位 ALTCHA 组件并点击复选框，等待组件进入 `verified` 状态或写入 Token；`wait_seconds` 控制最长等待时间。
 - `challenge.slider`：拖动手柄到容器右侧；配置了 `success_selector` 时等待成功元素。
+- `challenge.grid_captcha`：独立的九宫格多选验证码功能块（`challenge` 类别，允许多例），始终要求视觉模型，不属于字符验证码的 `captcha_method`。截图必须同时包含目标参考图与完整 3×3 网格，单元从左到右、从上到下编号 1–9，选择所有匹配项；不清楚时刷新，不猜测。未配置视觉模型或未开启「支持视觉」时需要人工处理。全局提示词在「功能管理」配置，不进入步骤字段。
+
+九宫格统一使用 `max_refresh` 控制额外重试次数，默认 3（首次加重试最多 4 轮），范围 0–10；0 表示不额外重试。识别不清刷新、答错后自动换题、识别期间题目变化，共用同一预算，不按原因或每轮重置。例如识别不清刷新一次、答错换题一次，合计已消耗 2 次重试。每次重新截图和识别。开始识别前等待题目稳定；模型返回后若确认题目已更新且新题无预选，也可丢弃旧答案并重试。提交后只有确认出现不同的新题才会重新作答，提交超时、异常或仅有状态文字变化不会盲目重复提交。次数耗尽转人工，日志记录验证轮次、重试次数和累计模型调用次数。
 - `sign.image_quiz`：读取签到页面上的答题图片、可选题目文字和选项，调用视觉模型选择答案，填写留言并点击对应选项提交；模型无法确定答案时按 `refresh_selector` 刷新换题，超过 `max_refresh` 或未配置视觉模型时返回 `waiting_human`。答题图片会保存为截图 artifact。提示词在「功能管理」的执行行为中全局配置，不进入步骤配置。
 - `sign.unit3d_claim`：点击 Claim 按钮后等待成功条件，支持成功文本、出现元素或消失元素三种判断，任一满足即成功；都未配置时点击后直接成功。
 - `sign.iframe.image_captcha`：在签到 iframe 内填写静态字段，识别图像验证码并填入，然后点击 iframe 提交按钮；验证码校验、刷新和任务重启逻辑与 `challenge.image_captcha` 相同。
@@ -110,6 +114,44 @@ post.resign
 - `post.buy_card` 未配置步骤超时时会根据购买数量和间隔自动放宽，避免默认 30 秒超时。
 
 `action.*` 和签到步骤支持候选选择器按顺序尝试。`sign.*.success_signals` 按页面文本匹配；`sign.unit3d_claim` 还支持 `success_selector`（成功后出现）和 `success_when_missing`（成功后消失）。
+
+### 九宫格工作流组合
+
+将打开页面、触发签到、处理验证码与输出结果拆为独立步骤，不在验证码功能中写入站点地址或凭据。例如以下站点配置片段使用占位站点和示例签到按钮选择器，实际使用时替换为页面对应选择器：
+
+```json
+{
+  "name": "Grid check-in example",
+  "base_url": "https://site.example",
+  "steps": [
+    {"step_key": "open", "feature_type": "flow.open"},
+    {
+      "step_key": "signup",
+      "feature_type": "action.click",
+      "config": {"selector": ["#signup"]}
+    },
+    {
+      "step_key": "grid",
+      "feature_type": "challenge.grid_captcha",
+      "on_error": "stop",
+      "config": {
+        "image_selector": [".geetest_panel_box", ".geetest_widget"],
+        "cell_selector": [".geetest_item"],
+        "success_signals": ["验证成功", "驗證成功", "今天已经签到过啦", "今天已經簽到過啦"]
+      }
+    },
+    {
+      "step_key": "result",
+      "feature_type": "flow.result",
+      "config": {"output_value": true, "message": "Check-in confirmed"}
+    }
+  ]
+}
+```
+
+`image_selector` 是有序候选区域，首个命中区域必须包含目标和全部九格，不能只截取网格。`cell_selector` 同样按候选顺序定位单元集合。`selected_selector` 默认 `.geetest_selected, .selected, [aria-checked="true"], [aria-selected="true"]`，含义是对每个单元自身做 CSS `matches`，不是在其内部查找子元素。刷新和提交按钮候选默认分别为 `[".geetest_refresh"]` 和 `[".geetest_commit"]`。
+
+提交后需要明确的成功条件：`success_signals`（任一文本命中）、`success_selector`（任一元素出现）或显式配置的 `success_when_missing`（列表中全部元素消失），三类条件任一满足才成功。默认使用示例中的四个成功文本，两个选择器列表均为空；验证码面板消失本身不代表已解决。不要仅把从未出现的备用选择器放入 `success_when_missing`，以免其缺失被当成成功。按站点实际成功状态调整条件。`success_wait_seconds` 默认 10 秒，范围 1–120；所有成功条件都清空仍允许保存，但运行时应返回 `unknown`，不能无条件成功。后续无条件 `flow.result` 应保留在验证码成功之后，不要用 `on_error=continue` 绕过确认。
 
 `flow.jump` 检查页面文字（不区分大小写）或选择器；命中后可按配置跳转到任意步骤 key，或重新开始任务。未命中时继续执行后续步骤；`max_jumps` 防止条件持续命中造成死循环，超过上限任务失败。
 

@@ -1,17 +1,34 @@
 import os
 
 import httpx
+import regex
 from urllib.parse import urlsplit
 
 
-def require_site_origin(current, base):
+def require_site_origin(current, base, trusted_urls=None):
     def origin(value):
+        if (not isinstance(value, str) or len(value) > 8192
+                or any(ord(ch) <= 32 or ord(ch) == 127 for ch in value) or "\\" in value):
+            raise ValueError()
         parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-            raise RuntimeError("Secret origin denied")
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+            raise ValueError()
         return parsed.scheme, parsed.hostname.lower(), parsed.port or (443 if parsed.scheme == "https" else 80)
-    if origin(current) != origin(base):
-        raise RuntimeError("Secret origin denied")
+    try:
+        if origin(current) == origin(base):
+            return
+        if not isinstance(trusted_urls, list) or len(trusted_urls) > 20:
+            raise ValueError()
+        for pattern in trusted_urls:
+            if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 1024:
+                raise ValueError()
+            regex.compile(pattern, flags=regex.VERSION0)
+        for pattern in trusted_urls:
+            if regex.fullmatch(pattern, current, flags=regex.VERSION0, timeout=0.025):
+                return
+    except (ValueError, TypeError, regex.error, TimeoutError, KeyError):
+        pass
+    raise RuntimeError("Secret origin denied: 当前页面不属于站点同源或可信网址")
 
 
 async def resolve_secret(payload, step):

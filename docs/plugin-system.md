@@ -918,7 +918,7 @@ SITEFLOW_PLUGIN_DEMO_TOKEN=replace-with-a-random-token
 - API `SecretProviders` 统一处理 `builtin.manual`、`builtin.bitwarden` 和 `builtin.twofauth`，使用加密凭据、Bitwarden 启用/匹配字段、2FAuth 集成配置和步骤 `service_hint`。
 - 普通 worker job payload 不包含用户名、密码、Bitwarden API token 或 2FAuth API token；包含当前任务所需的 Cookie、CFbox/vision 运行配置。
 - 每次 job attempt 生成独立 256-bit 随机 worker capability，绑定 job/site/attempt、已启用的认证步骤、purpose 和 provider；不复用浏览器 broker token，也不使用新增全局共享 provider token。
-- Worker 仅在 `auth.form_login` / `challenge.2fa` 中通过内部 `POST /api/v1/internal/secrets/resolve` 申请 lease，再兑换凭据或 OTP；普通插件协议不包含 worker capability 或 lease。填写前检查页面仍处于站点 origin，不允许跨源 SSO 自动填写。
+- Worker 仅在 `auth.form_login` / `challenge.2fa` 中通过内部 `POST /api/v1/internal/secrets/resolve` 申请 lease，再兑换凭据或 OTP；普通插件协议不包含 worker capability 或 lease。读取凭据、填写和提交前检查页面处于站点 origin 或显式配置的可信网址正则范围；跨源 SSO 必须由管理员在站点设置中单独授权。该授权不放宽插件浏览器代理的 origin 范围。
 - Lease 为 256-bit 随机不透明值，30 秒有效，绑定 job/site/step/purpose/provider。在锁内原子消费，先消费再调用 provider，失败也不能复用。同一 scope 再申请会替换尚未使用的 lease。worker capability 在执行超时后失效。
 - capability/lease 只在 API 单进程内存中保存 SHA-256 摘要和非秘密作用域，不持久化、不缓存明文。当前要求单 API 进程；重启 fail closed，不能横向多进程共享 lease。
 - 任务结束、重试前、取消和 API shutdown 撤销 capability/lease；兑换前检查数据库取消/状态/attempt，provider 返回后再次检查。provider 调用已发出时取消不能撤回该外部请求，但不再向 worker 返回秘密。

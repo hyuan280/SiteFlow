@@ -1,6 +1,6 @@
 # 数据模型
 
-首次启动使用 SQLAlchemy `create_all` 按当前模型建表。v1 不包含旧版本数据库升级、数据回填或数据库移植工具；启动不会重写已有工作流。
+首次启动使用 SQLAlchemy `create_all` 按当前模型建表。启动额外检查并补齐 `sites.trusted_urls_json` 字段，旧站点默认空数组，不重写已有工作流。此操作可重复执行，不提供其他历史开发版本的通用升级或数据库移植保证。更新前应备份数据库，并避免多个 API 进程同时执行结构更新。
 
 ## 1. 已实现
 
@@ -32,7 +32,7 @@ sites(
   id, name UNIQUE, base_url, enabled, template_id,
   lane_policy, support_resign, resign_max_days,
   bitwarden_enabled, bitwarden_match_mode, bitwarden_custom_match,
-  checkin_after, timezone, tags_json, notes,
+  checkin_after, timezone, tags_json, trusted_urls_json, notes,
   config_revision, created_at, updated_at
 );
 

@@ -8,6 +8,7 @@ import CopyConfigDialog from "@/components/CopyConfigDialog.vue";
 import ExportSelectionDialog from "@/components/ExportSelectionDialog.vue";
 import FloatingField from "@/components/FloatingField.vue";
 import SignalEditor from "@/components/SignalEditor.vue";
+import StringListField from "@/components/StringListField.vue";
 import WorkflowStepEditor from "@/components/WorkflowStepEditor.vue";
 import { useAuthStore } from "@/stores/auth";
 import { formatServerDateTime } from "@/utils/datetime";
@@ -64,6 +65,7 @@ interface EditorForm {
   checkin_after: string;
   timezone: string;
   tagsText: string;
+  trusted_urls: string[];
   notes: string;
   steps: StepForm[];
   groups: GroupForm[];
@@ -289,6 +291,7 @@ function emptyForm(): EditorForm {
     checkin_after: "",
     timezone: "Asia/Shanghai",
     tagsText: "",
+    trusted_urls: [],
     notes: "",
     steps: [],
     groups: [],
@@ -316,6 +319,19 @@ async function handleUnauthorized(cause: unknown): Promise<boolean> {
     return true;
   }
   return false;
+}
+
+function trustedUrls(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((pattern) => typeof pattern !== "string")) {
+    throw new Error("trusted_urls 必须是字符串数组");
+  }
+  if (value.length > 20) throw new Error("可信 URL 正则最多 20 条");
+  if (value.some((pattern) => !pattern.trim() || [...pattern].length > 1024)) {
+    throw new Error("可信 URL 正则不能为空，且每条最多 1024 字符");
+  }
+  // Preserve patterns verbatim; Python regex validation belongs to the backend.
+  return [...value];
 }
 
 function importBitwardenMode(value: unknown): "domain" | "root_domain" | "custom" {
@@ -377,6 +393,7 @@ async function buildSiteExport(items: ExportItem[]): Promise<unknown> {
         checkin_after: detail.checkin_after,
         timezone: detail.timezone,
         tags: detail.tags,
+        trusted_urls: trustedUrls(detail.trusted_urls),
         notes: detail.notes,
         groups: detail.groups.map((group) => ({
           group_key: group.group_key,
@@ -417,6 +434,7 @@ async function importSitesFromFile(file: File): Promise<void> {
     if (!name) throw new Error(`第 ${index + 1} 个站点缺少名称`);
     if (seen.has(name)) throw new Error(`导入文件中站点名称重复：${name}`);
     seen.add(name);
+    trustedUrls(item.trusted_urls);
     const rawTemplate = item.template_name;
     const templateName =
       rawTemplate === null || rawTemplate === undefined
@@ -481,6 +499,7 @@ async function importSitesFromFile(file: File): Promise<void> {
           checkin_after: importText(entry.item.checkin_after) || null,
           timezone: importText(entry.item.timezone) || "Asia/Shanghai",
           tags: importArray(entry.item.tags),
+          trusted_urls: trustedUrls(entry.item.trusted_urls),
           notes: importText(entry.item.notes),
           groups: importArray(entry.item.groups),
           steps: importArray(entry.item.steps),
@@ -621,6 +640,7 @@ async function copyFromSite(id: number): Promise<void> {
     form.checkin_after = detail.checkin_after ?? "";
     form.timezone = detail.timezone;
     form.tagsText = detail.tags.join(", ");
+    form.trusted_urls = trustedUrls(detail.trusted_urls);
     form.notes = detail.notes;
     form.steps = detail.steps.map(stepToForm);
     form.groups = detail.groups.map(groupToForm);
@@ -679,6 +699,7 @@ async function openEdit(id: number): Promise<void> {
     form.checkin_after = detail.checkin_after ?? "";
     form.timezone = detail.timezone;
     form.tagsText = detail.tags.join(", ");
+    form.trusted_urls = trustedUrls(detail.trusted_urls);
     form.notes = detail.notes;
     credential.value = detail.credential;
     cookieInput.value = "";
@@ -733,6 +754,7 @@ function validateCredentialInputs(): void {
 function validate(): void {
   if (!form.name.trim()) throw new Error("请填写站点名称");
   if (!form.base_url.trim()) throw new Error("请填写站点地址");
+  trustedUrls(form.trusted_urls);
   if (form.checkin_after.trim() && !/^([01]\d|2[0-3]):[0-5]\d$/.test(form.checkin_after.trim())) {
     throw new Error("签到时间格式应为 HH:MM");
   }
@@ -806,6 +828,7 @@ function buildPayload(): Record<string, unknown> {
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean),
+    trusted_urls: trustedUrls(form.trusted_urls),
     notes: form.notes,
     groups: form.groups.map((group) => ({
       group_key: group.group_key,
@@ -1383,6 +1406,20 @@ onMounted(() => {
           </el-col>
         </el-row>
 
+        <div>
+          <StringListField
+            v-model="form.trusted_urls"
+            label="可信 URL 正则（仅本站点）"
+            add-label="添加可信 URL 正则"
+          />
+          <p class="muted trusted-url-help">
+            仅扩展登录凭据和 TOTP 的使用范围，不改变其他权限；原站点同源 URL 默认可信，留空不扩展。
+            每条 Python 正则对浏览器当前完整 HTTP(S) URL（含路径、查询和片段）进行全匹配，最多 20 条，每条 1-1024 字符。
+            正则有效性由后端校验。域名中的 <code>.</code> 应写为 <code>\.</code>；宽泛的 <code>.*</code> 不安全，可能向不可信页面泄露凭据。
+            示例：<code>^https://openid\.13a\.com/login(?:[/?#].*)?$</code>
+          </p>
+        </div>
+
         <FloatingField label="备注" :has-value="Boolean(form.notes)">
           <textarea
             :value="form.notes"
@@ -1823,6 +1860,13 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.trusted-url-help {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 
 .credential-tabs {

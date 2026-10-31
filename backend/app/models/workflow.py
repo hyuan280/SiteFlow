@@ -48,6 +48,9 @@ class Site(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     base_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    trusted_urls_json: Mapped[str] = mapped_column(
+        Text, default="[]", server_default="[]", nullable=False
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     template_id: Mapped[int | None] = mapped_column(
         ForeignKey("templates.id", ondelete="SET NULL"), nullable=True, index=True

@@ -27,6 +27,7 @@ from app.core.auth import LoginRateLimiter
 from app.core.config import Settings
 from app.core.crypto import CryptoService
 from app.core.db import Base, create_db_engine, create_session_factory
+from app.core.schema_updates import ensure_trusted_urls_column
 from app.features.plugin_registry import clear_plugin_registry, refresh_plugin_registry
 from app.services.artifacts import ArtifactCleanupRunner
 from app.services.execution import ExecutionService
@@ -55,6 +56,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     crypto = CryptoService(settings.master_key_bytes())
     engine = create_db_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    ensure_trusted_urls_column(engine)
     session_factory = create_session_factory(engine)
     bootstrap = bootstrap_admin(session_factory, settings)
     clear_plugin_registry()

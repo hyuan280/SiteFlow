@@ -159,6 +159,7 @@ export interface SiteSummary {
   checkin_after: string | null;
   timezone: string;
   tags: string[];
+  trusted_urls: string[];
   notes: string;
   config_revision: number;
   step_count: number;

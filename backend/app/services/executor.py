@@ -446,7 +446,7 @@ class ExecutionManager:
             needs_vision_runtime = "flow.result" in feature_execution_settings or any(
                 step.enabled
                 and (
-                    step.feature_type == "sign.image_quiz"
+                    "vision" in step.requires
                     or step.config.get("captcha_method") == "vision"
                 )
                 for step in resolved.steps
@@ -456,6 +456,7 @@ class ExecutionManager:
                 "run_id": run.id,
                 "site_name": job.site_name,
                 "base_url": site.base_url,
+                "trusted_urls": json.loads(site.trusted_urls_json),
                 "attempt": job.attempt,
                 "lane_key": job.lane,
                 "steps": [step.model_dump(mode="json") for step in resolved.steps],

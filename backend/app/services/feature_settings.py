@@ -8,6 +8,7 @@ from app.features.base import (
     CAPTCHA_DEFAULT_PROMPT,
     EXECUTION_SETTINGS_FEATURES,
     FeatureConfigError,
+    GRID_CAPTCHA_DEFAULT_PROMPT,
     IMAGE_QUIZ_DEFAULT_PROMPT,
 )
 from app.features.plugin_registry import (
@@ -17,6 +18,12 @@ from app.features.plugin_registry import (
 )
 from app.models.setting import AppSetting
 from app.schemas.workflow import FeatureView, FeatureExecutionSettings, ResultExecutionSettings
+
+
+_FEATURE_DEFAULT_PROMPTS = {
+    "sign.image_quiz": IMAGE_QUIZ_DEFAULT_PROMPT,
+    "challenge.grid_captcha": GRID_CAPTCHA_DEFAULT_PROMPT,
+}
 
 
 def _is_remote(feature) -> bool:
@@ -104,11 +111,7 @@ class FeatureSettingsService:
         stored = policy.get("execution_settings") or {}
         if feature.key == "flow.result":
             return ResultExecutionSettings.model_validate(stored)
-        default_prompt = (
-            IMAGE_QUIZ_DEFAULT_PROMPT
-            if feature.key == "sign.image_quiz"
-            else CAPTCHA_DEFAULT_PROMPT
-        )
+        default_prompt = _FEATURE_DEFAULT_PROMPTS.get(feature.key, CAPTCHA_DEFAULT_PROMPT)
         prompt = stored.get("llm_prompt")
         if not isinstance(prompt, str) or not prompt:
             prompt = default_prompt
@@ -142,8 +145,8 @@ class FeatureSettingsService:
             raise FeatureConfigError("Execution settings are not supported for this feature")
         if execution_settings is not None:
             values = dict(execution_settings)
-            if feature.key == "sign.image_quiz":
-                values.setdefault("llm_prompt", IMAGE_QUIZ_DEFAULT_PROMPT)
+            if feature.key in _FEATURE_DEFAULT_PROMPTS:
+                values.setdefault("llm_prompt", _FEATURE_DEFAULT_PROMPTS[feature.key])
             try:
                 settings_model = (
                     ResultExecutionSettings

@@ -1138,6 +1138,7 @@ class WorkflowService:
             id=site.id,
             name=site.name,
             base_url=site.base_url,
+            trusted_urls=json.loads(site.trusted_urls_json),
             enabled=site.enabled,
             template_id=site.template_id,
             template_name=self._template_name(site.template_id),
@@ -1483,6 +1484,7 @@ class WorkflowService:
         site = Site(
             name=payload.name,
             base_url=payload.base_url,
+            trusted_urls_json=json.dumps(payload.trusted_urls, ensure_ascii=False),
             enabled=payload.enabled,
             template_id=payload.template_id,
             lane_policy=payload.lane_policy,
@@ -1550,6 +1552,8 @@ class WorkflowService:
         self._apply_override_positions(payload.steps, inherited_steps)
         site.name = payload.name
         site.base_url = payload.base_url
+        if "trusted_urls" in payload.model_fields_set:
+            site.trusted_urls_json = json.dumps(payload.trusted_urls, ensure_ascii=False)
         site.enabled = payload.enabled
         site.template_id = payload.template_id
         site.lane_policy = payload.lane_policy

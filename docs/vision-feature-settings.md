@@ -26,7 +26,8 @@ Environment overrides DB independently per field:
 `supports_vision` defaults to true for existing deployments. When false, an image
 captcha step configured to use the `vision` method fails with
 `reason=vision_not_supported`; steps using `ddddocr` or `nexusphp_gd5` are
-unaffected. `sign.image_quiz` always requires vision and returns `waiting_human`.
+unaffected. `sign.image_quiz` and `challenge.grid_captcha` always require vision
+and require human handling (`waiting_human`) when vision is unavailable or disabled.
 
 `POST /integrations/vision/test` uses the saved `supports_vision` flag. When enabled,
 it submits an actual tiny PNG to `/chat/completions` and requires a nonempty textual
@@ -54,16 +55,19 @@ The image-captcha features also expose management-only `execution_settings` cont
 `llm_prompt` (default asks for captcha characters only, preserving case). The prompt
 is used only when the selected method is `vision`. `sign.image_quiz` exposes the same
 `llm_prompt` field as a custom quiz instruction with an image-quiz-specific default
-and always uses vision. Prompts are not step config fields or defaults. Runtime
+and always uses vision. `challenge.grid_captcha` has its own grid-specific default
+prompt and always uses vision as well. Prompts are not step config fields or defaults. Runtime
 integration secrets are sent separately from resolved workflow configs and are not
 included in persisted workflow snapshots or recognition logs.
 
 Worker requests include `feature_execution_settings: {"<feature key>":
 {"llm_prompt": string}}`, containing only enabled, supported features present in
 that execution. Provider credentials remain in the separate `vision` runtime field.
-They are sent only when an enabled image-captcha step selects `vision`, or when an
-enabled `sign.image_quiz` step needs vision. Neither runtime field is added to
-workflow snapshots.
+They are sent only when an enabled image-captcha step selects `vision`, an enabled
+step requires `vision` (including `sign.image_quiz` and `challenge.grid_captcha`),
+or a `flow.result` step passes the existing global/step/scope judgement gate.
+Disabled grid steps alone do not cause credentials or grid execution settings to
+be forwarded. Neither runtime field is added to workflow snapshots.
 
 `sign.image_quiz` always requires vision and has no ddddocr fallback. Without a
 configured model or with `supports_vision` disabled it returns `waiting_human`. It
@@ -74,7 +78,78 @@ content remains ignored. Unclear answers refresh the question up to `max_refresh
 times, then return `waiting_human`. Quiz requests use `max_tokens: 2048` to leave
 space for reasoning models to emit the final JSON.
 
-Recognition reads only the response message's `content`, never `reasoning_content`.
+### Grid Captcha
+
+`challenge.grid_captcha` is a repeatable `challenge` feature with
+`requires=["vision"]`. It is not an image-character captcha method: the
+`captcha_methods` registry remains `ddddocr`, `vision`, `nexusphp_gd5`, and grid
+steps have no `captcha_method`, input field, charset, or OCR fallback.
+
+| Config Field | Code Default | Meaning |
+| --- | --- | --- |
+| `image_selector` | `[".geetest_panel_box", ".geetest_widget"]` | Ordered selector candidates for a capture region containing both the target reference and the entire 3x3 grid. The first matching region must include both. |
+| `cell_selector` | `[".geetest_item"]` | Ordered candidates for grid cells, indexed 1-9 from left to right, top to bottom. |
+| `selected_selector` | `.geetest_selected, .selected, [aria-checked="true"], [aria-selected="true"]` | CSS `matches` predicate against each cell itself, not a descendant lookup. |
+| `refresh_selector` | `[".geetest_refresh"]` | Ordered refresh-button candidates. |
+| `submit_selector` | `[".geetest_commit"]` | Ordered submit-button candidates. |
+| `max_refresh` | `3` | Shared extra retry budget for unclear recognition, rejected answers with a regenerated grid, and stale challenges. Integer 0-10; default allows at most four rounds in total. |
+| `success_signals` | `["验证成功", "驗證成功", "今天已经签到过啦", "今天已經簽到過啦"]` | Success text candidates; any match confirms success. Customize for the actual site. |
+| `success_selector` | `[]` | Explicit success elements that appear. |
+| `success_when_missing` | `[]` | All configured elements must disappear to satisfy this condition. No implicit panel-disappearance condition. |
+| `success_wait_seconds` | `10` | Success-condition deadline, integer 1-120 seconds. |
+
+Selector and text lists reject blank entries; the capture and cell lists must be
+nonempty. The three success-condition types are alternatives; within
+`success_when_missing`, all configured selectors must be absent/hidden. Do not use
+only unused fallback panel locators: already-absent elements cannot prove a solve.
+The schema permits all three success lists to be empty, but the
+runtime contract is explicit `unknown` in that case, never unconditional success.
+Panel disappearance alone is not a success signal unless explicitly configured.
+
+`GRID_CAPTCHA_DEFAULT_PROMPT` instructs the model to compare the reference target
+with the full 3x3 grid, use row-major indices 1-9, and select every matching cell,
+including multiple matches. It forbids guessing and requests refresh when unclear.
+The requested JSON fields are `is_clear`, `selected_indices`, `need_refresh`, and
+optional `reason`. The management-only prompt is editable as
+`execution_settings.llm_prompt`; it is neither a step override nor a provider
+credential. Features management displays a dedicated grid prompt label and warns
+that system vision support is required. Reset restores this grid prompt, not the
+character-recognition or image-quiz prompt.
+
+Requests offer the `submit_geetest_result` function tool with `tool_choice="auto"`,
+so thinking-model providers that reject named/required tool choices can use their
+native tool parser without disabling reasoning. The selected model must support
+image input and tool calling. A provider returning plain content is accepted only when
+the entire content is valid JSON with the same fields; prose, invalid indices,
+duplicate indices, and truncated answers are rejected. Provider error bodies and
+reasoning are never logged. Only the captured widget PNG is sent, not page text,
+cookies, or an arbitrary image URL fetched by the Worker.
+
+The Worker pins the challenge DOM and image sources before recognition. It
+rejects preselected cells and changed/replaced challenges, verifies the exact
+selected set before submission, and dispatches DOM clicks as in the reference
+script. Before recognition the grid must remain unchanged across two guarded
+reads. Unclear recognition, wrong selections that produce a new empty grid, and
+stale challenges all consume the same `max_refresh` budget, never a new per-round
+allowance. Each retry uses a fresh screenshot and model answer. For example,
+one unclear refresh plus one rejected-answer retry uses two of the default three
+retries. Regeneration requires changed image sources/canvas or replacement
+root/cell nodes; status text and selection classes alone are not sufficient proof.
+An unchanged grid, unknown submission outcome or submit exception never causes
+blind resubmission. A persistent preselection is not toggled. Retry exhaustion
+requires human handling and records `attempts` (total model calls),
+`verification_attempts` (verification rounds), and `retries`.
+The default deadline includes verification, model and refresh budgets (capped at
+3600 seconds); an explicitly configured timeout takes precedence.
+
+Compose `flow.open` -> `action.click` (trigger sign-up/check-in) ->
+`challenge.grid_captcha` -> `flow.result`. The challenge should stop on an
+unconfirmed outcome so the output step cannot announce success prematurely. See
+[the workflow example](execution.md#九宫格工作流组合) for a configuration without
+site-specific credentials. Browser interaction and model-response enforcement
+belong to the worker runtime; backend settings only validate and forward this contract.
+
+Character-captcha recognition reads only the response message's `content`, never `reasoning_content`.
 String content and arrays of `{type: "text", text: string}` are supported. Balanced
 leading `<think>...</think>` blocks are removed; nested, incomplete, misplaced, or
 reasoning-only wrappers are rejected. The remaining answer must be a single ASCII
@@ -92,7 +167,8 @@ reasoning budgets/token parameters are not automatically negotiated.
 `customized`, and `execution_settings`. Defaults include code default factories.
 For image-captcha features, defaults include `captcha_method` (default `ddddocr`).
 `execution_settings` is an object with `llm_prompt` for
-`challenge.image_captcha`, `sign.iframe.image_captcha`, and `sign.image_quiz`.
+`challenge.image_captcha`, `sign.iframe.image_captcha`, `sign.image_quiz`, and
+`challenge.grid_captcha`.
 `flow.result` uses the result-judgement contract below; other features return null.
 `config_schema` reflects effective defaults and
 required fields; types and constraints remain code-defined.
@@ -129,7 +205,7 @@ runs the original full model validation. Existing explicit step values take prio
 policy edits do not rewrite saved steps or historical snapshots.
 
 `captcha_method` selects the recognition method, defaulting to `ddddocr`.
-Captcha and image-quiz prompts belong only in `execution_settings.llm_prompt`, not
+Captcha, image-quiz, and grid prompts belong only in `execution_settings.llm_prompt`, not
 in step config or policy defaults. Output-result steps additionally support the
 optional per-step prompt described below. Unknown fields are rejected during validation.
 DELETE resets both config customization and execution behavior to code defaults.

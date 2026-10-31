@@ -12,6 +12,7 @@ const text = ref("");
 const required = ref<string[]>([]);
 const executionSettings = ref<FeatureExecutionSettings | null>(null);
 const isImageQuiz = computed(() => props.feature.key === "sign.image_quiz");
+const isGridCaptcha = computed(() => props.feature.key === "challenge.grid_captcha");
 const isResult = computed(() => props.feature.key === "flow.result");
 const methodProperty = computed(() => props.feature.config_schema.properties?.captcha_method);
 const methodOptions = computed(() =>
@@ -85,7 +86,7 @@ function validate(value: unknown, schema: JsonSchema, path: string): string {
 }
 
 const validationError = computed(() => {
-  if (executionSettings.value && (!executionSettings.value.llm_prompt.trim() || [...executionSettings.value.llm_prompt].length > 4000)) return `${isResult.value ? "结果判断提示词" : isImageQuiz.value ? "图片答题提示词" : "识别提示词"}必须为 1–4000 字符`;
+  if (executionSettings.value && (!executionSettings.value.llm_prompt.trim() || [...executionSettings.value.llm_prompt].length > 4000)) return `${isResult.value ? "结果判断提示词" : isImageQuiz.value ? "图片答题提示词" : isGridCaptcha.value ? "九宫格验证码提示词" : "识别提示词"}必须为 1–4000 字符`;
   if (isResult.value && [...(executionSettings.value?.model ?? "")].length > 256) return "模型 ID 最多为 256 字符";
   if (!parsed.value.value) return parsed.value.error;
   const properties = props.feature.config_schema.properties ?? {};
@@ -190,7 +191,13 @@ async function reset() {
               type="warning"
               :closable="false"
             />
-            <el-form-item :label="isImageQuiz ? '图片答题提示词' : '视觉模型提示词'">
+            <el-alert
+              v-if="isGridCaptcha"
+              title="九宫格验证码需要系统设置中的大模型开启「支持视觉」；未配置或关闭时九宫格验证码需要人工处理。"
+              type="warning"
+              :closable="false"
+            />
+            <el-form-item :label="isImageQuiz ? '图片答题提示词' : isGridCaptcha ? '九宫格验证码提示词' : '视觉模型提示词'">
               <el-input v-model="executionSettings.llm_prompt" type="textarea" :rows="4" :maxlength="4000" />
             </el-form-item>
           </template>

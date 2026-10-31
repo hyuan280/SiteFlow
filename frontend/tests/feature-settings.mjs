@@ -157,9 +157,56 @@ try {
     assert.doesNotMatch(enabledHtml, /视觉模型提示词|图片答题提示词/);
     const quizHtml = await renderEditor({ ...feature, key: "sign.image_quiz" });
     assert.match(quizHtml, /图片答题提示词/);
-    assert.match(quizHtml, /需要人工处理/);
-    assert.doesNotMatch(quizHtml, /大模型结果判断总开关/);
-    const captchaHtml = await renderEditor(feature);
+     assert.match(quizHtml, /需要人工处理/);
+     assert.doesNotMatch(quizHtml, /大模型结果判断总开关/);
+     const gridFeature = {
+       ...feature, key: "challenge.grid_captcha", requires: ["vision"],
+       defaults: { max_refresh: 2, success_signals: ["验证成功"], success_when_missing: [] },
+       required_fields: [], base_required_fields: [],
+       config_schema: { properties: {
+         max_refresh: { type: "integer", minimum: 0, maximum: 10 },
+         success_signals: { type: "array", items: { type: "string", minLength: 1 } },
+         success_when_missing: { type: "array", items: { type: "string", minLength: 1 } },
+       } },
+       execution_settings: { llm_prompt: "Match the target to all cells, indexed 1-9; do not guess." },
+     };
+     const gridHtml = await renderEditor(gridFeature);
+     assert.match(gridHtml, /九宫格验证码提示词/);
+     assert.match(gridHtml, /需要系统设置中的大模型开启「支持视觉」/);
+     assert.match(gridHtml, /需要人工处理/);
+     assert.doesNotMatch(gridHtml, /大模型结果判断总开关|默认识别方式|图片答题提示词/);
+     let gridEditor;
+     await renderToString(createSSRApp({ setup() {
+       Editor.setup({ feature: gridFeature }, {
+         expose(value) { gridEditor = value; }, emit() {},
+       });
+       return () => null;
+     } }));
+     assert.equal(gridEditor.validationError.value, "");
+     assert.deepEqual(gridEditor.methodOptions.value, []);
+     for (const invalid of ["", "   ", "a".repeat(4001)]) {
+       gridEditor.executionSettings.value.llm_prompt = invalid;
+       assert.match(gridEditor.validationError.value, /九宫格验证码提示词/);
+     }
+     gridEditor.executionSettings.value.llm_prompt = gridFeature.execution_settings.llm_prompt;
+     for (const invalid of [{ max_refresh: 11 }, { success_signals: [""] }, { captcha_method: "vision" }]) {
+       gridEditor.text.value = JSON.stringify(invalid);
+       assert.ok(gridEditor.validationError.value);
+     }
+     gridEditor.text.value = JSON.stringify(gridFeature.defaults);
+     globalThis.fetch = async (url, options) => {
+       request = { url, ...JSON.parse(options.body) };
+       return new Response(JSON.stringify(gridFeature));
+     };
+     try {
+       await gridEditor.save();
+       assert.deepEqual(request, {
+         url: "/api/v1/features/challenge.grid_captcha/settings",
+         defaults: gridFeature.defaults, required_fields: [],
+         execution_settings: gridFeature.execution_settings,
+       });
+     } finally { globalThis.fetch = originalFetch; }
+     const captchaHtml = await renderEditor(feature);
     assert.match(captchaHtml, /视觉模型提示词/);
     assert.doesNotMatch(captchaHtml, /大模型结果判断总开关/);
     const settings = resultEditor.executionSettings.value;
@@ -346,7 +393,9 @@ try {
     assert.equal(stepUsesLlm(captchaFeature, { captcha_method: "ddddocr" }, { captcha_method: "vision" }), false);
     const quizFeature = { ...captchaFeature, key: "sign.image_quiz", requires: ["vision"] };
     assert.equal(featureSupportsLlm(quizFeature), true);
-    assert.equal(stepUsesLlm(quizFeature, {}), true);
+     assert.equal(stepUsesLlm(quizFeature, {}), true);
+     assert.equal(featureSupportsLlm(gridFeature), true);
+     assert.equal(stepUsesLlm(gridFeature, {}), true);
     assert.equal(featureSupportsLlm(null), false);
     assert.equal(stepUsesLlm(undefined, {}), false);
     assert.equal(featureSupportsLlm({ ...captchaFeature, config_schema: {} }), false);

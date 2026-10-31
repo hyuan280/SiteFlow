@@ -24,7 +24,7 @@ LANE_POLICIES: tuple[str, ...] = (
 IMAGE_CAPTCHA_FEATURES = frozenset(
     {"challenge.image_captcha", "sign.iframe.image_captcha"}
 )
-VISION_FEATURES = IMAGE_CAPTCHA_FEATURES | {"sign.image_quiz"}
+VISION_FEATURES = IMAGE_CAPTCHA_FEATURES | {"sign.image_quiz", "challenge.grid_captcha"}
 EXECUTION_SETTINGS_FEATURES = VISION_FEATURES | {"flow.result"}
 CAPTCHA_DEFAULT_PROMPT = (
     "Read the captcha in this image. Return only its characters, without "
@@ -32,6 +32,15 @@ CAPTCHA_DEFAULT_PROMPT = (
 )
 IMAGE_QUIZ_DEFAULT_PROMPT = (
     "你是一个识图答题助手。根据图片内容回答题目，选择最符合图片的选项。"
+)
+GRID_CAPTCHA_DEFAULT_PROMPT = (
+    "Solve the visual grid captcha using the target reference and the entire 3x3 grid "
+    "shown in the image. Number cells 1-9 in row-major order, left to right and top "
+    "to bottom. Select all cells matching the target; multiple matches are allowed. "
+    "Do not guess. If the target or any required match is unclear, request a refresh. "
+    "Return only a JSON object with is_clear (boolean), selected_indices (array of "
+    "matching cell numbers), need_refresh (boolean), and optional reason. "
+    "For an unclear image, set is_clear=false, selected_indices=[], need_refresh=true."
 )
 RESULT_DEFAULT_PROMPT = (
     "检查这个页面，判断网站是否已登录，并仔细检查是否存在未签到的标记。"
@@ -73,6 +82,8 @@ FIELD_TITLES: dict[str, str] = {
     "handle_selector": "手柄选择器",
     "success_signals": "成功信号",
     "image_selector": "图片选择器",
+    "cell_selector": "九宫格单元选择器",
+    "selected_selector": "单元选中状态选择器",
     "input_selector": "输入框选择器",
     "refresh_selector": "刷新验证码选择器",
     "answer_selector": "答题选项选择器",

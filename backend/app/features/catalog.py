@@ -235,6 +235,53 @@ class ChallengeImageCaptchaConfig(ImageCaptchaFieldsConfig):
     )
 
 
+class ChallengeGridCaptchaConfig(FeatureConfig):
+    image_selector: SelectorCandidates = Field(
+        default_factory=lambda: [".geetest_panel_box", ".geetest_widget"],
+        min_length=1,
+        description=f"验证码截图区域，必须同时包含目标参考图和完整九宫格；{SELECTOR_HINT}",
+    )
+    cell_selector: SelectorCandidates = Field(
+        default_factory=lambda: [".geetest_item"],
+        min_length=1,
+        description=f"九宫格单元选择器，按从左到右、从上到下编号 1-9；{SELECTOR_HINT}",
+    )
+    selected_selector: str = Field(
+        default='.geetest_selected, .selected, [aria-checked="true"], [aria-selected="true"]',
+        description="对每个单元自身执行 CSS matches 判断是否已选中，不查找子元素",
+    )
+    refresh_selector: SelectorCandidates = Field(
+        default_factory=lambda: [".geetest_refresh"],
+        description=f"目标或匹配不清楚时刷新验证码的按钮；{SELECTOR_HINT}",
+    )
+    submit_selector: SelectorCandidates = Field(
+        default_factory=lambda: [".geetest_commit"],
+        description=f"完成多选后提交验证码的按钮；{SELECTOR_HINT}",
+    )
+    max_refresh: int = Field(
+        default=3, ge=0, le=10,
+        description="识别不清刷新、验证失败换题及题目变化共用的额外重试次数；默认 3 次（最多 4 轮），0 表示不重试；未确认新题时不重复提交",
+    )
+    success_signals: TextCandidates = Field(
+        default_factory=lambda: ["验证成功", "驗證成功", "今天已经签到过啦", "今天已經簽到過啦"],
+        description="提交后页面出现的成功文本；任一命中即成功（不区分大小写）",
+    )
+    success_selector: SelectorCandidates = Field(
+        default_factory=list,
+        description="提交成功后出现的元素；任一命中即成功",
+    )
+    success_when_missing: SelectorCandidates = Field(
+        default_factory=list,
+        description="显式配置的成功后消失元素；全部消失才命中此条件；默认不以验证码消失判定成功",
+    )
+    success_wait_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="等待成功条件的最长秒数；未配置任何成功条件或无法确认时返回 unknown",
+    )
+
+
 class SignButtonConfig(FeatureConfig):
     button_selector: SelectorCandidates = Field(
         default_factory=lambda: ["button[type='submit']"],
@@ -616,6 +663,15 @@ FEATURE_LIST: tuple[Feature, ...] = (
         "multiple",
         ChallengeImageCaptchaConfig,
         description="选择识别方式并填写图形验证码；默认使用 ddddocr。",
+    ),
+    _feature(
+        "challenge.grid_captcha",
+        "九宫格验证码",
+        "challenge",
+        "multiple",
+        ChallengeGridCaptchaConfig,
+        requires=("vision",),
+        description="使用视觉模型匹配目标参考图与九宫格，选择所有匹配单元并提交；未配置视觉模型时转人工处理。",
     ),
     _feature(
         "sign.button",

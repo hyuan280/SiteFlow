@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+import regex
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 from app.features.base import (
     CAPTCHA_DEFAULT_PROMPT,
@@ -207,6 +208,7 @@ class SiteSummary(BaseModel):
     id: int
     name: str
     base_url: str
+    trusted_urls: list[str] = Field(default_factory=list)
     enabled: bool
     template_id: int | None
     template_name: str | None
@@ -258,6 +260,12 @@ class SiteWrite(BaseModel):
 
     name: str = Field(min_length=1, max_length=128)
     base_url: str = Field(min_length=1, max_length=512)
+    trusted_urls: list[
+        Annotated[
+            str,
+            StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=1024),
+        ]
+    ] = Field(default_factory=list, max_length=20)
     enabled: bool = True
     template_id: int | None = None
     lane_policy: LanePolicy = "auto"
@@ -274,6 +282,17 @@ class SiteWrite(BaseModel):
     steps: list[StepInput] = Field(default_factory=list)
     groups: list[GroupInput] = Field(default_factory=list)
     signals: list[SignalInput] = Field(default_factory=list)
+
+    @field_validator("trusted_urls")
+    @classmethod
+    def _validate_trusted_urls(cls, value: list[str]) -> list[str]:
+        for pattern in value:
+            try:
+                regex.compile(pattern, flags=regex.VERSION0)
+            # Some regex releases raise KeyError for conflicting version flags.
+            except (regex.error, ValueError, KeyError) as exc:
+                raise ValueError(f"Invalid trusted URL regex: {exc}") from exc
+        return value
 
     @field_validator("base_url")
     @classmethod

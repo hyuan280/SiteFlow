@@ -3248,7 +3248,7 @@ async def _run_step(
         if secret_payload is not None:
             from worker.secret_client import resolve_secret
             from worker.secret_client import require_site_origin
-            require_site_origin(page.url, secret_payload["base_url"])
+            require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
             credentials = await resolve_secret(secret_payload, step)
         if not credentials and credential_task is not None:
             note("INFO", "等待 Bitwarden 登录凭据")
@@ -3291,12 +3291,14 @@ async def _run_step(
         if submit is None:
             return "fail", "未找到登录按钮", {}
         if secret_payload is not None:
-            require_site_origin(page.url, secret_payload["base_url"])
+            require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         try:
             note("INFO", "开始填写登录用户名")
             await username.fill(credentials["username"], timeout=PAGE_TIMEOUT_MS)
             if await username.input_value(timeout=PAGE_TIMEOUT_MS) != credentials["username"]:
                 raise RuntimeError("Username input verification failed")
+            if secret_payload is not None:
+                require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
             note("INFO", "用户名填写完成并校验，开始填写密码")
             await password.fill(credentials["password"], timeout=PAGE_TIMEOUT_MS)
             if await password.input_value(timeout=PAGE_TIMEOUT_MS) != credentials["password"]:
@@ -3307,6 +3309,8 @@ async def _run_step(
         finally:
             credentials = None
         note("INFO", "开始点击登录按钮")
+        if secret_payload is not None:
+            require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         await submit.click(timeout=PAGE_TIMEOUT_MS)
         note("INFO", "已填写登录凭据并提交")
         success = list(config.get("success_selector") or [])
@@ -3326,7 +3330,7 @@ async def _run_step(
         if secret_payload is not None:
             from worker.secret_client import resolve_secret
             from worker.secret_client import require_site_origin
-            require_site_origin(page.url, secret_payload["base_url"])
+            require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
             secret = await resolve_secret(secret_payload, step)
             code = secret.pop("code", None)
             fetch_status, fetch_message = "fail", "TOTP provider unavailable"
@@ -3346,7 +3350,7 @@ async def _run_step(
         if code_input is None:
             return "fail", "未找到动态验证码输入框", {}
         if secret_payload is not None:
-            require_site_origin(page.url, secret_payload["base_url"])
+            require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         try:
             await code_input.fill(code, timeout=PAGE_TIMEOUT_MS)
         except Exception:
@@ -3367,6 +3371,8 @@ async def _run_step(
         )
         if submit is None:
             return "fail", "未找到动态验证码提交按钮", {}
+        if secret_payload is not None:
+            require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         await submit.click(timeout=PAGE_TIMEOUT_MS)
         note("INFO", f"动态验证码已提交（长度 {len(code)}）")
         success = list(config.get("success_selector") or [])
@@ -3430,6 +3436,11 @@ async def _run_step(
         return await _run_iframe_image_captcha(
             page, config, note, vision, capture_image, plugin_runtimes
         )
+
+    if feature == "challenge.grid_captcha":
+        from worker.grid_captcha import run_grid_captcha
+
+        return await run_grid_captcha(page, config, note, vision, capture_image)
 
     if feature == "sign.image_quiz":
         return await _run_image_quiz(page, config, note, vision, capture_image)
@@ -3738,6 +3749,12 @@ async def _execute_admitted_job(
                         timeout = min(3600, max(180, (interval + 5) * max_buy + 120))
                     elif feature_type == "post.resign":
                         timeout = 300
+                    elif feature_type == "challenge.grid_captcha":
+                        grid_config = step.get("config") or {}
+                        refreshes = max(0, min(int(grid_config.get("max_refresh", 3)), 10))
+                        model_timeout = float((payload.get("vision") or {}).get("timeout") or 30)
+                        success_wait = max(1, min(int(grid_config.get("success_wait_seconds", 10)), 120))
+                        timeout = min(3600, (refreshes + 1) * (model_timeout + 20 + success_wait) + 30)
                     elif feature_type == "flow.open":
                         step_config = step.get("config")
                         if not isinstance(step_config, dict):
