@@ -14,6 +14,34 @@ SiteFlow 是一个站点自动化管理工具，当前主要用于 **PT 站点�
 
 详细操作见 [使用指南](docs/usage.md)。验证码识别和浏览器自动化不能保证适用于所有站点，请仅用于你有权访问的账户和服务。
 
+## 界面预览
+
+点击图片可查看原图。截图中的站点信息和敏感配置已做遮挡。
+
+| 数据面板 | 运行分析 · 状态概览 |
+| --- | --- |
+| [![数据面板](docs/screenshots/dashboard.png)](docs/screenshots/dashboard.png) | [![运行分析：状态概览与签到矩阵](docs/screenshots/analytics-overview.png)](docs/screenshots/analytics-overview.png) |
+
+| 运行分析 · 趋势与失败分析 | 任务调度 |
+| --- | --- |
+| [![运行分析：执行趋势与失败记录](docs/screenshots/analytics-trends.png)](docs/screenshots/analytics-trends.png) | [![任务调度与运行记录](docs/screenshots/runs.png)](docs/screenshots/runs.png) |
+
+| 车道状态 | 功能管理 |
+| --- | --- |
+| [![浏览器车道状态与并发设置](docs/screenshots/lanes.png)](docs/screenshots/lanes.png) | [![功能管理与全局默认设置](docs/screenshots/features.png)](docs/screenshots/features.png) |
+
+| 模板管理 | 站点管理 |
+| --- | --- |
+| [![模板管理与继承配置](docs/screenshots/templates.png)](docs/screenshots/templates.png) | [![站点管理与执行入口](docs/screenshots/sites.png)](docs/screenshots/sites.png) |
+
+| 通知设置 | 插件管理 |
+| --- | --- |
+| [![通知模板与邮件、HTTP 通知设置](docs/screenshots/notifications.png)](docs/screenshots/notifications.png) | [![插件管理与能力审批](docs/screenshots/plugins.png)](docs/screenshots/plugins.png) |
+
+| 系统设置 · 模型与集成 | 系统设置 · 凭据与调度 |
+| --- | --- |
+| [![大模型、代理、2FAuth 与 CFbox 集成设置](docs/screenshots/settings-integrations.png)](docs/screenshots/settings-integrations.png) | [![Bitwarden 凭据与自动调度设置](docs/screenshots/settings-scheduling.png)](docs/screenshots/settings-scheduling.png) |
+
 ## 快速开始
 
 需要 Docker 和 Docker Compose。根目录 `docker-compose.yml` 使用 GHCR 发布镜像，无需在服务器安装 Node.js 或构建工具；浏览器由 Compose 直接拉取官方 CloakBrowser Manager 镜像，以 keyless 模式运行。
