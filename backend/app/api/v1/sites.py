@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from typing import Literal
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_crypto, get_current_session, get_db, get_settings, require_csrf
@@ -20,6 +21,9 @@ from app.schemas.workflow import (
     SiteOptionView,
     SiteSummary,
     SiteWrite,
+    WorkflowRestore,
+    WorkflowVersionDetail,
+    WorkflowVersionList,
 )
 from app.services.credentials import (
     CredentialError,
@@ -44,8 +48,9 @@ def get_service(
     session: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
     crypto: CryptoService = Depends(get_crypto),
+    actor: AuthSession = Depends(get_current_session),
 ) -> WorkflowService:
-    return WorkflowService(session, settings, crypto)
+    return WorkflowService(session, settings, crypto, actor=actor)
 
 
 def get_credential_service(
@@ -110,14 +115,53 @@ def update_site(
 @router.delete("/{site_id}", status_code=204)
 def delete_site(
     site_id: int,
+    expected_revision: int | None = Query(default=None, ge=1),
+    expected_history_key: UUID | None = Query(default=None),
     service: WorkflowService = Depends(get_service),
     _current: AuthSession = Depends(require_csrf),
 ) -> Response:
     try:
-        service.delete_site(site_id)
-    except WorkflowNotFoundError as exc:
+        service.delete_site(site_id, expected_revision=expected_revision,
+                            expected_history_key=expected_history_key)
+    except (WorkflowNotFoundError, WorkflowConflictError, WorkflowValidationError) as exc:
         _raise(exc)
     return Response(status_code=204)
+
+
+@router.get("/{site_id}/versions", response_model=WorkflowVersionList)
+def list_site_versions(
+    site_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    service: WorkflowService = Depends(get_service),
+) -> WorkflowVersionList:
+    try:
+        return service.list_versions("site", site_id, limit=limit, offset=offset)
+    except (WorkflowNotFoundError, WorkflowValidationError) as exc:
+        _raise(exc)
+
+
+@router.get("/{site_id}/versions/{revision}", response_model=WorkflowVersionDetail)
+def get_site_version(
+    site_id: int, revision: int,
+    service: WorkflowService = Depends(get_service),
+) -> WorkflowVersionDetail:
+    try:
+        return service.get_version("site", site_id, revision)
+    except (WorkflowNotFoundError, WorkflowValidationError) as exc:
+        _raise(exc)
+
+
+@router.post("/{site_id}/versions/{revision}/restore", response_model=SiteDetail)
+def restore_site_version(
+    site_id: int, revision: int, payload: WorkflowRestore,
+    service: WorkflowService = Depends(get_service),
+    _current: AuthSession = Depends(require_csrf),
+) -> SiteDetail:
+    try:
+        return service.restore_version("site", site_id, revision, payload)
+    except (WorkflowNotFoundError, WorkflowConflictError, WorkflowValidationError) as exc:
+        _raise(exc)
 
 
 @router.get("/{site_id}/resolved", response_model=ResolvedWorkflowView)

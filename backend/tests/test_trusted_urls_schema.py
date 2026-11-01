@@ -1,4 +1,5 @@
 import json
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from sqlalchemy import Column, MetaData, Table, create_engine, event, inspect, select, text
@@ -100,6 +101,7 @@ def test_fresh_schema_has_python_and_server_defaults(client):
         values.pop("id")
         values.pop("trusted_urls_json")
         values["name"] = "server default"
+        values["history_key"] = str(uuid4())
         names = ", ".join(values)
         parameters = ", ".join(f":{name}" for name in values)
         connection.execute(text(f"INSERT INTO sites ({names}) VALUES ({parameters})"), values)

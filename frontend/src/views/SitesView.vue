@@ -10,6 +10,7 @@ import FloatingField from "@/components/FloatingField.vue";
 import SignalEditor from "@/components/SignalEditor.vue";
 import StringListField from "@/components/StringListField.vue";
 import WorkflowStepEditor from "@/components/WorkflowStepEditor.vue";
+import WorkflowHistoryDialog from "@/components/WorkflowHistoryDialog.vue";
 import { useAuthStore } from "@/stores/auth";
 import { formatServerDateTime } from "@/utils/datetime";
 import { usePersistedSearch } from "@/utils/persistedSearch";
@@ -28,6 +29,7 @@ import type {
   StepForm,
   TemplateDetail,
   TemplateSummary,
+  WorkflowHistoryTarget,
 } from "@/types/workflow";
 import {
   importArray,
@@ -84,6 +86,10 @@ const loading = ref(true);
 const error = ref("");
 const editorOpen = ref(false);
 const editingId = ref<number | null>(null);
+const editingRevision = ref<number | null>(null);
+const editingHistoryKey = ref<string | null>(null);
+const historyOpen = ref(false);
+const historyTarget = ref<WorkflowHistoryTarget | null>(null);
 const saving = ref(false);
 const editorError = ref("");
 const formBaseline = ref("");
@@ -600,6 +606,8 @@ async function loadTemplateChain(): Promise<void> {
 }
 
 function resetEditor(): void {
+  editingRevision.value = null;
+  editingHistoryKey.value = null;
   Object.assign(form, emptyForm());
   editorError.value = "";
   chain.value = [];
@@ -683,6 +691,8 @@ async function openEdit(id: number): Promise<void> {
   try {
     const detail = await apiRequest<SiteDetail>(`/sites/${id}`);
     form.name = detail.name;
+    editingRevision.value = detail.config_revision;
+    editingHistoryKey.value = detail.history_key;
     form.base_url = detail.base_url;
     form.template_id = detail.template_id ?? undefined;
     form.enabled = detail.enabled;
@@ -811,6 +821,10 @@ function lanePolicy(): string {
 
 function buildPayload(): Record<string, unknown> {
   return {
+    ...(editingId.value === null ? {} : {
+      expected_revision: editingRevision.value,
+      expected_history_key: editingHistoryKey.value,
+    }),
     name: form.name.trim(),
     base_url: form.base_url.trim(),
     enabled: form.enabled,
@@ -1023,8 +1037,10 @@ async function loadTimezone(): Promise<void> {
 }
 
 async function save(closeAfter = true, successMessage = "站点已保存"): Promise<void> {
+  if (saving.value || loadingForm.value) return;
   editorError.value = "";
   try {
+    if (editingId.value !== null && (editingRevision.value === null || !editingHistoryKey.value)) throw new Error("请重新打开站点以加载配置版本和对象身份");
     validate();
   } catch (cause) {
     editorError.value = cause instanceof Error ? cause.message : "表单校验失败";
@@ -1038,6 +1054,8 @@ async function save(closeAfter = true, successMessage = "站点已保存"): Prom
       body: JSON.stringify(buildPayload()),
     });
     editingId.value = saved.id;
+    editingRevision.value = saved.config_revision;
+    editingHistoryKey.value = saved.history_key;
     credential.value = saved.credential;
     if (hasCredentialInputs.value) {
       const credentialSaved = await saveCredentialFor(saved.id, false);
@@ -1095,6 +1113,7 @@ async function runSite(row: SiteSummary): Promise<void> {
 }
 
 async function remove(row: SiteSummary): Promise<void> {
+  const { id, config_revision: revision, history_key: historyKey } = row;
   try {
     await ElMessageBox.confirm(`确认删除站点 ${row.name}？`, "删除站点", {
       confirmButtonText: "删除",
@@ -1105,13 +1124,20 @@ async function remove(row: SiteSummary): Promise<void> {
     return;
   }
   try {
-    await apiRequest(`/sites/${row.id}`, { method: "DELETE" });
+    if (!historyKey) throw new Error("缺少对象身份，请刷新站点列表后重试");
+    await apiRequest(`/sites/${id}?expected_revision=${revision}&expected_history_key=${encodeURIComponent(historyKey)}`, { method: "DELETE" });
     ElMessage.success("站点已删除");
     await load();
   } catch (cause) {
     if (await handleUnauthorized(cause)) return;
     ElMessage.error(cause instanceof Error ? cause.message : "删除站点失败");
   }
+}
+
+function openHistory(row: SiteSummary): void {
+  if (editorOpen.value) return;
+  historyTarget.value = { ownerType: "site", id: row.id, name: row.name, historyKey: row.history_key };
+  historyOpen.value = true;
 }
 
 async function showPreview(row: SiteSummary): Promise<void> {
@@ -1219,10 +1245,11 @@ onMounted(() => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="250" fixed="right">
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openEdit(row.id)">编辑</el-button>
             <el-button link @click="showPreview(row)">预览</el-button>
+            <el-button link @click="openHistory(row)">历史</el-button>
             <el-button
               link
               type="success"
@@ -1237,6 +1264,8 @@ onMounted(() => {
         </el-table-column>
       </el-table>
     </el-card>
+
+    <WorkflowHistoryDialog v-model="historyOpen" :target="historyTarget" @restored="load" />
 
     <ExportSelectionDialog
       v-model="exportOpen"

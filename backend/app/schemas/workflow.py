@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
+from uuid import UUID
 
 import regex
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
@@ -167,6 +168,7 @@ class ResolvedSignalView(SignalView):
 
 class TemplateSummary(BaseModel):
     id: int
+    history_key: str
     name: str
     description: str
     parent_id: int | None
@@ -195,6 +197,8 @@ class TemplateDetail(TemplateSummary):
 class TemplateWrite(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_revision: int | None = Field(default=None, ge=1, strict=True)
+    expected_history_key: UUID | None = None
     name: str = Field(min_length=1, max_length=128)
     description: str = Field(default="", max_length=4000)
     parent_id: int | None = None
@@ -206,6 +210,7 @@ class TemplateWrite(BaseModel):
 
 class SiteSummary(BaseModel):
     id: int
+    history_key: str
     name: str
     base_url: str
     trusted_urls: list[str] = Field(default_factory=list)
@@ -258,6 +263,8 @@ class SiteDetail(SiteSummary):
 class SiteWrite(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_revision: int | None = Field(default=None, ge=1, strict=True)
+    expected_history_key: UUID | None = None
     name: str = Field(min_length=1, max_length=128)
     base_url: str = Field(min_length=1, max_length=512)
     trusted_urls: list[
@@ -332,3 +339,42 @@ class SiteWrite(BaseModel):
         ):
             raise ValueError("凭据提供商自定义匹配方式需要填写匹配值")
         return self
+
+
+class WorkflowRestore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1, strict=True)
+    expected_history_key: UUID | None = None
+    accept_current_dependencies: bool = False
+
+
+class WorkflowVersionSummary(BaseModel):
+    revision: int
+    operation: Literal["baseline", "create", "update", "restore", "delete"]
+    created_at: datetime
+    created_by: str | None
+    restored_from_revision: int | None
+    content_hash: str
+    schema_version: int
+
+
+class WorkflowSnapshot(BaseModel):
+    local: dict[str, Any]
+    dependencies: list[dict[str, Any]]
+    features: dict[str, Any]
+    resolved: dict[str, Any] | None
+    resolution_error: str | None
+
+
+class WorkflowVersionDetail(WorkflowVersionSummary):
+    history_key: str
+    owner_type: Literal["site", "template"]
+    snapshot: WorkflowSnapshot
+
+
+class WorkflowVersionList(BaseModel):
+    history_key: str
+    current_revision: int
+    total: int
+    items: list[WorkflowVersionSummary]

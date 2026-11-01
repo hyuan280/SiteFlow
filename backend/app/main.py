@@ -22,12 +22,13 @@ from app.api.v1 import (
     sites,
     secrets,
     templates,
+    workflow_history,
 )
 from app.core.auth import LoginRateLimiter
 from app.core.config import Settings
 from app.core.crypto import CryptoService
 from app.core.db import Base, create_db_engine, create_session_factory
-from app.core.schema_updates import ensure_trusted_urls_column
+from app.core.schema_updates import ensure_trusted_urls_column, ensure_workflow_history_keys
 from app.features.plugin_registry import clear_plugin_registry, refresh_plugin_registry
 from app.services.artifacts import ArtifactCleanupRunner
 from app.services.execution import ExecutionService
@@ -49,6 +50,7 @@ from app.models.workflow import (  # noqa: F401  (register tables)
     WorkflowStep,
 )
 from app.services.auth import bootstrap_admin
+from app.services.workflows import WorkflowService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -57,11 +59,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     engine = create_db_engine(settings.database_url)
     Base.metadata.create_all(engine)
     ensure_trusted_urls_column(engine)
+    ensure_workflow_history_keys(engine)
     session_factory = create_session_factory(engine)
     bootstrap = bootstrap_admin(session_factory, settings)
     clear_plugin_registry()
     with session_factory() as session:
         refresh_plugin_registry(session)
+        WorkflowService(session, settings, crypto).baseline_workflows()
 
     executor = ExecutionManager(session_factory, settings, crypto)
     scheduler = Scheduler(session_factory, settings, crypto, executor)
@@ -115,6 +119,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(features.router)
     app.include_router(templates.router)
     app.include_router(sites.router)
+    app.include_router(workflow_history.router)
     app.include_router(runs.router)
     app.include_router(runs.stream_router)
     app.include_router(analytics.router)

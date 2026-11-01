@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -25,6 +26,8 @@ from app.models.workflow import (
 from app.schemas.credential import SiteCredentialView
 from app.services.credentials import CredentialService
 from app.services.integrations import IntegrationService
+from app.services.workflow_history import WorkflowHistoryMixin, atomic_workflow_write
+from app.models.auth import AuthSession
 from app.schemas.workflow import (
     SiteOptionView,
     FeatureView,
@@ -213,16 +216,18 @@ def _feature_view(feature: Feature) -> FeatureView:
     )
 
 
-class WorkflowService:
+class WorkflowService(WorkflowHistoryMixin):
     def __init__(
         self,
         session: Session,
         settings: Settings | None = None,
         crypto: CryptoService | None = None,
+        actor: AuthSession | None = None,
     ) -> None:
         self.session = session
         self.settings = settings
         self.crypto = crypto
+        self.actor = actor
         self._templates_by_id: dict[int, Template] | None = None
         self._steps_by_owner: dict[tuple[str, int], list[WorkflowStep]] | None = None
         self._signals_by_owner: dict[tuple[str, int], list[WorkflowSignal]] | None = None
@@ -581,11 +586,11 @@ class WorkflowService:
         )
 
     def _replace_groups(
-        self, owner_type: str, owner_id: int, groups: list[GroupInput]
+        self, owner_type: str, owner_id: int, groups: list[GroupInput], *, preserve_null=False
     ) -> None:
         existing = {row.group_key: row for row in self._groups(owner_type, owner_id)}
         for group in groups:
-            if group.step_anchor is None and group.group_key in existing:
+            if not preserve_null and group.step_anchor is None and group.group_key in existing:
                 group.step_anchor = existing[group.group_key].step_anchor
         self.session.query(WorkflowGroup).filter(
             WorkflowGroup.owner_type == owner_type,
@@ -864,11 +869,12 @@ class WorkflowService:
     def _apply_override_positions(
         steps: list[StepInput],
         inherited: list[_EffectiveStep],
+        *, preserve_positions: bool = False,
     ) -> None:
         base_by_key = {step.step_key: step for step in inherited}
         for step in steps:
             base = base_by_key.get(step.step_key)
-            if base is not None:
+            if base is not None and not preserve_positions:
                 step.position = base.position + 1
         # Validate writes only: historical data remains readable and untouched.
         # Overrides are one effective step, not a new local ordering entry.
@@ -876,7 +882,8 @@ class WorkflowService:
         local_keys: set[str] = set()
         for step in steps:
             base = base_by_key.get(step.step_key)
-            position = step.position
+            # Match resolution even when restoring an untouched historical position.
+            position = base.position + 1 if base is not None else step.position
             if position is None:
                 position = max((value[1] for value in effective.values()), default=0) + 1000
             effective[step.step_key] = (
@@ -1109,6 +1116,7 @@ class WorkflowService:
             error = str(exc)
         return TemplateSummary(
             id=template.id,
+            history_key=template.history_key,
             name=template.name,
             description=template.description,
             parent_id=template.parent_id,
@@ -1136,6 +1144,7 @@ class WorkflowService:
             error = str(exc)
         return SiteSummary(
             id=site.id,
+            history_key=site.history_key,
             name=site.name,
             base_url=site.base_url,
             trusted_urls=json.loads(site.trusted_urls_json),
@@ -1357,6 +1366,7 @@ class WorkflowService:
         if self.session.scalar(query) is not None:
             raise WorkflowConflictError(f"名称已存在: {name}")
 
+    @atomic_workflow_write
     def create_template(self, payload: TemplateWrite) -> TemplateDetail:
         self._ensure_name_available(Template, payload.name)
         if payload.parent_id is not None:
@@ -1393,6 +1403,8 @@ class WorkflowService:
             self._replace_steps(OWNER_TEMPLATE, template.id, payload.steps)
             self.session.flush()
             self.resolve_template(template.id)
+            self._record_history(template, "create")
+            result = self.get_template(template.id)
             self.session.commit()
         except WorkflowError:
             self.session.rollback()
@@ -1400,10 +1412,13 @@ class WorkflowService:
         except IntegrityError as exc:
             self.session.rollback()
             raise WorkflowConflictError("模板名称或继承关系冲突") from exc
-        return self.get_template(template.id)
+        return result
 
-    def update_template(self, template_id: int, payload: TemplateWrite) -> TemplateDetail:
+    @atomic_workflow_write
+    def update_template(self, template_id: int, payload: TemplateWrite, *, _restored_from=None, _revision_claimed=False) -> TemplateDetail:
         template = self._get_template(template_id)
+        if not _revision_claimed:
+            self._cas_revision(template, payload.expected_revision, payload.expected_history_key)
         self._ensure_name_available(Template, payload.name, exclude_id=template_id)
         if payload.parent_id is not None:
             if payload.parent_id == template_id:
@@ -1430,21 +1445,24 @@ class WorkflowService:
             {group.group_key for group in payload.groups},
             {group.group_key for group in inherited_groups},
         )
-        self._apply_override_positions(payload.steps, inherited_effective)
+        self._apply_override_positions(payload.steps, inherited_effective, preserve_positions=_restored_from is not None)
         template.name = payload.name
         template.description = payload.description
         template.parent_id = payload.parent_id
         template.enabled = payload.enabled
-        template.version += 1
         template.updated_at = _utcnow()
         try:
-            self._replace_groups(OWNER_TEMPLATE, template.id, payload.groups)
+            self._replace_groups(OWNER_TEMPLATE, template.id, payload.groups, preserve_null=_restored_from is not None)
             self._replace_steps(OWNER_TEMPLATE, template.id, payload.steps)
             self.session.flush()
             self._check_removed_signals(OWNER_TEMPLATE, template.id, payload.signals)
             self._replace_signals(OWNER_TEMPLATE, template.id, payload.signals)
             self.session.flush()
             self.resolve_template(template.id)
+            self._validate_affected_descendants(template.id)
+            self._record_history(template, "restore" if _restored_from is not None else "update",
+                                 restored_from_revision=_restored_from)
+            result = self.get_template(template.id)
             self.session.commit()
         except WorkflowError:
             self.session.rollback()
@@ -1452,16 +1470,66 @@ class WorkflowService:
         except IntegrityError as exc:
             self.session.rollback()
             raise WorkflowConflictError("模板名称或继承关系冲突") from exc
-        return self.get_template(template.id)
+        return result
 
-    def delete_template(self, template_id: int) -> None:
+    def _validate_affected_descendants(self, template_id: int) -> None:
+        template_ids = self._descendant_template_ids(template_id)
+        for descendant_id in template_ids:
+            if descendant_id == template_id:
+                continue
+            descendant = self._get_template(descendant_id)
+            inherited_groups = self._resolved_template_groups(self._get_template(descendant.parent_id))
+            self._validate_group_inputs(
+                [GroupInput.model_validate(self._group_view(row).model_dump())
+                 for row in self._groups(OWNER_TEMPLATE, descendant_id)], inherited_groups,
+            )
+            self._validate_step_groups(
+                [StepInput.model_validate(self._step_view(row).model_dump(include=set(StepInput.model_fields)))
+                 for row in self._steps(OWNER_TEMPLATE, descendant_id)],
+                {step.step_key: step.group_key for step in self._resolved_template_steps(self._get_template(descendant.parent_id))},
+                {group.group_key for group in self._groups(OWNER_TEMPLATE, descendant_id)},
+                {group.group_key for group in inherited_groups},
+            )
+            self._apply_override_positions(
+                [StepInput.model_validate(self._step_view(row).model_dump(include=set(StepInput.model_fields)))
+                 for row in self._steps(OWNER_TEMPLATE, descendant_id)],
+                self._resolved_template_steps(self._get_template(descendant.parent_id)),
+                preserve_positions=True,
+            )
+            self.resolve_template(descendant_id)
+        for site in self.session.scalars(select(Site).where(Site.template_id.in_(template_ids))):
+            self._validate_group_inputs(
+                [GroupInput.model_validate(self._group_view(row).model_dump())
+                 for row in self._groups(OWNER_SITE, site.id)],
+                self._resolved_template_groups(self._get_template(site.template_id)),
+            )
+            self._validate_step_groups(
+                [StepInput.model_validate(self._step_view(row).model_dump(include=set(StepInput.model_fields)))
+                 for row in self._steps(OWNER_SITE, site.id)],
+                {step.step_key: step.group_key for step in self._resolved_template_steps(self._get_template(site.template_id))},
+                {group.group_key for group in self._groups(OWNER_SITE, site.id)},
+                {group.group_key for group in self._resolved_template_groups(self._get_template(site.template_id))},
+            )
+            self._apply_override_positions(
+                [StepInput.model_validate(self._step_view(row).model_dump(include=set(StepInput.model_fields)))
+                 for row in self._steps(OWNER_SITE, site.id)],
+                self._resolved_template_steps(self._get_template(site.template_id)),
+                preserve_positions=True,
+            )
+            self.resolve_site(site.id)
+
+    @atomic_workflow_write
+    def delete_template(self, template_id: int, expected_revision: int | None = None,
+                        expected_history_key: UUID | None = None) -> None:
         template = self._get_template(template_id)
+        self._cas_revision(template, expected_revision, expected_history_key)
         child = self.session.scalar(select(Template.id).where(Template.parent_id == template_id))
         if child is not None:
             raise WorkflowConflictError("模板仍有子模板，不能删除")
         used = self.session.scalar(select(Site.id).where(Site.template_id == template_id))
         if used is not None:
             raise WorkflowConflictError("模板仍被站点引用，不能删除")
+        self._record_history(template, "delete")
         self.session.query(WorkflowStep).filter(
             WorkflowStep.owner_type == OWNER_TEMPLATE,
             WorkflowStep.owner_id == template_id,
@@ -1477,6 +1545,7 @@ class WorkflowService:
         self.session.delete(template)
         self.session.commit()
 
+    @atomic_workflow_write
     def create_site(self, payload: SiteWrite) -> SiteDetail:
         self._ensure_name_available(Site, payload.name)
         if payload.template_id is not None:
@@ -1522,6 +1591,8 @@ class WorkflowService:
             self._replace_steps(OWNER_SITE, site.id, payload.steps)
             self.session.flush()
             self.resolve_site(site.id)
+            self._record_history(site, "create")
+            result = self.get_site(site.id)
             self.session.commit()
         except WorkflowError:
             self.session.rollback()
@@ -1529,10 +1600,13 @@ class WorkflowService:
         except IntegrityError as exc:
             self.session.rollback()
             raise WorkflowConflictError("站点名称冲突") from exc
-        return self.get_site(site.id)
+        return result
 
-    def update_site(self, site_id: int, payload: SiteWrite) -> SiteDetail:
+    @atomic_workflow_write
+    def update_site(self, site_id: int, payload: SiteWrite, *, _restored_from=None, _revision_claimed=False) -> SiteDetail:
         site = self._get_site(site_id)
+        if not _revision_claimed:
+            self._cas_revision(site, payload.expected_revision, payload.expected_history_key)
         self._ensure_name_available(Site, payload.name, exclude_id=site_id)
         if payload.template_id is not None:
             self._get_template(payload.template_id)
@@ -1549,7 +1623,7 @@ class WorkflowService:
             {group.group_key for group in payload.groups},
             {group.group_key for group in inherited_groups},
         )
-        self._apply_override_positions(payload.steps, inherited_steps)
+        self._apply_override_positions(payload.steps, inherited_steps, preserve_positions=_restored_from is not None)
         site.name = payload.name
         site.base_url = payload.base_url
         if "trusted_urls" in payload.model_fields_set:
@@ -1567,16 +1641,18 @@ class WorkflowService:
         site.timezone = payload.timezone
         site.tags_json = json.dumps(payload.tags, ensure_ascii=False)
         site.notes = payload.notes
-        site.config_revision += 1
         site.updated_at = _utcnow()
         try:
-            self._replace_groups(OWNER_SITE, site.id, payload.groups)
+            self._replace_groups(OWNER_SITE, site.id, payload.groups, preserve_null=_restored_from is not None)
             self._replace_steps(OWNER_SITE, site.id, payload.steps)
             self.session.flush()
             self._check_removed_signals(OWNER_SITE, site.id, payload.signals)
             self._replace_signals(OWNER_SITE, site.id, payload.signals)
             self.session.flush()
             self.resolve_site(site.id)
+            self._record_history(site, "restore" if _restored_from is not None else "update",
+                                 restored_from_revision=_restored_from)
+            result = self.get_site(site.id)
             self.session.commit()
         except WorkflowError:
             self.session.rollback()
@@ -1584,10 +1660,14 @@ class WorkflowService:
         except IntegrityError as exc:
             self.session.rollback()
             raise WorkflowConflictError("站点名称冲突") from exc
-        return self.get_site(site.id)
+        return result
 
-    def delete_site(self, site_id: int) -> None:
+    @atomic_workflow_write
+    def delete_site(self, site_id: int, expected_revision: int | None = None,
+                    expected_history_key: UUID | None = None) -> None:
         site = self._get_site(site_id)
+        self._cas_revision(site, expected_revision, expected_history_key)
+        self._record_history(site, "delete")
         self.session.query(WorkflowStep).filter(
             WorkflowStep.owner_type == OWNER_SITE,
             WorkflowStep.owner_id == site_id,

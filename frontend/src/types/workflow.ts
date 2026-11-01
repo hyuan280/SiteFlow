@@ -1,5 +1,41 @@
 import type { JsonSchema } from "@/utils/schema";
 
+export interface WorkflowHistoryTarget {
+  ownerType: "site" | "template";
+  id: number;
+  name: string;
+  historyKey: string;
+}
+
+export interface WorkflowVersionSummary {
+  revision: number;
+  operation: "baseline" | "create" | "update" | "restore" | "delete";
+  created_at: string;
+  created_by: string;
+  restored_from_revision: number | null;
+  content_hash: string;
+  schema_version: number;
+}
+
+export interface WorkflowVersionList {
+  history_key: string;
+  current_revision: number;
+  total: number;
+  items: WorkflowVersionSummary[];
+}
+
+export interface WorkflowVersionDetail extends WorkflowVersionSummary {
+  history_key: string;
+  owner_type: "site" | "template";
+  snapshot: {
+    local: Record<string, unknown>;
+    dependencies: unknown[];
+    features: Record<string, unknown>;
+    resolved: Record<string, unknown> | null;
+    resolution_error: string | null;
+  };
+}
+
 export interface FeatureExecutionSettings {
   llm_prompt: string;
   llm_enabled?: boolean;
@@ -104,6 +140,7 @@ export interface SignalForm extends SignalView {
 
 export interface TemplateSummary {
   id: number;
+  history_key: string;
   name: string;
   description: string;
   parent_id: number | null;
@@ -143,6 +180,7 @@ export interface SiteCredential {
 
 export interface SiteSummary {
   id: number;
+  history_key: string;
   name: string;
   base_url: string;
   enabled: boolean;

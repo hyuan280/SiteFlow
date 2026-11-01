@@ -1,6 +1,6 @@
 # 数据模型
 
-首次启动使用 SQLAlchemy `create_all` 按当前模型建表。启动额外检查并补齐 `sites.trusted_urls_json` 字段，旧站点默认空数组，不重写已有工作流。此操作可重复执行，不提供其他历史开发版本的通用升级或数据库移植保证。更新前应备份数据库，并避免多个 API 进程同时执行结构更新。
+首次启动使用 SQLAlchemy `create_all` 按当前模型建表。启动额外检查并补齐 `sites.trusted_urls_json`、站点和模板的 `history_key` 字段及唯一索引，并为没有历史的存量对象建立当前版本基线。旧站点可信网址默认空数组，不重写已有工作流。此操作可重复执行，不提供其他历史开发版本的通用升级或数据库移植保证。更新前应备份数据库，并避免多个 API 进程同时执行结构更新。版本语义、恢复和 API 见 [配置历史](workflow-history.md)。
 
 ## 1. 已实现
 
@@ -24,16 +24,23 @@ app_settings(
 );
 
 templates(
-  id, name UNIQUE, description, parent_id, enabled, version,
+  id, history_key UNIQUE, name UNIQUE, description, parent_id, enabled, version,
   created_at, updated_at
 );
 
 sites(
-  id, name UNIQUE, base_url, enabled, template_id,
+  id, history_key UNIQUE, name UNIQUE, base_url, enabled, template_id,
   lane_policy, support_resign, resign_max_days,
   bitwarden_enabled, bitwarden_match_mode, bitwarden_custom_match,
   checkin_after, timezone, tags_json, trusted_urls_json, notes,
   config_revision, created_at, updated_at
+);
+
+workflow_history(
+  id, history_key, owner_type, revision, operation, created_at, created_by,
+  restored_from_revision, content_hash, schema_version,
+  ciphertext, nonce, key_version,
+  UNIQUE(history_key, revision)
 );
 
 workflow_steps(
@@ -83,6 +90,7 @@ job_steps(
 - `app_settings` 存车道设置、调度模式/参数和调度器的下次运行时间。
 - `templates` 通过 `parent_id` 形成继承链；删除前检查子模板和站点引用。
 - `sites.template_id` 为空时表示只使用站点自己的步骤。
+- `workflow_history` 只追加加密完整快照，冻结本地配置、祖先依赖、功能设置和解析结果；与当前态同事务保存，删除对象后仍保留。恢复产生新版本，不覆盖旧历史，且不恢复凭据或 Cookie。
 - `sites.lane_policy` 由站点「优先交互」「使用代理」两个开关映射为四种车道；模板不设置车道。
 - `workflow_steps` 是模板/站点共用的步骤表：
   - `owner_type` 为 `template` 或 `site`，`owner_id` 指向对应记录；

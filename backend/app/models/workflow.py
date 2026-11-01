@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from sqlalchemy import (
     Boolean,
@@ -27,6 +28,7 @@ class Template(Base):
     __tablename__ = "templates"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    history_key: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     parent_id: Mapped[int | None] = mapped_column(
@@ -46,6 +48,7 @@ class Site(Base):
     __tablename__ = "sites"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    history_key: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     base_url: Mapped[str] = mapped_column(String(512), nullable=False)
     trusted_urls_json: Mapped[str] = mapped_column(
@@ -75,6 +78,28 @@ class Site(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+
+
+class WorkflowHistory(Base):
+    __tablename__ = "workflow_history"
+    __table_args__ = (
+        UniqueConstraint("history_key", "revision", name="uq_workflow_history_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # No FK: the archive outlives its owner, including reused integer IDs.
+    history_key: Mapped[str] = mapped_column(String(36), nullable=False)
+    owner_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    restored_from_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    key_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class SiteCredential(Base):

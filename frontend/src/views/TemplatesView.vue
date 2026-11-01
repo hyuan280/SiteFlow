@@ -8,6 +8,7 @@ import CopyConfigDialog from "@/components/CopyConfigDialog.vue";
 import ExportSelectionDialog from "@/components/ExportSelectionDialog.vue";
 import SignalEditor from "@/components/SignalEditor.vue";
 import WorkflowStepEditor from "@/components/WorkflowStepEditor.vue";
+import WorkflowHistoryDialog from "@/components/WorkflowHistoryDialog.vue";
 import { useAuthStore } from "@/stores/auth";
 import { usePersistedSearch } from "@/utils/persistedSearch";
 import type { ExportItem } from "@/types/export";
@@ -21,6 +22,7 @@ import type {
   StepForm,
   TemplateDetail,
   TemplateSummary,
+  WorkflowHistoryTarget,
 } from "@/types/workflow";
 import {
   importArray,
@@ -61,6 +63,10 @@ const loading = ref(true);
 const error = ref("");
 const editorOpen = ref(false);
 const editingId = ref<number | null>(null);
+const editingRevision = ref<number | null>(null);
+const editingHistoryKey = ref<string | null>(null);
+const historyOpen = ref(false);
+const historyTarget = ref<WorkflowHistoryTarget | null>(null);
 const saving = ref(false);
 const editorError = ref("");
 const formBaseline = ref("");
@@ -448,6 +454,8 @@ async function loadParentChain(): Promise<void> {
 }
 
 function resetEditor(): void {
+  editingRevision.value = null;
+  editingHistoryKey.value = null;
   Object.assign(form, emptyForm());
   editorError.value = "";
   chain.value = [];
@@ -505,6 +513,8 @@ async function openEdit(id: number): Promise<void> {
   try {
     const detail = await apiRequest<TemplateDetail>(`/templates/${id}`);
     form.name = detail.name;
+    editingRevision.value = detail.version;
+    editingHistoryKey.value = detail.history_key;
     form.description = detail.description;
     form.parent_id = detail.parent_id ?? undefined;
     form.enabled = detail.enabled;
@@ -582,6 +592,10 @@ function validate(): void {
 
 function buildPayload(): Record<string, unknown> {
   return {
+    ...(editingId.value === null ? {} : {
+      expected_revision: editingRevision.value,
+      expected_history_key: editingHistoryKey.value,
+    }),
     name: form.name.trim(),
     description: form.description,
     parent_id: selectedParentId(),
@@ -619,8 +633,10 @@ function buildPayload(): Record<string, unknown> {
 }
 
 async function save(): Promise<void> {
+  if (saving.value || loadingForm.value) return;
   editorError.value = "";
   try {
+    if (editingId.value !== null && (editingRevision.value === null || !editingHistoryKey.value)) throw new Error("请重新打开模板以加载配置版本和对象身份");
     validate();
   } catch (cause) {
     editorError.value = cause instanceof Error ? cause.message : "表单校验失败";
@@ -646,6 +662,7 @@ async function save(): Promise<void> {
 }
 
 async function remove(row: TemplateSummary): Promise<void> {
+  const { id, version: revision, history_key: historyKey } = row;
   try {
     await ElMessageBox.confirm(`确认删除模板 ${row.name}？`, "删除模板", {
       confirmButtonText: "删除",
@@ -656,13 +673,20 @@ async function remove(row: TemplateSummary): Promise<void> {
     return;
   }
   try {
-    await apiRequest(`/templates/${row.id}`, { method: "DELETE" });
+    if (!historyKey) throw new Error("缺少对象身份，请刷新模板列表后重试");
+    await apiRequest(`/templates/${id}?expected_revision=${revision}&expected_history_key=${encodeURIComponent(historyKey)}`, { method: "DELETE" });
     ElMessage.success("模板已删除");
     await load();
   } catch (cause) {
     if (await handleUnauthorized(cause)) return;
     ElMessage.error(cause instanceof Error ? cause.message : "删除模板失败");
   }
+}
+
+function openHistory(row: TemplateSummary): void {
+  if (editorOpen.value) return;
+  historyTarget.value = { ownerType: "template", id: row.id, name: row.name, historyKey: row.history_key };
+  historyOpen.value = true;
 }
 
 async function showPreview(row: TemplateSummary): Promise<void> {
@@ -735,15 +759,18 @@ onMounted(load);
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="210" fixed="right">
+        <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openEdit(row.id)">编辑</el-button>
             <el-button link @click="showPreview(row)">预览</el-button>
+            <el-button link @click="openHistory(row)">历史</el-button>
             <el-button link type="danger" @click="remove(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
     </el-card>
+
+    <WorkflowHistoryDialog v-model="historyOpen" :target="historyTarget" @restored="load" />
 
     <ExportSelectionDialog
       v-model="exportOpen"

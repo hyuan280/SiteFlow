@@ -29,7 +29,7 @@ try {
   const bindings = {
     form, parseExportFile, importText, importArray,
     loadingForm: ref(false), interactionStarted: ref(false), editorOpen: ref(false),
-    editingId: ref(null), editorError: ref(""), credential: ref({}), cookieInput: ref(""),
+    editingId: ref(null), editingRevision: ref(null), editingHistoryKey: ref(null), editorError: ref(""), credential: ref({}), cookieInput: ref(""),
     cookieError: ref(""), chain: ref([]), formBaseline: ref(""), credentialBaseline: ref(""),
     copying: ref(false), copyOpen: ref(true),
     resetEditor: () => Object.assign(form, ui.emptyForm()),
@@ -41,7 +41,7 @@ try {
     ElMessageBox: { confirm: async () => {} },
     apiRequest: async (url, options) => {
       requests.push({ url, ...options });
-      if (options?.method === "POST") return { id: 42 };
+      if (options?.method === "POST") return { id: 42, history_key: "site-42" };
       if (url === "/sites" || url === "/templates") return [];
       return detail;
     },
@@ -66,7 +66,7 @@ try {
   assert.deepEqual(ui.trustedUrls(["["]), ["["], "backend owns regex syntax errors");
 
   detail = {
-    ...ui.emptyForm(), id: 7, name: "Source", base_url: "https://site.example.com",
+    ...ui.emptyForm(), id: 7, config_revision: 1, history_key: "site-7", name: "Source", base_url: "https://site.example.com",
     template_id: null, template_name: null, lane_policy: "general", tags: [], credential: {},
     trusted_urls: patterns,
   };

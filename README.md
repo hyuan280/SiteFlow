@@ -4,7 +4,7 @@ SiteFlow 是一个站点自动化管理工具，当前主要用于 **PT 站点�
 
 支持的主要功能：
 
-- **站点与工作流**：模板继承、站点覆盖、条件判断、步骤跳转、配置导入导出及元素拾取。
+- **站点与工作流**：模板继承、站点覆盖、配置版本历史与恢复、条件判断、步骤跳转、配置导入导出及元素拾取。
 - **登录与验证**：账户、Cookie、Bitwarden 和插件凭据；2FAuth；Turnstile、ALTCHA、图形验证码及视觉模型。
 - **签到与补签**：按钮操作、iframe 签到、UNIT3D Claim、NexusPHP 日历补签和补签卡购买。
 - **自动执行**：手动运行、定时/间隔/随机调度、并发限制、取消与超时处理。
@@ -185,6 +185,7 @@ git diff --check
 ## 文档
 
 - [使用指南](docs/usage.md)：配置站点、编排流程、执行与排查。
+- [配置历史](docs/workflow-history.md)：版本快照、依赖追溯、恢复与并发保护。
 - [部署与运维](docs/deployment.md)：Docker 部署、端口、数据与备份。
 - [集成配置](docs/configuration.md)：代理、凭据提供商、CFbox 和视觉模型。
 - [通知设置](docs/notifications.md)：邮件、HTTP 通知与内容模板。
