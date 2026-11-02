@@ -53,20 +53,15 @@ class FakePage:
         return FakeLocator(self, selector)
 
     async def evaluate(self, script: str, arg=None):  # type: ignore[no-untyped-def]
+        if "document.readyState" in script:
+            return True
         if "const days = Array.from" in script:
             return "missed" if arg["date"] in self.missed else "signed"
-        if "const headings = Array.from" in script:
-            return {"option": "12", "price": "1000"}
         if "dateParam" in script:
             return {
                 "status": 200,
                 "text": json.dumps({"ret": 0, "msg": "OK", "data": {"points": 1}}),
             }
-        if "const body = new URLSearchParams" in script:
-            self.bought += 1
-            self.cards += 1
-            self.points -= 1000
-            return {"status": 200, "text": "ok"}
         raise AssertionError(f"unexpected evaluate: {script[:80]}")
 
 
@@ -186,13 +181,15 @@ def test_run_resign_uses_available_cards_without_failing() -> None:
 
 
 def test_run_buy_card_with_insufficient_points_is_not_failure() -> None:
+    from backend.tests.test_buy_card_clicks import BuyPage, SHOP
+
     async def run() -> None:
-        page = FakePage()
+        page = BuyPage()
         page.cards = 0
         page.points = 500
         status, message, data = await _run_buy_card(
             page,
-            {"shop_url": "https://pt.example.com/mybonus.php", "purchase_interval_seconds": 0},
+            {"shop_url": SHOP, "purchase_interval_seconds": 0},
             ["2026-10-01", "2026-10-02"],
             lambda _level, _text: None,
         )
@@ -204,13 +201,15 @@ def test_run_buy_card_with_insufficient_points_is_not_failure() -> None:
 
 
 def test_run_buy_card_tops_up_missing_cards() -> None:
+    from backend.tests.test_buy_card_clicks import BuyPage, SHOP
+
     async def run() -> None:
-        page = FakePage()
+        page = BuyPage()
         page.cards = 1
         status, message, data = await _run_buy_card(
             page,
             {
-                "shop_url": "https://pt.example.com/mybonus.php",
+                "shop_url": SHOP,
                 "purchase_interval_seconds": 0,
             },
             ["2026-10-01", "2026-10-02"],

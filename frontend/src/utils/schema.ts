@@ -1,4 +1,6 @@
 export interface JsonSchema {
+  $ref?: string;
+  $defs?: Record<string, JsonSchema>;
   type?: string;
   title?: string;
   description?: string;
@@ -8,6 +10,7 @@ export interface JsonSchema {
   enum_descriptions?: Record<string, string>;
   items?: JsonSchema;
   properties?: Record<string, JsonSchema>;
+  additionalProperties?: boolean | JsonSchema;
   required?: string[];
   minimum?: number;
   maximum?: number;
@@ -19,6 +22,7 @@ export interface JsonSchema {
   exclusiveMaximum?: number;
   anyOf?: JsonSchema[];
   "ui:widget"?: string;
+  "ui:hidden"?: boolean;
   "ui:trueLabel"?: string;
   "ui:falseLabel"?: string;
 }

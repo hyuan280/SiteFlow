@@ -74,7 +74,7 @@ const selectedConditionCount = computed(
 );
 
 const entries = computed(() =>
-  Object.entries(schema.value.properties ?? {}).map(([key, property]) => ({
+  Object.entries(schema.value.properties ?? {}).filter(([, property]) => !property["ui:hidden"]).map(([key, property]) => ({
     key,
     property,
   })),
@@ -86,7 +86,11 @@ function valueOf(key: string, property: JsonSchema): unknown {
 function formatValue(value: unknown): string {
   if (value === undefined || value === null) return "未设置";
   if (typeof value === "boolean") return value ? "是" : "否";
-  if (Array.isArray(value)) return value.length ? value.join("、") : "空";
+  if (Array.isArray(value)) {
+    if (!value.length) return "空";
+    return value.some((item) => item !== null && typeof item === "object")
+      ? JSON.stringify(value, null, 2) : value.join("、");
+  }
   if (typeof value === "object") return JSON.stringify(value);
   if (value === "") return "空字符串";
   return String(value);
@@ -417,6 +421,7 @@ function errorValue(): string {
   font-size: 13px;
   line-height: 1.6;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
   padding: 2px 0;
 }
 

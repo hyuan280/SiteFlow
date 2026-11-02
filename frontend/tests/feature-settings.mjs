@@ -17,7 +17,7 @@ const server = await createServer({
       if (id.endsWith("/StepFields.vue")) {
         return source.replace("</script>", "defineExpose({ schema, llmEnabled, llmPrompt, resetResultField });\n</script>");
       }
-      if (id.endsWith("/SchemaConfigForm.vue")) {
+      if (id.endsWith("/SchemaConfigForm.vue") || id.endsWith("/StringListField.vue")) {
         // The closed picker imports browser-only noVNC, unrelated to these form regressions.
         return source.replace('import ElementPickerDialog from "@/components/ElementPickerDialog.vue";',
           'const ElementPickerDialog = { render: () => null };');

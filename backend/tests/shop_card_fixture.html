@@ -1,15 +1,51 @@
-<!doctype html><meta charset="utf-8">
-<p>补签卡: 0 魔力值: 10000</p>
-<form class="magic-card" action="?action=exchange" method="post">
-  <input type="hidden" name="option" value="4">
-  <div class="magic-card-header">上传量</div>
-  <div class="magic-footer-stats"><span>&#128722; 999999</span><span>&#129689; 500</span></div>
-  <button type="submit" name="submit">交换</button>
-</form>
-<form class="magic-card" action="?action=exchange" method="post">
-  <input type="hidden" name="option" value="0">
-  <input type="hidden" name="csrf" value="TOKEN">
-  <div class="magic-card-header"><span>购买补签卡</span></div>
-  <div class="magic-footer-stats"><span>&#128722; 999999</span><span>&#129689; 3,000</span><span>限购: 2</span></div>
-  <button type="submit" name="redeem">交换</button>
-</form>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Isolated Card Shop</title>
+<p id="balance">补签卡: CARDS 魔力值: POINTS</p>
+PRODUCTS
+<dialog id="confirm-modal"><button id="confirm-pay" type="button">确认购买</button></dialog>
+<script>
+const mode = new URL(location.href).searchParams.get('mode') || 'prg';
+let pendingForm;
+function rebuildBalance(text, delay) {
+  const balance = document.querySelector('#balance');
+  balance.textContent = '库存加载中';
+  setTimeout(() => {
+    const replacement = balance.cloneNode(false);
+    replacement.textContent = text;
+    replacement.dataset.rebuilt = 'true';
+    balance.replaceWith(replacement);
+  }, delay);
+}
+const domDelay = DOM_DELAY_MS;
+if (domDelay > 0) rebuildBalance(document.querySelector('#balance').textContent, domDelay);
+async function pay(form) {
+  const response = await fetch(form.action, {method: 'POST', body: new URLSearchParams(new FormData(form))});
+  const state = await response.json();
+  const text = `补签卡: ${state.cards} 魔力值: ${state.points}`;
+  if (mode === 'rebuild') rebuildBalance(text, 1200);
+  else document.querySelector('#balance').textContent = text;
+  form.querySelector('[name="csrf"]').value = state.token;
+}
+for (const form of document.querySelectorAll('form')) {
+  form.addEventListener('submit', event => {
+    if (mode === 'prg') return;
+    event.preventDefault();
+    if (mode === 'native') {
+      if (!confirm('购买补签卡？')) return;
+    }
+    if (mode === 'modal') {
+      pendingForm = form;
+      document.querySelector('#confirm-modal').showModal();
+    } else {
+      pay(form);
+    }
+  });
+}
+document.querySelector('#confirm-pay').onclick = () => {
+  document.querySelector('#confirm-modal').close();
+  pay(pendingForm);
+};
+</script>
+</html>

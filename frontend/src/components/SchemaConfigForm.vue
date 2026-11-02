@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 
 import ElementPickerDialog from "@/components/ElementPickerDialog.vue";
 import FloatingField from "@/components/FloatingField.vue";
+import PurchaseClicksField from "@/components/PurchaseClicksField.vue";
 import SecretProviderSelect from "@/components/SecretProviderSelect.vue";
 import {
   type ConfigObject,
@@ -34,7 +35,7 @@ const pickerTargetIndex = ref<number | null>(null);
 const pickerTitle = ref("元素拾取器");
 
 const entries = computed<PropertyEntry[]>(() =>
-  Object.entries(props.schema.properties ?? {}).map(([key, property]) => ({
+  Object.entries(props.schema.properties ?? {}).filter(([, property]) => !property["ui:hidden"]).map(([key, property]) => ({
     key,
     property,
   })),
@@ -117,6 +118,10 @@ function enumDescription(key: string, property: JsonSchema): string {
 function arrayValue(key: string, property: JsonSchema): unknown[] {
   const value = valueOf(key, property);
   return Array.isArray(value) ? value : [];
+}
+
+function purchaseClicksValue(key: string, property: JsonSchema): { scope: "product" | "page"; selectors: string[] }[] {
+  return arrayValue(key, property) as { scope: "product" | "page"; selectors: string[] }[];
 }
 
 function arrayItemValue(key: string, property: JsonSchema, index: number): unknown {
@@ -325,7 +330,16 @@ function inheritedText(key: string, property: JsonSchema): string {
         :required="isRequired(entry.key)"
         :has-value="hasValue(entry.key, entry.property)"
       >
-        <div v-if="entry.property.type === 'array'" class="inline-list">
+        <PurchaseClicksField
+          v-if="entry.property['ui:widget'] === 'purchase-clicks'"
+          :model-value="purchaseClicksValue(entry.key, entry.property)"
+          :min-items="entry.property.minItems"
+          :max-items="entry.property.maxItems"
+          :picker-base-url="pickerBaseUrl"
+          @update:model-value="setField(entry.key, $event)"
+        />
+
+        <div v-else-if="entry.property.type === 'array'" class="inline-list">
           <div
             v-for="(_, index) in arrayValue(entry.key, entry.property)"
             :key="index"
@@ -534,6 +548,12 @@ function inheritedText(key: string, property: JsonSchema): string {
               setField(entry.key, (event.target as HTMLInputElement).value)
           "
         />
+        <p
+          v-if="(entry.property.type === 'integer' || entry.property.type === 'number') && entry.property.description"
+          class="enum-hint"
+        >
+          {{ entry.property.description }}
+        </p>
         <p
           v-if="entry.property.enum && enumDescription(entry.key, entry.property)"
           class="enum-hint"

@@ -511,6 +511,19 @@ class ExecutionManager:
                 if not active:
                     self._active_jobs.pop(run_id, None)
 
+        if str(result.get("status") or "") in {"restart", "fallback_interaction"}:
+            paid = any(
+                isinstance(row, dict) and row.get("feature_type") == "post.buy_card"
+                and isinstance(row.get("data"), dict)
+                and isinstance(row["data"].get("buy_card"), dict)
+                and (row["data"]["buy_card"].get("payment_attempted")
+                     or row["data"]["buy_card"].get("bought", 0))
+                for row in result.get("steps", [])
+            )
+            if paid:
+                result = {**result, "status": "waiting_human",
+                          "message": "本任务已发起购卡点击，禁止自动重跑以避免重复购买，请人工核验"}
+
         if str(result.get("status") or "") == "fallback_interaction":
             with self.session_factory() as session:
                 job = session.get(SiteJob, job_id)

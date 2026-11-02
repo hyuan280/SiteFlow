@@ -532,6 +532,21 @@ class FlowResultConfig(FeatureConfig):
     )
 
 
+class PurchaseClick(FeatureConfig):
+    scope: Literal["product", "page"] = Field(
+        default="product",
+        title="点击范围",
+        description="在当前商品内或整个页面中查找点击目标",
+        json_schema_extra={"enum_titles": {"product": "商品内", "page": "整个页面"}},
+    )
+    selectors: SelectorCandidates = Field(
+        min_length=1,
+        max_length=20,
+        title="点击选择器候选",
+        description=SELECTOR_HINT,
+    )
+
+
 class PostBuyCardConfig(FeatureConfig):
     shop_url: str = Field(
         default="{base_url}/mybonus.php",
@@ -543,6 +558,128 @@ class PostBuyCardConfig(FeatureConfig):
         min_length=1,
         description="商店中补签卡商品的标题候选，按顺序匹配",
     )
+    purchase_quantity: int = Field(
+        default=0,
+        ge=0,
+        le=365,
+        title="购买数量",
+        description=(
+            "0 表示按待补签天数减去已有卡数自动补齐（不小于 0）；"
+            "正数表示固定购买 N 张，即使没有待补签日期也购买"
+        ),
+    )
+    layout: Literal["table", "grid", "custom"] = Field(
+        default="table",
+        title="商品布局",
+        description=(
+            "选择商品布局；网格卡片和自定义布局必须提供价格选择器，"
+            "自定义布局还必须提供商品选择器"
+        ),
+        json_schema_extra={
+            "enum_titles": {"table": "表格", "grid": "网格卡片", "custom": "自定义"},
+        },
+    )
+    product_selectors: SelectorCandidates = Field(
+        default_factory=list,
+        title="商品选择器候选",
+        description=(
+            "留空时表格使用 table tr，网格卡片依次使用 "
+            "form.magic-card、section article、article；"
+            f"自定义布局必须显式配置；{SELECTOR_HINT}"
+        ),
+    )
+    title_selectors: SelectorCandidates = Field(
+        default_factory=lambda: ["h1", "h2", "h3", ".magic-card-header", ".card-title"],
+        title="商品标题选择器候选",
+        description=f"在商品内查找标题；{SELECTOR_HINT}",
+    )
+    price_selectors: SelectorCandidates = Field(
+        default_factory=list,
+        title="价格选择器候选",
+        description=(
+            "在商品内查找单张价格；留空时仅表格布局使用价格表格列索引；"
+            f"网格卡片和自定义布局必须显式配置，不自动猜测价格；{SELECTOR_HINT}"
+        ),
+    )
+    price_column_index: int = Field(
+        default=2, ge=0, le=10, description="表格布局未配置价格选择器时使用的价格列索引"
+    )
+    price_regex: str = Field(
+        default=r"([+-]?[0-9][0-9,]*(?:\.[0-9]+)?)",
+        title="价格正则",
+        description="商品单张价格正则，第一个分组为数值",
+    )
+    points_selectors: SelectorCandidates = Field(
+        default_factory=list,
+        title="魔力值选择器候选",
+        description=f"读取魔力值的元素；留空使用 body；{SELECTOR_HINT}",
+    )
+    points_regex: str = Field(
+        default=r"魔力值[^\d+\-]*([+-]?\d[\d,]*(?:\.\d+)?)",
+        description="页面魔力值正则，第一个分组为数值",
+    )
+    card_count_selectors: SelectorCandidates = Field(
+        default_factory=list,
+        title="补签卡数量选择器候选",
+        description=f"读取已有补签卡数量的元素；留空使用 body；{SELECTOR_HINT}",
+    )
+    card_count_regex: str = Field(
+        default=r"[补補][签簽]卡[:：]\s*(\d+)",
+        description="页面补签卡数量正则，第一个分组为数量",
+    )
+    card_count_url: str = Field(
+        default="",
+        title="补签卡库存地址",
+        description="独立读取已有补签卡数量的地址，支持 {base_url} 占位符；留空在当前页面读取",
+    )
+    verification_timeout_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        title="购买验证等待秒数",
+        description="首次读取、轮次间读取补签卡库存及每轮购买后核验的最长等待秒数",
+    )
+    quantity_selectors: SelectorCandidates = Field(
+        default_factory=list,
+        max_length=20,
+        title="购买数量输入框候选",
+        description=(
+            "在当前唯一商品内查找购买数量输入框；留空逐张购买；"
+            "配置后按目标剩余数量、余额及输入框 min/max/step 限制批量填写；"
+            f"价格始终为单张价格；{SELECTOR_HINT}"
+        ),
+    )
+    purchase_clicks: list[PurchaseClick] = Field(
+        default=[{
+            "scope": "product",
+            "selectors": ["input[type='submit']", "button[type='submit']"],
+        }],
+        validate_default=True,
+        min_length=1,
+        max_length=10,
+        title="购买点击项",
+        description="按配置顺序执行点击；支持增删点击项，每项按顺序尝试选择器候选",
+        json_schema_extra={"ui:widget": "purchase-clicks"},
+    )
+    option_selector: str = Field(
+        default='input[name="option"]',
+        description="已废弃，忽略此字段；仅保留历史配置",
+        json_schema_extra={"ui:hidden": True},
+    )
+    exchange_action: str = Field(
+        default="exchange",
+        description="已废弃，忽略此字段；仅保留历史配置",
+        json_schema_extra={"ui:hidden": True},
+    )
+    submit_value: str = Field(
+        default="交换",
+        description="已废弃，忽略此字段；仅保留历史配置",
+        json_schema_extra={"ui:hidden": True},
+    )
+    max_price: int | None = Field(default=None, ge=1, description="单张补签卡最高价格")
+    purchase_interval_seconds: int = Field(
+        default=12, ge=0, le=120, description="两次购买之间的间隔秒数"
+    )
 
     @field_validator("card_title", mode="before")
     @classmethod
@@ -550,22 +687,14 @@ class PostBuyCardConfig(FeatureConfig):
         if isinstance(value, str):
             return [value]
         return value
-    option_selector: str = Field(default='input[name="option"]', description="商品 option 输入框选择器")
-    price_column_index: int = Field(default=2, ge=0, le=10, description="旧版表格价格列索引；卡片布局自动读取金币价格")
-    points_regex: str = Field(
-        default=r"魔力值[^\d]*(\d[\d,.]*\d)",
-        description="页面魔力值正则，第一个分组为数值",
-    )
-    card_count_regex: str = Field(
-        default=r"[补補][签簽]卡[:：]\s*(\d+)",
-        description="页面补签卡数量正则，第一个分组为数量",
-    )
-    exchange_action: str = Field(default="exchange", description="无表单时的兑换 action；非默认值覆盖表单 action 参数")
-    submit_value: str = Field(default="交换", description="无表单时的提交值；非默认值覆盖表单按钮值")
-    max_price: int | None = Field(default=None, ge=1, description="单张补签卡最高价格")
-    purchase_interval_seconds: int = Field(
-        default=12, ge=0, le=120, description="两次购买之间的间隔秒数"
-    )
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> "PostBuyCardConfig":
+        if self.layout == "custom" and not self.product_selectors:
+            raise ValueError("自定义布局必须提供商品选择器 product_selectors")
+        if self.layout != "table" and not self.price_selectors:
+            raise ValueError("网格卡片和自定义布局必须提供价格选择器 price_selectors")
+        return self
 
 
 class PostResignConfig(FeatureConfig):
@@ -791,7 +920,7 @@ FEATURE_LIST: tuple[Feature, ...] = (
         "post",
         "multiple",
         PostBuyCardConfig,
-        description="按待补签日期自动补齐补签卡数量。",
+        description="按待补签日期自动补齐补签卡，或固定购买指定数量。",
     ),
     _feature(
         "post.resign",

@@ -108,14 +108,14 @@ post.resign
 - `sign.unit3d_claim`：点击 Claim 按钮后等待成功条件，支持成功文本、出现元素或消失元素三种判断，任一满足即成功；都未配置时点击后直接成功。
 - `sign.iframe.image_captcha`：在签到 iframe 内填写静态字段，识别图像验证码并填入，然后点击 iframe 提交按钮；验证码校验、刷新和任务重启逻辑与 `challenge.image_captcha` 相同。
 - `challenge.image_captcha`：截取验证码图片，按步骤的 `captcha_method` 选择识别方式后填写；默认 `ddddocr`，也可选择 `vision`（需配置视觉大模型并开启支持视觉）或 `nexusphp_gd5`（支持 NexusPHP GD 5 号字体、6 位字符，标准尺寸 150×40，其他显示尺寸会自动缩放）。配置了 `submit_selector` 时自动提交，否则只填表，交由后续登录/签到步骤提交。`charset` 校验字符集（纯数字、纯小写/大写/大小写字母、数字+字母或不限制），`length` 校验字符数（0 不校验）。`min_confidence` 仅用于 ddddocr。任一校验不通过时先按 `refresh_selector` 刷新验证码（未配置则点击验证码图片），图片未变化或刷新后仍不通过时重新开始任务，最多重新开始 2 次；视觉模型和 NexusPHP GD5 不会静默回退到其他方式。
-- `post.buy_card`：按待补签日期减去当前补签卡数量，自动购买缺额；动态识别商店中的补签卡商品、option、价格和魔力值，按配置间隔购买。商品标题支持配置多个候选，按顺序匹配。
+- `post.buy_card`：通过商品范围内的页面元素购买，不再构造 POST。`purchase_quantity=0` 按待补签日期减去已有卡数补足，正数固定购买 N 张（范围 1 到 365），不要求待补签日期非空。支持 table/grid/custom 布局、商品/标题/价格候选选择器及魔力值读取；`purchase_clicks` 按列表顺序执行，每项使用 product/page 范围内首个可用候选，点击发出后不切换候选重试。`quantity_selectors` 为空时逐张购买；配置后在唯一商品内填写批量数量，取目标剩余、余额可负担数与输入框 max 的最小值，并按 min/step 向下取合法正整数。使用真实 fill/Tab 处理常见失焦行为，实际点击前重读数量、单张报价与余额，变化或失效时停止。每轮必须核验卡数恰好增加本轮 N 张；独立库存页在提交结束后有界重新 GET 核验。原生弹窗拒绝、数量异常或结果不明返回 `waiting_human`，即使 `on_error=continue` 也停止。已发起购买后禁止任务自动重启、转车道重跑及回跳重购。旧 option/action/submit 请求字段保留但忽略。
 - `post.resign`：读取待补签日期，检查 NexusPHP FullCalendar 日历，翻月定位漏签日期，通过 `ajax.php` 的 `attendanceRetroactive` 执行补签；不负责买卡。
 - 待补签日期由 API 按站点「支持补签最大天数」生成并注入 worker：从该站点最早有运行记录的日期开始，窗口内没有成功运行或成功补签记录的日期都算缺失；今天等当日结束后再判定。补签结果写入 `site_resign_records`，同时合并到状态矩阵和趋势。
 - 站点 Cookie 由系统主动维护：任务开始前注入，站点任务成功后从浏览器导出当前站点 Cookie 并加密更新；失败时保留原配置。
-- `post.buy_card` 和 `post.resign` 不再配置历史天数、购买数或补签数，统一使用站点配置的最大天数。
+- `post.resign` 的历史日期范围继续使用站点最大补签天数；购卡自动数量由该范围内的待补签日期决定，固定数量由 `purchase_quantity` 决定。
 - 魔力值不足时 `post.buy_card` 只购买可负担部分并继续，`post.resign` 按现有卡数补签，剩余日期保留到下次。
 - 模板和站点解析信号始终包含系统信号「断签」(`sys_resign_pending`)；worker 用待补签日期数量计算真假，站点不支持补签时恒为假。条件日志会输出待补签天数。
-- `post.buy_card` 未配置步骤超时时会根据购买数量和间隔自动放宽，避免默认 30 秒超时。
+- `post.buy_card` 未配置步骤超时时会根据购买数量、点击项、库存验证和间隔计算预算；显式步骤超时仍优先。新配置沿用 `workflow_steps.config_json`，不创建新表、不搬迁旧数据。
 
 `action.*` 和签到步骤支持候选选择器按顺序尝试。`sign.*.success_signals` 按页面文本匹配；`sign.unit3d_claim` 还支持 `success_selector`（成功后出现）和 `success_when_missing`（成功后消失）。
 

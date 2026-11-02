@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Isolated Piggo DOM Replay</title>
+<body>
+<b class="loading">Loading</b>
+<main></main>
+<script>
+const state = FIXTURE_STATE;
+const main = document.querySelector('main');
+if (state.view === 'calendar') {
+  setTimeout(() => {
+    document.querySelector('.loading').remove();
+    main.innerHTML = '<p class="cal-help">补签卡（当前 0 张）</p>' +
+      '<div class="cal-wrap" aria-busy="true"><div class="cal-skel">Loading calendar</div></div>';
+    if (!state.permanentBusy) setTimeout(() => {
+      document.querySelector('.cal-help').textContent = `补签卡（当前 ${state.cards} 张）`;
+      const calendar = document.querySelector('.cal-wrap');
+      calendar.removeAttribute('aria-busy');
+      calendar.replaceChildren();
+    }, state.stockDelay);
+  }, state.shellDelay);
+} else {
+  document.querySelector('.loading').remove();
+  main.innerHTML = `<p class="balance">余额: ${state.points}</p><section></section>`;
+  setTimeout(() => {
+    document.querySelector('section').innerHTML = '<article class="good"><h3>补签卡</h3>' +
+      '<p class="good-cost">2000 🥫饲料/张</p>' +
+      '<form action="/pay" method="post"><button type="submit">购买</button></form></article>';
+    document.querySelector('form').onsubmit = async event => {
+      event.preventDefault();
+      main.setAttribute('aria-busy', 'true');
+      const response = await fetch('/pay', {method: 'POST'});
+      const updated = await response.json();
+      document.querySelector('.balance').textContent = `余额: ${updated.points}`;
+      if (state.postBusy) {
+        main.insertAdjacentHTML('beforeend', `<p class="cal-help">补签卡（当前 ${updated.cards} 张）</p>`);
+      } else main.removeAttribute('aria-busy');
+    };
+  }, state.shopDelay);
+}
+</script>
+</body>
+</html>

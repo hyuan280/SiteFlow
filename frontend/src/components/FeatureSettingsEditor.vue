@@ -64,6 +64,14 @@ const methodDescription = computed(() => {
 });
 
 function validate(value: unknown, schema: JsonSchema, path: string): string {
+  if (schema.$ref) {
+    const prefix = "#/$defs/";
+    const name = schema.$ref.slice(prefix.length).replace(/~1/g, "/").replace(/~0/g, "~");
+    const target = schema.$ref.startsWith(prefix) ? props.feature.config_schema.$defs?.[name] : undefined;
+    if (!target) return `${path} 无法解析 schema 引用：${schema.$ref}`;
+    const error = validate(value, target, path);
+    if (error) return error;
+  }
   if (schema.anyOf) {
     return schema.anyOf.some(option => !validate(value, option, path)) ? "" : `${path} 不符合允许的类型或约束`;
   }
@@ -80,6 +88,21 @@ function validate(value: unknown, schema: JsonSchema, path: string): string {
     for (const [index, item] of value.entries()) {
       const error = validate(item, schema.items ?? {}, `${path}[${index}]`);
       if (error) return error;
+    }
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const object = value as Record<string, unknown>;
+    for (const key of schema.required ?? []) {
+      if (!Object.hasOwn(object, key)) return `${path}.${key} 为必填字段`;
+    }
+    for (const [key, item] of Object.entries(object)) {
+      const property = schema.properties?.[key];
+      if (!property && schema.additionalProperties === false) return `未知字段：${path}.${key}`;
+      const nestedSchema = property ?? (typeof schema.additionalProperties === "object" ? schema.additionalProperties : undefined);
+      if (nestedSchema) {
+        const error = validate(item, nestedSchema, `${path}.${key}`);
+        if (error) return error;
+      }
     }
   }
   return "";

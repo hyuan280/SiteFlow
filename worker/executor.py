@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -2717,90 +2718,339 @@ async def _calendar_day_status(page: Any, date_value: str, config: dict[str, Any
         return f"error:{type(exc).__name__}: {exc}"
 
 
+def _buy_amount(text: str, pattern: str) -> float | None:
+    try:
+        match = re.search(pattern, text)
+        if match is None:
+            return None
+        value = float(match.group(1).replace(",", ""))
+        # Custom/default regexes may start at the digits after a spaced minus.
+        if re.search(r"-\s*$", text[:match.start(1)]):
+            value = -abs(value)
+        return value if math.isfinite(value) else None
+    except (re.error, IndexError, TypeError, ValueError, OverflowError):
+        return None
+
+
+async def _buy_page_ready(page: Any) -> bool:
+    try:
+        return await page.evaluate("""() => {
+            if (document.readyState === 'loading' || !document.body) return false;
+            return !Array.from(document.querySelectorAll('[aria-busy="true"], .loading, .spinner'))
+                .some(el => el.getClientRects().length > 0 &&
+                    !['hidden', 'collapse'].includes(getComputedStyle(el).visibility));
+        }""") is True
+    except Exception:
+        return False
+
+
 async def _extract_card_info(
     page: Any,
     config: dict[str, Any],
     log: Callable[[str, str], None],
+    *,
+    product: Any = None,
 ) -> dict[str, Any] | None:
-    raw_titles = config.get("card_title") or ["购买补签卡"]
-    if isinstance(raw_titles, str):
-        raw_titles = [raw_titles]
-    titles = [str(item) for item in raw_titles if str(item).strip()]
-    if not titles:
-        titles = ["购买补签卡"]
-    option_selector = str(config.get("option_selector") or 'input[name="option"]')
-    price_index = int(config.get("price_column_index", 2))
+    retained = product is not None
+    product = product if retained else await _buy_product(page, config)
+    if product is None:
+        return None
     try:
-        info = await page.evaluate(
-            """(args) => {
-                const headings = Array.from(document.querySelectorAll('h1,h2,h3,.magic-card-header'));
-                let matches = [];
-                for (const candidate of args.titles) {
-                    matches = headings.filter(el => (el.textContent || '').includes(candidate));
-                    if (matches.length) break;
-                }
-                if (matches.length !== 1) return null;
-                const title = matches[0];
-                if (!title) return null;
-                const card = title.closest('form.magic-card');
-                const row = title.closest('tr');
-                const scope = card || row;
-                if (!scope) return null;
-                const options = scope.querySelectorAll(args.optionSelector);
-                if (options.length !== 1) return null;
-                const option = options[0];
-                const form = card || option.form || title.closest('form');
-                const cells = row ? row.querySelectorAll('td') : [];
-                let price = cells.length > args.priceIndex
-                    ? (cells[args.priceIndex].textContent || '').trim()
-                    : '';
-                if (card) {
-                    const coins = [...card.querySelectorAll('.magic-footer-stats span')]
-                        .filter(el => (el.textContent || '').includes('\uD83E\uDE99'));
-                    if (coins.length !== 1) return null;
-                    price = coins[0].textContent;
-                }
-                const fields = {};
-                let submitName = 'submit';
-                if (form) {
-                    if (form.method.toLowerCase() !== 'post') return null;
-                    for (const el of form.querySelectorAll('input[type="hidden"][name]')) {
-                        if (el.matches(':disabled')) continue;
-                        if (Object.hasOwn(fields, el.name)) return null;
-                        fields[el.name] = el.value;
-                    }
-                    const buttons = [...scope.querySelectorAll('button,input')].filter(
-                        el => el.type === 'submit' && !el.matches(':disabled'));
-                    if (buttons.length !== 1) return null;
-                    const button = buttons[0];
-                    if (button.hasAttribute('formaction') || button.hasAttribute('formmethod')) return null;
-                    submitName = button.name;
-                    if (submitName) fields[submitName] = button.hasAttribute('value')
-                        ? button.value : (button.textContent || '').trim();
-                }
-                fields[option.name || 'option'] = option.value;
-                return {
-                    option: option.value || option.getAttribute('value') || '',
-                    price,
-                    action: form ? form.action : null,
-                    fields,
-                    submitName,
-                };
-            }""",
-            {"titles": titles, "optionSelector": option_selector, "priceIndex": price_index},
-        )
+        if retained:
+            current = await _buy_product(page, config, require_unique_visible=True)
+            if current is not None:
+                product = current
+                retained = False
+        if retained and await product.evaluate("""(el, args) => el.isConnected &&
+            args.headings.some(selector => Array.from(el.querySelectorAll(selector)).some(
+                heading => args.titles.some(title => heading.textContent.includes(title))))""",
+            {"headings": config.get("title_selectors") or
+             ["h1", "h2", "h3", ".magic-card-header", ".card-title"],
+             "titles": config.get("card_title") or ["购买补签卡"]}) is not True:
+            return None
+        include_hidden = retained and not await product.is_visible()
+        selectors = config.get("price_selectors") or []
+        if selectors:
+            text = await _buy_text(product, selectors, unique=True, include_hidden=include_hidden)
+        elif config.get("layout", "table") == "table":
+            cells = await product.query_selector_all("td")
+            index = int(config.get("price_column_index", 2))
+            cell = cells[index] if 0 <= index < len(cells) else None
+            text = ""
+            if cell and (include_hidden or await cell.is_visible()):
+                text = (await cell.text_content() or "") if include_hidden else await cell.inner_text()
+        else:
+            text = ""
+        price = _buy_amount(text, str(config.get("price_regex") or
+                                     r"([+-]?[0-9][0-9,]*(?:\.[0-9]+)?)"))
+        if price is None or not math.isfinite(price) or price <= 0:
+            return None
+        return {"price": price}
     except Exception as exc:
-        log("WARN", f"读取商店补签卡信息失败：{type(exc).__name__}: {exc}")
+        log("WARN", f"读取商店价格失败：{type(exc).__name__}: {exc}")
         return None
-    if not isinstance(info, dict):
+    finally:
+        if not retained:
+            await product.dispose()
+
+
+async def _buy_product(
+    page: Any, config: dict[str, Any], *, require_unique_visible: bool = False,
+) -> Any:
+    layout = config.get("layout", "table")
+    selectors = config.get("product_selectors") or {
+        "table": ["table tr"], "grid": ["form.magic-card", "section article", "article"],
+    }.get(layout, [])
+    if layout not in {"table", "grid", "custom"} or not selectors:
         return None
-    option = str(info.get("option") or "")
-    price_text = str(info.get("price") or "")
-    price = _regex_number(price_text, r"([0-9][0-9,.]*)")
-    if not option or price is None:
-        return None
-    info['price'] = price
-    return info
+    handle = await page.evaluate_handle(
+        """args => {
+            const visible = el => !!el.getClientRects().length &&
+                getComputedStyle(el).visibility !== 'hidden';
+            if (args.requireUniqueVisible) {
+                // A new confirmation product must not be masked by a retained quote.
+                const scopes = new Set();
+                for (const heading of args.headings) {
+                    for (const el of document.querySelectorAll(heading)) {
+                        if (!visible(el) || !args.titles.some(title => el.textContent.includes(title))) continue;
+                        const scope = args.products.map(selector => el.closest(selector))
+                            .find(candidate => candidate && visible(candidate));
+                        if (!scope) throw new Error('Visible purchase title has no product scope');
+                        scopes.add(scope);
+                    }
+                }
+                if (scopes.size > 1) throw new Error('Ambiguous visible purchase products');
+                return scopes.size ? [...scopes][0] : null;
+            }
+            for (const title of args.titles) {
+                for (const product of args.products) {
+                    for (const heading of args.headings) {
+                        const scopes = new Set();
+                        for (const el of document.querySelectorAll(heading)) {
+                            if (!visible(el) || !el.textContent.includes(title)) continue;
+                            const scope = el.closest(product);
+                            if (scope && visible(scope)) scopes.add(scope);
+                        }
+                        if (scopes.size) return scopes.size === 1 ? [...scopes][0] : null;
+                    }
+                }
+            }
+            return null;
+        }""",
+        {"titles": config.get("card_title") or ["购买补签卡"],
+         "headings": config.get("title_selectors") or
+         ["h1", "h2", "h3", ".magic-card-header", ".card-title"],
+         "products": selectors, "requireUniqueVisible": require_unique_visible},
+    )
+    element = handle.as_element()
+    if element is None:
+        await handle.dispose()
+    return element
+
+
+async def _buy_text(
+    root: Any, selectors: list[str], *, unique: bool = False, include_hidden: bool = False,
+) -> str:
+    for selector in selectors or ["body"]:
+        elements = await root.query_selector_all(selector)
+        try:
+            visible = []
+            for element in elements:
+                if include_hidden or await element.is_visible():
+                    visible.append(element)
+            if visible:
+                if unique and len(visible) != 1:
+                    return ""
+                return (await visible[0].text_content() or "") if include_hidden else await visible[0].inner_text()
+        finally:
+            for element in elements:
+                await element.dispose()
+    return ""
+
+
+def _buy_origin(url: str) -> tuple[str, str, int | None]:
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+        raise ValueError("购买地址必须为安全的 HTTP(S) 同源地址")
+    return parts.scheme, parts.hostname.lower(), parts.port or (443 if parts.scheme == "https" else 80)
+
+
+def _buy_clicks(config: dict[str, Any]) -> list[dict[str, Any]]:
+    clicks = config.get("purchase_clicks", [
+        {"scope": "product", "selectors": ["input[type='submit']", "button[type='submit']"]},
+    ])
+    if not isinstance(clicks, list) or not clicks:
+        raise ValueError("购买点击项不能为空")
+    for item in clicks:
+        if (not isinstance(item, dict) or item.get("scope") not in {"product", "page"}
+                or not isinstance(item.get("selectors"), list) or not item["selectors"]
+                or any(not isinstance(s, str) or not s.strip() for s in item["selectors"])):
+            raise ValueError("购买点击项 scope/selectors 无效")
+    return clicks
+
+
+def _buy_timeout(config: dict[str, Any]) -> float:
+    quantity = int(config.get("purchase_quantity", 0)) or 365
+    verify = max(1, min(float(config.get("verification_timeout_seconds", 10)), 60))
+    interval = max(0, float(config.get("purchase_interval_seconds", 12)))
+    clicks = _buy_clicks(config)
+    # Include selection/trial waits, real clicks, inventory/shop navigation and verification.
+    per_click = (sum(len(item["selectors"]) for item in clicks) + len(clicks)) * SELECTOR_WAIT_MS / 1000
+    if config.get("quantity_selectors"):
+        per_click += (len(config["quantity_selectors"]) + len(clicks) + 2) * SELECTOR_WAIT_MS / 1000
+    return max(180, 60 + min(365, max(1, quantity)) * (interval + per_click + verify + 90))
+
+
+async def _buy_quantity(
+    page: Any, element: Any, origin: Any, cap: int, expected: int | None = None,
+) -> int:
+    if _buy_origin(page.url) != origin:
+        raise ValueError("数量输入页面跨源")
+    ready_before = await _buy_page_ready(page)
+    if _buy_origin(page.url) != origin or not ready_before:
+        raise ValueError("数量输入页面跨源或未就绪")
+    state = await element.evaluate("""el => ({
+        input: el instanceof HTMLInputElement &&
+            ['number', 'text', 'tel'].includes(el.type) && el.isConnected,
+        min: el.getAttribute('min'), max: el.getAttribute('max'), step: el.getAttribute('step'),
+        value: el.getAttribute('value')
+    })""")
+    if (not state["input"] or not await element.is_enabled()
+            or (expected is None and (not await element.is_visible() or not await element.is_editable()))):
+        raise ValueError("购买数量必须是可见、启用且可编辑的 number/text/tel input")
+    limits = {}
+    for name, default in (("min", 1), ("max", None), ("step", 1)):
+        raw = state[name]
+        if raw is None or (name == "step" and raw == "any"):
+            limits[name] = 1 if raw == "any" else default
+            continue
+        # Reject malformed HTML attributes rather than accepting browser defaults.
+        if not isinstance(raw, str) or not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", raw):
+            raise ValueError(f"购买数量 {name} 属性非法")
+        try:
+            value = Decimal(raw)
+            if not value.is_finite() or value != value.to_integral_value() or value < (1 if name == "step" else 0):
+                raise ValueError(f"购买数量 {name} 必须为有效整数")
+            limits[name] = int(value)
+        except InvalidOperation as exc:
+            raise ValueError(f"购买数量 {name} 属性非法") from exc
+    minimum, maximum, step = limits["min"], limits["max"], limits["step"]
+    if maximum is not None and maximum < minimum:
+        raise ValueError("购买数量 min/max 范围非法")
+    cap = min(cap, maximum) if maximum is not None else cap
+    # HTML step base is min, then a valid initial value attribute, otherwise zero.
+    base = Decimal(limits["min"]) if state["min"] is not None else Decimal(0)
+    initial = state["value"]
+    if (state["min"] is None and isinstance(initial, str) and
+            re.fullmatch(r"-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", initial)):
+        base = Decimal(initial)
+    if state["step"] == "any":
+        base = Decimal(0)
+    if not base.is_finite() or base != base.to_integral_value():
+        raise ValueError("购买数量 step 基准无法产生合法正整数")
+    base = int(base)
+    quantity = base + (cap - base) // step * step
+    if quantity <= 0 or quantity < minimum:
+        raise ValueError("购买数量限制内无可购买的合法正整数")
+    if expected is not None:
+        if expected > quantity or expected < minimum or expected <= 0 or (expected - base) % step:
+            raise ValueError("购买数量限制已变化，停止购买")
+        if await element.input_value() != str(expected):
+            raise ValueError("购买数量输入值核验失败")
+        if await element.evaluate("el => el.checkValidity()") is not True:
+            raise ValueError("购买数量 input checkValidity 核验失败")
+    ready_after = await _buy_page_ready(page)
+    if _buy_origin(page.url) != origin or not ready_after:
+        raise ValueError("数量输入检查期间页面跨源或未就绪")
+    return quantity if expected is None else expected
+
+
+async def _buy_fill_quantity(
+    page: Any, config: dict[str, Any], origin: Any, cap: int,
+) -> tuple[Any, int, Any]:
+    if _buy_origin(page.url) != origin:
+        raise ValueError("数量输入页面跨源")
+    product = await _buy_product(page, config)
+    if product is None:
+        raise ValueError("无法唯一定位补签卡商品")
+    selected = None
+    try:
+        async with asyncio.timeout(SELECTOR_WAIT_MS / 1000):
+            while selected is None:
+                for selector in config["quantity_selectors"]:
+                    elements = await product.query_selector_all(selector)
+                    try:
+                        for element in elements:
+                            editable = await element.evaluate("""el => el instanceof HTMLInputElement &&
+                                ['number', 'text', 'tel'].includes(el.type) && !el.readOnly""")
+                            if (editable is True and await element.is_visible()
+                                    and await element.is_enabled() and await element.is_editable()):
+                                selected = element
+                                break
+                    finally:
+                        for element in elements:
+                            if element is not selected:
+                                await element.dispose()
+                    if selected is not None:
+                        break
+                if selected is None:
+                    await asyncio.sleep(0.1)
+            quantity = await _buy_quantity(page, selected, origin, cap)
+            # Only real fill; after this point never try another candidate.
+            await selected.fill(str(quantity), timeout=SELECTOR_WAIT_MS)
+            await selected.press("Tab", timeout=SELECTOR_WAIT_MS)
+            if _buy_origin(page.url) != origin:
+                raise ValueError("数量失焦期间页面跨源")
+            await page.wait_for_load_state("networkidle", timeout=SELECTOR_WAIT_MS)
+            await _buy_quantity(page, selected, origin, cap, quantity)
+        return selected, quantity, product
+    except BaseException as exc:
+        if selected is not None:
+            await selected.dispose()
+        await product.dispose()
+        if isinstance(exc, TimeoutError):
+            raise ValueError("购买数量输入框查找、填写或核验超时，已停止") from exc
+        raise
+
+
+async def _buy_button(page: Any, config: dict[str, Any], item: dict[str, Any], origin: Any) -> Any:
+    if _buy_origin(page.url) != origin:
+        raise ValueError("付款页面跨源")
+    root = await _buy_product(page, config) if item["scope"] == "product" else page
+    if root is None:
+        raise ValueError("无法唯一定位补签卡商品")
+    try:
+        deadline = asyncio.get_running_loop().time() + SELECTOR_WAIT_MS / 1000
+        while True:
+            for selector in item["selectors"]:
+                for button in await root.query_selector_all(selector):
+                    if not await button.is_visible() or not await button.is_enabled():
+                        continue
+                    try:
+                        await button.click(trial=True, timeout=250)
+                    except Exception:
+                        continue
+                    # Use the browser's form owner, including repaired tr > form markup.
+                    urls = await button.evaluate("""el => ({
+                        action: el.form ? el.form.action : null,
+                        override: el.hasAttribute('formaction') ? el.formAction : null,
+                        href: el.closest('a[href]')?.href || null,
+                        target: el.formTarget || el.form?.target || ''
+                    })""")
+                    for url in (urls["action"], urls["override"], urls["href"]):
+                        if url and _buy_origin(url) != origin:
+                            raise ValueError("拒绝跨源 action/formaction/href")
+                    if urls["target"] not in {"", "_self"}:
+                        raise ValueError("拒绝在其他窗口付款")
+                    if _buy_origin(page.url) != origin:
+                        raise ValueError("付款页面跨源")
+                    return button
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ValueError("未找到可见、启用且可用的购买按钮")
+            await asyncio.sleep(0.1)
+    finally:
+        if root is not page:
+            await root.dispose()
 
 
 async def _purchase_cards(
@@ -2809,140 +3059,298 @@ async def _purchase_cards(
     shop_url: str,
     needed: int,
     log: Callable[[str, str], None],
+    *,
+    pending_count: int | None = None,
 ) -> dict[str, Any]:
-    cards_before = _regex_number(
-        await _page_body(page),
-        str(config.get("card_count_regex") or r"[补補][签簽]卡[:：]\s*(\d+)"),
-    )
-    if cards_before is None:
-        return {"status": "fail", "message": "未找到补签卡数量", "bought": 0}
-    points_before = _regex_float(
-        await _page_body(page),
-        str(config.get("points_regex") or r"魔力值[^\d]*(\d[\d,.]*\d)"),
-    )
-    info = await _extract_card_info(page, config, log)
-    if info is None:
-        return {"status": "fail", "message": "未在商店找到购买补签卡商品", "bought": 0}
-    price = info['price']
-    max_price = config.get("max_price")
-    if max_price is not None and price > int(max_price):
-        return {
-            "status": "fail",
-            "message": f"补签卡价格 {price} 超过上限 {max_price}",
-            "bought": 0,
-        }
-    affordable = int(points_before // price) if points_before is not None and price > 0 else 0
-    to_buy = min(max(0, needed), affordable)
-    log(
-        "INFO",
-        f"补签卡购买：当前 {cards_before} 张，需要 {needed} 张，"
-        f"价格 {price}，可买 {affordable} 张，本次买 {to_buy} 张",
-    )
-    if to_buy <= 0:
-        return {
-            "status": "success",
-            "message": "魔力值不足，未购买补签卡",
-            "bought": 0,
-            "needed": needed,
-            "cards_before": cards_before,
-            "cards_after": cards_before,
-            "points_before": points_before,
-            "points_after": points_before,
-        }
-    bought = 0
-    failure = None
-    for index in range(to_buy):
-        if index:
-            info = await _extract_card_info(page, config, log)
-        if info is None:
-            failure = "商店商品参数刷新失败"
-            break
-        price = info['price']
-        if price <= 0 or (max_price is not None and price > int(max_price)):
-            failure = "补签卡价格无效或超过上限"
-            break
-        points = _regex_float(await _page_body(page), str(
-            config.get('points_regex') or r"魔力值[^\d]*(\d[\d,.]*\d)"))
-        if points is None or points < price:
-            break
-        exchange_url = info.get('action') or shop_url
-        if not info.get('action') or config.get('exchange_action', 'exchange') != 'exchange':
-            parts = urlsplit(exchange_url)
-            query = dict(parse_qsl(parts.query))
-            query['action'] = str(config.get('exchange_action') or 'exchange')
-            exchange_url = urlunsplit(parts._replace(query=urlencode(query)))
-        exchange_url = urljoin(page.url, exchange_url)
-        fields = dict(info.get('fields') or {'option': info['option']})
-        submit_name = info.get('submitName', 'submit')
-        if submit_name and (not info.get('action') or config.get('submit_value', '交换') != '交换'):
-            fields[submit_name] = str(config.get('submit_value') or '交换')
+    result = {"status": "fail", "message": "购买未开始", "bought": 0,
+              "requested_quantity": needed, "mode": "fixed" if config.get("purchase_quantity", 0) else "auto",
+              "needed": needed, "cards_before": None, "cards_after": None,
+              "payment_attempted": False, "rounds": []}
+    origin = _buy_origin(shop_url)
+    count_url = urljoin(shop_url, str(config.get("card_count_url") or ""))
+    clicks = _buy_clicks(config)
+    verify_seconds = max(1, min(float(config.get("verification_timeout_seconds", 10)), 60))
+    count_pattern = str(config.get("card_count_regex") or r"[补補][签簽]卡[:：]\s*(\d+)")
+
+    async def cards() -> int | None:
+        if _buy_origin(page.url) != origin:
+            raise ValueError("库存页面跨源")
+        count = _regex_number(await _buy_text(page, config.get("card_count_selectors") or []), count_pattern)
+        if _buy_origin(page.url) != origin:
+            raise ValueError("库存读取期间页面跨源")
+        return count
+
+    async def goto(url: str) -> None:
+        parts = urlsplit(url)
+        log("INFO", f"购卡页面导航：{parts.scheme}://{parts.netloc}{parts.path}（查询参数仅在日志中隐藏，导航保留）")
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        if _buy_origin(page.url) != origin:
+            raise ValueError("购买导航跨源")
+
+    async def wait_cards(expected: int | None = None) -> int | None:
+        observed = None
+        checks = 0
+        started = asyncio.get_running_loop().time()
+        log("INFO", f"读取购卡库存：来源={'独立库存地址' if config.get('card_count_url') else '商店页面'}，选择器={'已配置' if config.get('card_count_selectors') else 'body'}，最多等待 {verify_seconds:g}s")
         try:
-            response = await page.evaluate(
-                """async (args) => {
-                    const url = new URL(args.url, location.href);
-                    if (!['http:', 'https:'].includes(url.protocol) || url.origin !== location.origin)
-                        throw new Error('Unsafe exchange form action');
-                    const body = new URLSearchParams(args.fields);
-                    const resp = await fetch(url.href, {
-                        method: 'POST',
-                        mode: 'same-origin',
-                        redirect: 'error',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
-                        body: body.toString(),
-                    });
-                    return {status: resp.status, text: (await resp.text()).slice(0, 1000)};
-                }""",
-                {"url": exchange_url, "fields": fields},
-            )
-        except Exception as exc:
-            log("WARN", f"购买第 {index + 1} 张失败：{type(exc).__name__}: {exc}")
-            failure = "补签卡购买请求失败"
-            break
-        text = str((response or {}).get("text") or "")
-        status_code = int((response or {}).get("status") or 0)
-        if status_code >= 400:
-            log("WARN", f"购买第 {index + 1} 张返回 HTTP {status_code}：{text[:200]}")
-            break
-        if any(word in text for word in ("不足", "不够", "已经存在", "已有")):
-            log("WARN", f"购买第 {index + 1} 张失败：{text[:200]}")
-            break
-        bought += 1
-        log("INFO", f"已购买第 {bought}/{to_buy} 张补签卡")
+            async with asyncio.timeout(verify_seconds):
+                while True:
+                    try:
+                        observed = None
+                        ready_before = await _buy_page_ready(page)
+                        count = await cards()
+                        checks += 1
+                        ready_after = await _buy_page_ready(page)
+                        if _buy_origin(page.url) != origin:
+                            raise ValueError("库存就绪检查期间页面跨源")
+                        if ready_before and ready_after:
+                            observed = count
+                        if observed is not None and (expected is None or observed == expected):
+                            log("INFO", f"已读取补签卡数量：{observed} 张（检查 {checks} 次）")
+                            return observed
+                    except Exception:
+                        if _buy_origin(page.url) != origin or getattr(page, "is_closed", lambda: False)():
+                            raise
+                        observed = None
+                    await asyncio.sleep(0.2)
+        except TimeoutError:
+            pass
+        elapsed = asyncio.get_running_loop().time() - started
+        log("WARN", f"库存读取等待结束：耗时 {elapsed:.2f}s，检查 {checks} 次，最后数量 {observed if observed is not None else '未匹配'}；请检查库存地址、数量选择器和正则第一捕获组")
+        return observed
+
+    async def wait_shop() -> tuple[float, float]:
+        error = "商店页面未就绪"
         try:
-            await page.goto(shop_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-            await asyncio.sleep(2)
-        except Exception as exc:
-            log("WARN", f"购买后刷新商店失败：{type(exc).__name__}: {exc}")
-            break
-        if index < to_buy - 1:
-            await asyncio.sleep(int(config.get("purchase_interval_seconds", 12)))
-    cards_after = _regex_number(
-        await _page_body(page),
-        str(config.get("card_count_regex") or r"[补補][签簽]卡[:：]\s*(\d+)"),
-    )
-    points_after = _regex_float(
-        await _page_body(page),
-        str(config.get("points_regex") or r"魔力值[^\d]*(\d[\d,.]*\d)"),
-    )
-    if bought >= needed:
-        message = f"已购买 {bought} 张补签卡，当前 {cards_after if cards_after is not None else '-'} 张"
-    elif bought > 0:
-        message = (
-            f"魔力值不足，已购买 {bought}/{needed} 张补签卡，"
-            f"当前 {cards_after if cards_after is not None else '-'} 张"
-        )
-    else:
-        message = "魔力值不足，未购买补签卡"
-    return {
-        "status": "fail" if failure else "success",
-        "message": failure or message,
-        "bought": bought,
-        "needed": needed,
-        "cards_before": cards_before,
-        "cards_after": cards_after,
-        "points_before": points_before,
-        "points_after": points_after,
-    }
+            async with asyncio.timeout(verify_seconds):
+                while True:
+                    try:
+                        if _buy_origin(page.url) != origin:
+                            raise ValueError("商店页面跨源")
+                        if await _buy_page_ready(page):
+                            error = "无法唯一定位商品或读取正价格"
+                            info = await _extract_card_info(page, config, log)
+                            if info is not None:
+                                price = info["price"]
+                                maximum = float(config["max_price"]) if config.get("max_price") is not None else None
+                                if maximum is not None and (not math.isfinite(maximum) or price > maximum):
+                                    raise ValueError(f"补签卡价格 {price} 超过上限 {maximum}")
+                                error = "无法读取有效商店余额"
+                                points = _buy_amount(await _buy_text(page, config.get("points_selectors") or []),
+                                                    str(config.get("points_regex") or r"魔力值[^\d+\-]*([+-]?\d[\d,]*(?:\.\d+)?)"))
+                                ready_after = await _buy_page_ready(page)
+                                if _buy_origin(page.url) != origin:
+                                    raise ValueError("商店读取期间页面跨源")
+                                if points is not None and points >= 0 and ready_after:
+                                    return price, points
+                        if _buy_origin(page.url) != origin:
+                            raise ValueError("商店就绪检查期间页面跨源")
+                    except Exception as exc:
+                        if _buy_origin(page.url) != origin or getattr(page, "is_closed", lambda: False)():
+                            raise
+                        error = str(exc)
+                    await asyncio.sleep(0.2)
+        except TimeoutError:
+            raise ValueError(error) from None
+
+    dialog_seen = False
+
+    async def dismiss_dialog(dialog: Any) -> None:
+        nonlocal dialog_seen
+        dialog_seen = True
+        await dialog.dismiss()
+
+    page.on("dialog", dismiss_dialog)
+    try:
+        quantity_selectors = config.get("quantity_selectors", [])
+        if (not isinstance(quantity_selectors, list) or len(quantity_selectors) > 20
+                or any(not isinstance(s, str) or not s.strip() for s in quantity_selectors)):
+            raise ValueError("购买数量输入框候选必须为最多 20 个非空 CSS 选择器")
+        if _buy_origin(count_url) != origin:
+            raise ValueError("独立库存地址必须与商店同源")
+        await goto(count_url if config.get("card_count_url") else shop_url)
+        baseline = await wait_cards()
+        result.update(cards_before=baseline, cards_after=baseline)
+        if baseline is None:
+            raise ValueError(f"在 {verify_seconds:g}s 内未找到补签卡数量，请检查补签卡库存地址、数量选择器和正则第一捕获组")
+        if pending_count is not None:
+            needed = max(0, pending_count - baseline)
+            result.update(needed=needed, requested_quantity=needed)
+        if needed <= 0:
+            result.update(status="success", message=f"补签卡已足够（当前 {baseline} 张）")
+            return result
+        for index in range(min(365, needed)):
+            if result["bought"] >= needed:
+                break
+            if index:
+                await asyncio.sleep(max(0, float(config.get("purchase_interval_seconds", 12))))
+                if config.get("card_count_url"):
+                    await goto(count_url)
+                current = await wait_cards(expected=baseline)
+                if current != baseline:
+                    result.update(status="waiting_human", cards_after=current, message="购买轮次之间库存异常，已停止")
+                    return result
+            if config.get("card_count_url"):
+                await goto(shop_url)
+            price, points = await wait_shop()
+            # Keep the finite local float source, but do not floor a binary float ratio.
+            balance_n, balance_d = Decimal(str(points)).as_integer_ratio()
+            price_n, price_d = Decimal(str(price)).as_integer_ratio()
+            affordable = (balance_n * price_d) // (balance_d * price_n)
+            if affordable <= 0:
+                result.update(status="success", message=f"魔力值不足，已购买 {result['bought']}/{needed} 张补签卡")
+                return result
+            round_result = {"round": index + 1, "cards_before": baseline, "cards_after": None,
+                            "price": price, "points_before": points, "clicks": 0,
+                            "qty": 1, "requested": needed - result["bought"], "expected_cards": baseline + 1,
+                            "dispatched": False, "status": "unknown", "message": "购买结果待核验"}
+            result["rounds"].append(round_result)
+            interrupted = False
+            quantity_input = None
+            quote_product = None
+            quantity = 1
+            cap = min(needed - result["bought"], affordable)
+            try:
+                if quantity_selectors:
+                    quantity_input, quantity, quote_product = await _buy_fill_quantity(page, config, origin, cap)
+                round_result.update(qty=quantity, requested=quantity, expected_cards=baseline + quantity)
+                for item in clicks:
+                    async with asyncio.timeout(SELECTOR_WAIT_MS / 1000):
+                        button = await _buy_button(page, config, item, origin)
+                    if dialog_seen:
+                        await button.dispose()
+                        break
+                    # Once dispatched, no alternate selector or replay is safe.
+                    try:
+                        async with asyncio.timeout(SELECTOR_WAIT_MS / 1000):
+                            if _buy_origin(page.url) != origin or not await _buy_page_ready(page):
+                                raise ValueError("付款页面跨源或未就绪")
+                            info = (await _extract_card_info(page, config, log, product=quote_product)
+                                    if quote_product is not None else await _extract_card_info(page, config, log))
+                            current_points = _buy_amount(await _buy_text(page, config.get("points_selectors") or []),
+                                str(config.get("points_regex") or r"魔力值[^\d+\-]*([+-]?\d[\d,]*(?:\.\d+)?)"))
+                            maximum = float(config["max_price"]) if config.get("max_price") is not None else None
+                            if (info is None or info["price"] != price or
+                                    (maximum is not None and (not math.isfinite(maximum) or info["price"] > maximum))):
+                                raise ValueError("购买单张价格已变化或超过上限，已停止")
+                            if current_points is None or current_points < 0:
+                                raise ValueError("无法读取有效付款余额")
+                            current_n, current_d = Decimal(str(current_points)).as_integer_ratio()
+                            if current_n * price_d < quantity * price_n * current_d:
+                                raise ValueError("付款余额不足本轮数量，已停止")
+                            if quantity_input is not None:
+                                await _buy_quantity(page, quantity_input, origin, cap, quantity)
+                            if _buy_origin(page.url) != origin or not await _buy_page_ready(page) or _buy_origin(page.url) != origin:
+                                raise ValueError("付款检查期间页面跨源或未就绪")
+                        round_result["dispatched"] = True
+                        result["payment_attempted"] = True
+                        await button.click(timeout=SELECTOR_WAIT_MS)
+                        round_result["clicks"] += 1
+                    finally:
+                        await button.dispose()
+                    if dialog_seen:
+                        break
+            except (Exception, asyncio.CancelledError) as exc:
+                interrupted = isinstance(exc, asyncio.CancelledError)
+                round_result["error"] = f"{type(exc).__name__}: {exc}"
+                round_result["message"] = round_result["error"]
+                if not round_result["dispatched"]:
+                    if interrupted:
+                        raise
+                    raise ValueError(str(exc)) from exc
+            finally:
+                if quantity_input is not None:
+                    await quantity_input.dispose()
+                if quote_product is not None:
+                    await quote_product.dispose()
+            if dialog_seen:
+                round_result["message"] = "原生弹窗已拒绝，购买结果未知"
+                result.update(status="waiting_human", message="原生弹窗已拒绝，购买结果未知，需要人工核验")
+                return result
+            observed = None
+            settled = False
+            verified = False
+            verification_started = asyncio.get_running_loop().time()
+            verification_checks = 0
+            last_verification_state = None
+            log("INFO", f"购买后开始库存核验：本轮 {quantity} 张，购买前 {baseline} 张，期望 {baseline + quantity} 张，最多等待 {verify_seconds:g}s")
+            try:
+                async with asyncio.timeout(verify_seconds):
+                    refreshed = False
+                    next_refresh = 0.0
+                    while True:
+                        try:
+                            if _buy_origin(page.url) != origin:
+                                raise ValueError("库存页面跨源")
+                            # Never interrupt an unsettled POST/navigation/AJAX with a GET.
+                            settled = False
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=1000)
+                                settled = await _buy_page_ready(page)
+                            except Exception:
+                                pass
+                            if _buy_origin(page.url) != origin:
+                                raise ValueError("库存等待期间页面跨源")
+                            now = asyncio.get_running_loop().time()
+                            if not config.get("card_count_url") or refreshed:
+                                observed = await cards()
+                                verification_checks += 1
+                                settled = await _buy_page_ready(page) and settled
+                                if _buy_origin(page.url) != origin:
+                                    raise ValueError("库存就绪检查期间页面跨源")
+                            if observed == baseline + quantity and settled:
+                                verified = True
+                                break
+                            verification_state = (observed, settled)
+                            if verification_state != last_verification_state:
+                                log("INFO", f"库存尚未确认，继续等待：当前 {observed if observed is not None else '未读到'} 张，期望 {baseline + quantity} 张，页面就绪={settled}")
+                                last_verification_state = verification_state
+                            if settled and now >= next_refresh:
+                                # Explicit GET, never reload a POST result or replay payment.
+                                settled = False
+                                await goto(count_url if config.get("card_count_url") else shop_url)
+                                refreshed = True
+                                next_refresh = asyncio.get_running_loop().time() + 1
+                                continue
+                        except Exception:
+                            observed = None
+                            if _buy_origin(page.url) != origin or getattr(page, "is_closed", lambda: False)():
+                                raise
+                            round_result["verification_error"] = "页面加载或库存读取暂时失败"
+                            log("WARN", "库存页面加载或读取暂时失败，将在剩余验证时间内继续核验，不会重复购买")
+                        await asyncio.sleep(0.1)
+            except (Exception, asyncio.CancelledError) as exc:
+                interrupted = interrupted or isinstance(exc, asyncio.CancelledError)
+                round_result["verification_error"] = f"{type(exc).__name__}: {exc}"
+            round_result["cards_after"] = observed
+            round_result["verification_checks"] = verification_checks
+            round_result["verification_elapsed_seconds"] = round(asyncio.get_running_loop().time() - verification_started, 3)
+            log("INFO" if verified else "WARN", f"库存核验结束：检查 {verification_checks} 次，耗时 {round_result['verification_elapsed_seconds']:g}s，购买前 {baseline} 张，最后读取 {observed if observed is not None else '未知'} 张，已确认={verified}")
+            result["cards_after"] = observed
+            if dialog_seen or not verified:
+                round_result["message"] = f"验证等待结束前未确认库存恰好增加 {quantity}，需要人工核验"
+                result.update(status="waiting_human", message=f"购买后在 {verify_seconds:g}s 验证等待内未确认库存恰好增加 {quantity}（购买前 {baseline}，最后读取 {observed if observed is not None else '未知'}），结果未知，需要人工核验")
+                return result
+            baseline = observed
+            result["bought"] += quantity
+            round_result["status"] = "success"
+            round_result["message"] = f"库存已核验增加 {quantity}"
+            log("INFO", f"已核验购买 {result['bought']}/{needed} 张补签卡")
+            if interrupted or not settled:
+                result.update(status="waiting_human", message="库存已增加，但执行被中断或提交尚未结束，已停止后续购买")
+                return result
+            if result["bought"] < needed and index < min(365, needed) - 1:
+                await goto(shop_url)
+        result.update(status="success", message=f"已购买 {result['bought']} 张补签卡，当前 {baseline} 张")
+    except asyncio.CancelledError:
+        if not result["rounds"]:
+            raise
+        result.update(status="waiting_human", message="购买执行超时或取消，已停止后续购买")
+    except Exception as exc:
+        result.update(status="waiting_human" if result["bought"] else "fail", message=str(exc))
+    finally:
+        page.remove_listener("dialog", dismiss_dialog)
+    return result
 
 
 async def _run_buy_card(
@@ -2954,28 +3362,12 @@ async def _run_buy_card(
     shop_url = urljoin(page.url, str(config.get("shop_url") or "{base_url}/mybonus.php"))
     if "{base_url}" in shop_url:
         return "fail", "商店地址未解析 {base_url}", {}
-    if not pending_dates:
-        return "success", "没有待补签日期，跳过购买补签卡", {
-            "buy_card": {"needed": 0, "bought": 0}
-        }
-    await _goto_if_needed(page, shop_url, "domcontentloaded", log, "商店页面")
-    await asyncio.sleep(2)
-    body = await _page_body(page)
-    cards = _regex_number(
-        body, str(config.get("card_count_regex") or r"[补補][签簽]卡[:：]\s*(\d+)")
-    )
-    if cards is None:
-        return "fail", "未找到补签卡数量", {}
-    needed = max(0, len(pending_dates) - cards)
-    if needed <= 0:
-        return "success", f"补签卡已足够（当前 {cards} 张）", {
-            "buy_card": {"needed": 0, "bought": 0, "cards_before": cards}
-        }
-    result = await _purchase_cards(page, config, shop_url, needed, log)
-    data = {"buy_card": {**result, "cards_before": result.get("cards_before", cards)}}
-    if result.get("status") == "success":
-        return "success", str(result.get("message") or "补签卡购买完成"), data
-    return "fail", str(result.get("message") or "补签卡购买失败"), data
+    quantity = int(config.get("purchase_quantity", 0))
+    if not 0 <= quantity <= 365:
+        return "fail", "购买数量必须在 0..365 之间", {}
+    result = await _purchase_cards(page, config, shop_url, quantity, log,
+                                   pending_count=None if quantity else len(pending_dates))
+    return result["status"], result["message"], {"buy_card": result}
 
 
 async def _run_resign(
@@ -3743,6 +4135,7 @@ async def _execute_admitted_job(
 
     job_artifacts = JobArtifacts(payload)
     credential_task: asyncio.Task[dict[str, str]] | None = None
+    payment_steps: set[str] = set()
 
     def finish(
         status: str,
@@ -3929,9 +4322,7 @@ async def _execute_admitted_job(
                         step_config = step.get("config")
                         if not isinstance(step_config, dict):
                             step_config = {}
-                        interval = int(step_config.get("purchase_interval_seconds") or 12)
-                        max_buy = int(payload.get("resign_max_days") or 30)
-                        timeout = min(3600, max(180, (interval + 5) * max_buy + 120))
+                        timeout = _buy_timeout(step_config)
                     elif feature_type == "post.resign":
                         timeout = 300
                     elif feature_type == "challenge.grid_captcha":
@@ -4005,7 +4396,8 @@ async def _execute_admitted_job(
                         timeout=max(1, int(timeout)),
                     )
                 except asyncio.TimeoutError:
-                    status, message, data = "fail", f"步骤超时（{timeout}s）", {}
+                    status = "waiting_human" if step.get("feature_type") == "post.buy_card" else "fail"
+                    message, data = f"步骤超时（{timeout}s）", {}
                 except asyncio.CancelledError:
                     results[-1] = _step_result(step, "canceled", "已取消", started=started)
                     job_status = "canceled"
@@ -4020,6 +4412,14 @@ async def _execute_admitted_job(
                         {},
                     )
                 feature = str(step.get("feature_type") or "")
+                purchase = data.get("buy_card") if isinstance(data, dict) else None
+                if feature == "post.buy_card" and isinstance(purchase, dict) and (
+                    purchase.get("payment_attempted") or purchase.get("bought", 0)
+                ):
+                    payment_steps.add(str(step.get("step_key") or ""))
+                if payment_steps and status in {"restart", "fallback_interaction"}:
+                    status = "waiting_human"
+                    message = "本任务已发起购卡点击，禁止自动重跑以避免重复购买，请人工核验"
                 page = job_artifacts.pages.active
                 category = str(step.get("category") or feature.split(".", 1)[0])
                 if category in {"sign", "post"} and status != "skipped":
@@ -4074,6 +4474,15 @@ async def _execute_admitted_job(
                             step, "fail", job_message, started=started, data=data
                         )
                         job_artifacts.log("ERROR", job_message)
+                        await emit_progress()
+                        break
+                    if payment_steps.intersection(
+                        str(item.get("step_key") or "") for item in steps[target_index:index + 1]
+                    ):
+                        job_status = "waiting_human"
+                        job_message = "跳转将重复执行已发起的购卡步骤，已停止，请人工核验"
+                        results[-1] = _step_result(step, job_status, job_message, started=started, data=data)
+                        job_artifacts.log("WARN", job_message)
                         await emit_progress()
                         break
                     if jump_total >= jump_limit:
