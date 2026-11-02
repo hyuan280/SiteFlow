@@ -121,9 +121,12 @@ multipart field: image       # PNG/JPEG 截图
 ```text
 has_cf_challenge
 state: absent | unchecked | verified | processing | error | unknown
+confidence: 0 到 1 的数值或 null
 checkbox_center_pct: {x, y}
 widget_box_pct
 ```
+
+`state=error` 表示截图中识别到视觉错误状态，和请求异常、HTTP 非 200 或非法响应不同。Worker 会继续重新识别；状态不变时不重复打印每轮日志，等待期间会输出低频进度。`error/unknown` 的有效 `confidence < 0.95` 时，连续 3 次同状态的新截图和至少 2 秒的清晰页面状态可用于排除误检测；缺失或非法置信度不按 0 处理。完整完成判据、新 token 及连续低置信度确认见 [任务执行](execution.md)。
 
 配置：
 

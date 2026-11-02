@@ -22,6 +22,8 @@ from app.services.integrations import IntegrationService
 from app.services.plugin_audit import record
 
 logger = logging.getLogger("siteflow.secrets")
+CREDENTIAL_PURPOSES = frozenset({"auth.form_login", "auth.password_verify"})
+SECRET_PURPOSES = CREDENTIAL_PURPOSES | {"challenge.2fa"}
 
 
 class SecretDenied(ValueError):
@@ -33,7 +35,7 @@ def credential_provider(site):
 
 
 def step_provider(site, step):
-    return credential_provider(site) if step.feature_type == "auth.form_login" else step.config.get("totp_provider_id") or "builtin.twofauth"
+    return credential_provider(site) if step.feature_type in CREDENTIAL_PURPOSES else step.config.get("totp_provider_id") or "builtin.twofauth"
 
 
 class SecretProviders:
@@ -83,7 +85,7 @@ class SecretProviders:
         token = secrets.token_urlsafe(32)
         allowed = {}
         for step in steps:
-            if step.enabled and step.feature_type in {"auth.form_login", "challenge.2fa"}:
+            if step.enabled and step.feature_type in SECRET_PURPOSES:
                 provider = step_provider(site, step)
                 options = dict(step.config)
                 options.update(base_url=site.base_url, bitwarden_match_mode=site.bitwarden_match_mode, bitwarden_custom_match=site.bitwarden_custom_match)
@@ -139,6 +141,8 @@ class SecretProviders:
             step = grant[4].get(step_key)
             if not step or step[:2] != (purpose, provider):
                 raise SecretDenied()
+            if purpose == "auth.password_verify" and provider == "builtin.twofauth":
+                raise SecretDenied()
             if lease is not None:
                 key = self.digest(lease)
                 entry = self.leases.get(key)
@@ -154,7 +158,7 @@ class SecretProviders:
             if provider.startswith("plugin."):
                 try:
                     runtime = PluginRuntimeService(session, self.settings).runtime_for_plugin(provider[7:])
-                    capability = "secret.credentials" if purpose == "auth.form_login" else "secret.totp"
+                    capability = "secret.credentials" if purpose in CREDENTIAL_PURPOSES else "secret.totp"
                     if capability not in runtime["approved_capabilities"] or (runtime["generation"], runtime["permission_epoch"]) != step[2].get("plugin_scope"):
                         raise SecretDenied()
                 except Exception:
@@ -228,6 +232,8 @@ class SecretProviders:
                 except Exception:
                     raise SecretDenied() from None
         logger.info("secret resolve job=%s site=%s step=%s provider=%s outcome=success", job_id, site_id, step_key, provider)
+        if purpose == "auth.password_verify":
+            return {"password": result["password"]}
         return result
 
     def _bitwarden(self, options):
@@ -239,7 +245,7 @@ class SecretProviders:
         if not provider.startswith("plugin."):
             raise SecretDenied()
         plugin_id = provider[len("plugin."):]
-        capability = "secret.credentials" if purpose == "auth.form_login" else "secret.totp"
+        capability = "secret.credentials" if purpose in CREDENTIAL_PURPOSES else "secret.totp"
         with self.session_factory() as session:
             row = session.get(PluginRegistration, plugin_id)
             if not row or capability not in json.loads(row.capabilities_json):

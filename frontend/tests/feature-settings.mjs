@@ -290,8 +290,24 @@ try {
        stepUsesLlm(props.feature, props.step.config, props.inherited) ? h("span", { class: "llm-badge" }, "大模型") : null,
      ]) }).use(ElementPlus).provide(ID_INJECTION_KEY, { prefix: 1, current: 0 })
        .provide(ZINDEX_INJECTION_KEY, { current: 0 }));
-     const assertNoGenericControls = (html) => assert.doesNotMatch(html, /Generic LLM switch|Generic LLM prompt/);
-     const legacy = stepProps();
+      const assertNoGenericControls = (html) => assert.doesNotMatch(html, /Generic LLM switch|Generic LLM prompt/);
+      const passwordFeature = {
+        key: "auth.password_verify", name: "密码验证", category: "auth", cardinality: "multiple",
+        requires: [], defaults: { password_selector: ["#password"], submit_selector: ["#verify"], success_selector: [] },
+        required_fields: [], config_schema: { type: "object", additionalProperties: false, properties: {
+          password_selector: { type: "array", title: "密码选择器", minItems: 1, items: { type: "string", minLength: 1 } },
+          submit_selector: { type: "array", title: "提交按钮选择器", minItems: 1, items: { type: "string", minLength: 1 } },
+          success_selector: { type: "array", title: "成功元素选择器", description: "留空仅提交，不证明验证成功", items: { type: "string", minLength: 1 } },
+        } },
+      };
+      const passwordProps = stepProps({}, null, passwordFeature);
+      passwordProps.step.feature_type = passwordFeature.key;
+      const passwordHtml = await renderStep(passwordProps);
+      for (const label of ["密码选择器", "提交按钮选择器", "成功元素选择器"]) assert.ok(passwordHtml.includes(label), label);
+      assert.doesNotMatch(passwordHtml, /用户名选择器|用户名表单字段|开启模型判断/);
+      assert.deepEqual(passwordProps.step.config, {}, "rendering password verification must not materialize inherited defaults");
+      assert.equal(stepUsesLlm(passwordFeature, {}), false);
+      const legacy = stepProps();
      const legacyHtml = await renderStep(legacy);
      assert.match(legacyHtml, /role="switch"[^>]*aria-checked="false"[^>]*aria-label="开启模型判断"/);
      assert.doesNotMatch(legacyHtml, /步骤模型判断提示词|llm-badge/);

@@ -92,9 +92,13 @@ post.buy_card
 post.resign
 ```
 
-- `flow.open`、`action.navigate`：导航完成后检测页面标题和正文中的错误页特征，例如 Bad Gateway、Service Unavailable、502/503/522、Internal Server Error、404、网站维护/正在维护/关闭维护、The website has been stopped 等，即使 HTTP 返回 200 也会检测。`flow.open` 的网络异常和错误页共用 `retry_count` 次额外重试（总尝试次数为 `1 + retry_count`）；错误页重试临时禁用当前任务标签页的缓存，强制重新访问原目标地址，不因 URL 相同而跳过，步骤结束后恢复缓存。不会清除 Cookie 或整个 profile 的缓存。`retry_count=0` 和 `action.navigate` 不额外重试。次数耗尽仍是错误页时返回 `fail` 和 `error_page` 数据，随后按该步骤的错误策略 `stop`/`continue`/`defer`/`escalate_interaction` 处理。
+- `flow.open`、`action.navigate`：导航完成后检测页面标题和正文中的错误页特征，例如 Bad Gateway、Service Unavailable、502/503/522、Internal Server Error、404、网站维护/正在维护/关闭维护、The website has been stopped 等，即使 HTTP 返回 200 也会检测。`flow.open` 的网络异常和错误页共用 `retry_count` 次额外重试（总尝试次数为 `1 + retry_count`）；错误页重试临时禁用当前任务标签页的缓存，强制重新访问原目标地址，不因 URL 相同而跳过，步骤结束后恢复缓存。不会清除 Cookie 或整个 profile 的缓存。`retry_count=0` 不额外重试。次数耗尽仍是错误页时返回 `fail` 和 `error_page` 数据，随后按该步骤的错误策略 `stop`/`continue`/`defer`/`escalate_interaction` 处理。
+- `action.navigate.retry_count` 默认 0，范围 0 到 20；仅对确认可重复访问的页面显式开启，例如设置为 2 表示最多尝试 3 次，间隔 1 秒。只重试 Chromium 的 `ERR_CONNECTION_CLOSED`、`ERR_CONNECTION_RESET`、`ERR_CONNECTION_ABORTED`、`ERR_TIMED_OUT` 和 `ERR_CONNECTION_TIMED_OUT`；不重试错误页、证书/代理错误、`ERR_ABORTED`、页面关闭、普通加载超时或浏览器断连。不重放登录、点击、购买或补签操作；URL 本身带副作用时应保持 0。默认步骤超时按重试预算扩展，显式配置的步骤超时仍优先。
 - `challenge.2fa`：通过 2FAuth 按 `service_hint` 匹配账号并获取 OTP；多个候选或没有候选时返回 `waiting_human`。
 - `challenge.turnstile`：先检查 `.cf-turnstile`、`cf-turnstile-response`、`cf-chl-widget`、CF iframe、挑战文案；存在挑战时截图调用 CFbox，按复选框中心点击。CFbox 返回 `absent` 但 DOM 仍有挑战时继续等待，不直接判成功；完全没有 CF 标记约 2 秒后才视为无挑战。`wait_seconds` 是从步骤开始计算的总等待上限，包含 DOM 检测、CFbox 调用和点击后的等待，不是固定延时；未配置 CFbox 返回 `waiting_human`。
+- CFbox 的视觉状态 `error` 是合法识别结果，不代表 HTTP 服务异常；仍逐轮重新截图识别，相同状态日志去重，每约 10 秒输出等待计数和阻塞原因。视觉 `error` 与页面检查冲突时，可以在本步骤观察到页面挑战、点击时读取到空 token、随后读取到新 token，且无可见组件、挑战文字或挑战 URL、页面可读且 ready 稳定至少 2 秒后通过替代确认，结果保留 `cfbox_state=error` 和 `completion_reason=fresh_token_and_clear_page`。旧 token、不可读 token 或重建挑战不得复用此前证据。
+- 连续低置信度复核：`state=error/unknown` 且有效数值 `confidence < 0.95` 时，同一状态、同一 URL 连续至少 3 次重新截图识别，并在这段时间内持续无可见 CF 组件、挑战文字及挑战 URL，页面可读且 ready 至少 2 秒，则按误检测处理，无需 token 或点击，返回 `completion_reason=low_confidence_and_clear_page`，保留实际 `cfbox_state`、`confidence` 和 `low_confidence_count`。状态、URL、页面检查或低置信度条件中断后重新累计。等于 0.95、缺失、非数值、非有限值或越界值不计入此路径。原有新 token 确认及普通 `unknown` 双重确认保持独立，不因低置信度复核重置其稳定时间。
+- 没有足够证据仍返回 `unknown`；HTTP、认证、连接或响应格式失败不会被降级为通过。上述判断只确认挑战状态，不证明后续业务提交成功。
 - `challenge.altcha`：定位 ALTCHA 组件并点击复选框，等待组件进入 `verified` 状态或写入 Token；`wait_seconds` 控制最长等待时间。
 - `challenge.slider`：拖动手柄到容器右侧；配置了 `success_selector` 时等待成功元素。
 - `challenge.grid_captcha`：独立的九宫格多选验证码功能块（`challenge` 类别，允许多例），始终要求视觉模型，不属于字符验证码的 `captcha_method`。截图必须同时包含目标参考图与完整 3×3 网格，单元从左到右、从上到下编号 1–9，选择所有匹配项；不清楚时刷新，不猜测。未配置视觉模型或未开启「支持视觉」时需要人工处理。全局提示词在「功能管理」配置，不进入步骤字段。

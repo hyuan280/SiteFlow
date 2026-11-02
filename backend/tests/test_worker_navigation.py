@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from worker.executor import (  # noqa: E402
+    PAGE_TIMEOUT_MS,
     _captcha_format_error,
     _cf_page_state,
     _cf_progress_reason,
@@ -22,6 +25,7 @@ from worker.executor import (  # noqa: E402
     _run_flow_jump,
     _run_step,
     _same_navigation_url,
+    _transient_navigation_error,
     _wait_unit3d_success,
     execute_job,
 )
@@ -733,6 +737,254 @@ class _CachedErrorPage(_ErrorPage):
         self.detached = True
 
 
+@pytest.fixture
+def navigation_retry_sleep(monkeypatch):
+    sleep = AsyncMock()
+    monkeypatch.setattr("worker.executor.asyncio.sleep", sleep)
+    return sleep
+
+
+@pytest.mark.parametrize("code", [
+    "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_ABORTED",
+    "ERR_TIMED_OUT", "ERR_CONNECTION_TIMED_OUT",
+])
+def test_navigate_retries_transient_errors_after_url_already_changed(
+    navigation_retry_sleep, code,
+):
+    assert _transient_navigation_error(RuntimeError(f"Page.goto: net::{code}"))
+    target = "https://pt.example.com/"
+    page = _CachedErrorPage([
+        RuntimeError(f"Page.goto: net::{code} at {target}"),
+        RuntimeError(f"Page.goto: net::{code} at {target}"),
+        "Welcome",
+    ])
+    page.goto = AsyncMock(wraps=page.goto)
+    messages = []
+    status, message, data = asyncio.run(_run_step(
+        page, {"feature_type": "action.navigate", "config": {
+            "url": target, "retry_count": 2, "wait_until": "load",
+        }}, None, None, None, None, None, "general",
+        lambda level, text: messages.append((level, text)),
+    ))
+    assert status == "success"
+    assert target in message
+    assert data == {"url": target}
+    # The fake changes page.url before raising, so URL equality cannot skip a retry.
+    assert page.visits == [target] * 3
+    assert page.goto.await_count == 3
+    for call in page.goto.await_args_list:
+        assert call.args == (target,)
+        assert call.kwargs == {"wait_until": "load", "timeout": PAGE_TIMEOUT_MS}
+    assert navigation_retry_sleep.await_count == 2
+    assert sum(level == "WARN" for level, _ in messages) == 2
+    assert page.commands == []
+    assert not page.detached
+
+
+@pytest.mark.parametrize("config", [{}, {"retry_count": 0}])
+def test_navigate_without_retry_budget_attempts_only_once(navigation_retry_sleep, config):
+    error = RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED")
+    target = "https://pt.example.com/"
+    page = _CachedErrorPage([error, "Welcome"])
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(_run_step(
+            page, {"feature_type": "action.navigate", "config": {"url": target, **config}},
+            None, None, None, None, None, "general",
+        ))
+    assert caught.value is error
+    assert page.visits == [target]
+    navigation_retry_sleep.assert_not_awaited()
+    assert page.commands == []
+
+
+@pytest.mark.parametrize("retry_count", [1, 3, 20])
+def test_navigate_exhausts_exact_retry_budget(navigation_retry_sleep, retry_count):
+    target = "https://pt.example.com/"
+    errors = [RuntimeError(f"Page.goto: net::ERR_CONNECTION_RESET attempt={i}")
+              for i in range(retry_count + 1)]
+    page = _CachedErrorPage([*errors, "Welcome"])
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(_run_step(
+            page, {"feature_type": "action.navigate", "config": {
+                "url": target, "retry_count": retry_count,
+            }}, None, None, None, None, None, "general",
+        ))
+    assert caught.value is errors[-1]
+    assert page.visits == [target] * (retry_count + 1)
+    assert navigation_retry_sleep.await_count == retry_count
+    assert page.commands == []
+    assert not page.detached
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("Page.goto: net::ERR_CERT_AUTHORITY_INVALID"),
+    RuntimeError("Page.goto: net::ERR_CERT_DATE_INVALID"),
+    RuntimeError("Page.goto: net::ERR_SSL_PROTOCOL_ERROR"),
+    RuntimeError("Page.goto: net::ERR_ABORTED"),
+    RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE"),
+    RuntimeError("Page.goto: net::ERR_NAME_NOT_RESOLVED"),
+    RuntimeError("Page.goto: net::ERR_CONNECTION_REFUSED"),
+    RuntimeError("Page.goto: net::ERR_INTERNET_DISCONNECTED"),
+    RuntimeError("Page.goto: net::ERR_CONNECTION_RESET_EXTRA"),
+    RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED2"),
+    RuntimeError("Page.goto: xnet::ERR_CONNECTION_RESET"),
+    RuntimeError("Page.goto: ERR_CONNECTION_RESET"),
+    RuntimeError("Page.goto: net::err_connection_reset"),
+    RuntimeError("Page.goto: Target page, context or browser has been closed"),
+    RuntimeError("Browser backend disconnected; task was not replayed"),
+    PlaywrightTimeoutError("Page.goto: Timeout 30000ms exceeded."),
+    PlaywrightTimeoutError('Page.goto: Timeout 30000ms exceeded.\nCall log:\n  - navigating to "https://example.test/?note=net::ERR_CONNECTION_RESET"'),
+    RuntimeError("Page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://example.test/?note=net::ERR_CONNECTION_RESET"),
+    TimeoutError("navigation timed out"),
+    ValueError("invalid URL"),
+], ids=lambda error: str(error))
+def test_navigate_does_not_retry_non_whitelisted_errors(navigation_retry_sleep, error):
+    assert not _transient_navigation_error(error)
+    target = "https://pt.example.com/"
+    page = _CachedErrorPage([error, "Welcome"])
+    with pytest.raises(type(error)) as caught:
+        asyncio.run(_run_step(
+            page, {"feature_type": "action.navigate", "config": {
+                "url": target, "retry_count": 20,
+            }}, None, None, None, None, None, "general",
+        ))
+    assert caught.value is error
+    assert page.visits == [target]
+    navigation_retry_sleep.assert_not_awaited()
+    assert page.commands == []
+    assert not page.detached
+
+
+@pytest.mark.parametrize("same_url", [False, True])
+@pytest.mark.parametrize("title, reason", [
+    ("502 Bad Gateway", "bad gateway"),
+    ("The website has been stopped", "the website has been stopped"),
+    ("404 net::ERR_CONNECTION_RESET", "页面标题显示 404 net::ERR_CONNECTION_RESET"),
+])
+def test_navigate_error_page_never_retries_or_changes_cache(
+    navigation_retry_sleep, same_url, title, reason,
+):
+    target = "https://pt.example.com/"
+    page = _CachedErrorPage([title, "Welcome"], same_url=same_url)
+    page.title_text = title
+    status, message, data = asyncio.run(_run_step(
+        page, {"feature_type": "action.navigate", "config": {
+            "url": target, "retry_count": 20,
+        }}, None, None, None, None, None, "general",
+    ))
+    assert status == "fail"
+    assert reason in message
+    assert data == {"url": target, "error_page": reason}
+    assert page.visits == ([] if same_url else [target])
+    navigation_retry_sleep.assert_not_awaited()
+    assert page.commands == []
+    assert not page.detached
+
+
+def test_navigate_stops_if_transient_retry_lands_on_error_page(navigation_retry_sleep):
+    target = "https://pt.example.com/"
+    page = _CachedErrorPage([
+        RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED"),
+        "502 Bad Gateway", "Welcome",
+    ])
+    status, message, data = asyncio.run(_run_step(
+        page, {"feature_type": "action.navigate", "config": {
+            "url": target, "retry_count": 3,
+        }}, None, None, None, None, None, "general",
+    ))
+    assert status == "fail"
+    assert "bad gateway" in message
+    assert data == {"url": target, "error_page": "bad gateway"}
+    assert page.visits == [target] * 2
+    navigation_retry_sleep.assert_awaited_once()
+    assert page.commands == []
+    assert not page.detached
+
+
+@pytest.mark.parametrize("during_backoff", [False, True])
+def test_navigate_cancellation_does_not_retry(navigation_retry_sleep, during_backoff):
+    target = "https://pt.example.com/"
+    canceled = asyncio.CancelledError()
+    if during_backoff:
+        navigation_retry_sleep.side_effect = canceled
+        outcome = RuntimeError("Page.goto: net::ERR_CONNECTION_RESET")
+    else:
+        outcome = canceled
+    page = _CachedErrorPage([outcome, "Welcome"])
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(_run_step(
+            page, {"feature_type": "action.navigate", "config": {
+                "url": target, "retry_count": 20,
+            }}, None, None, None, None, None, "general",
+        ))
+    assert caught.value is canceled
+    assert page.visits == [target]
+    assert navigation_retry_sleep.await_count == int(during_backoff)
+    assert page.commands == []
+    assert not page.detached
+
+
+@pytest.mark.parametrize("feature_type", ["flow.open", "action.navigate"])
+def test_navigation_step_skips_healthy_same_url(navigation_retry_sleep, feature_type):
+    page = _CachedErrorPage([], same_url=True)
+    page.title_text = "Welcome"
+    status, _, data = asyncio.run(_run_step(
+        page, {"feature_type": feature_type, "config": {
+            "url": "https://pt.example.com", "retry_count": 2,
+        }}, None, None, None, None, None, "general",
+    ))
+    assert status == "success"
+    assert data == {"url": "https://pt.example.com/"}
+    assert page.visits == []
+    navigation_retry_sleep.assert_not_awaited()
+    assert page.commands == []
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE"),
+    RuntimeError("Page.goto: net::ERR_CERT_AUTHORITY_INVALID"),
+    RuntimeError("Page.goto: net::ERR_ABORTED"),
+    PlaywrightTimeoutError("Page.goto: Timeout 30000ms exceeded."),
+], ids=lambda error: str(error))
+def test_flow_open_retains_broad_network_retry_behavior(navigation_retry_sleep, error):
+    target = "https://pt.example.com/"
+    page = _CachedErrorPage([error, "Welcome"])
+    status, _, data = asyncio.run(_run_step(
+        page, {"feature_type": "flow.open", "config": {
+            "url": target, "retry_count": 1,
+        }}, None, None, None, None, None, "general",
+    ))
+    assert status == "success"
+    assert data == {"url": target}
+    assert page.visits == [target] * 2
+    navigation_retry_sleep.assert_awaited_once()
+    assert page.commands == []
+
+
+@pytest.mark.parametrize("same_url", [False, True])
+def test_flow_open_still_recovers_from_cached_error_page(navigation_retry_sleep, same_url):
+    target = "https://pt.example.com/"
+    page = _CachedErrorPage(
+        ["Welcome"] if same_url else ["The website has been stopped", "Welcome"],
+        same_url=same_url,
+    )
+    status, _, data = asyncio.run(_run_step(
+        page, {"feature_type": "flow.open", "config": {
+            "url": target, "retry_count": 1,
+        }}, None, None, None, None, None, "general",
+    ))
+    assert status == "success"
+    assert data == {"url": target}
+    assert page.visits == [target] * (1 if same_url else 2)
+    navigation_retry_sleep.assert_awaited_once()
+    assert page.commands == [
+        ("Network.enable", None),
+        ("Network.setCacheDisabled", {"cacheDisabled": True}),
+        ("Network.setCacheDisabled", {"cacheDisabled": False}),
+    ]
+    assert page.detached
+
+
 @pytest.mark.parametrize("same_url", [False, True])
 def test_open_error_page_retries_same_target_without_cache(same_url):
     async def run():
@@ -807,6 +1059,105 @@ def test_open_cache_setting_restored_on_cancellation():
         assert page.detached
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("feature_type", ["flow.open", "action.navigate"])
+@pytest.mark.parametrize("config, page_timeout_ms, expected", [
+    ({}, 30000, 32),
+    ({"retry_count": 0}, 30000, 32),
+    ({"retry_count": 2}, 30000, 96),
+    ({"retry_count": 20}, 30000, 672),
+    ({"retry_count": 0}, 1000, 30),
+    ({"retry_count": 20}, 200000, 3600),
+])
+def test_execute_job_navigation_default_timeout_includes_retry_budget(
+    monkeypatch, tmp_path, feature_type, config, page_timeout_ms, expected,
+):
+    import worker.executor as executor_module
+
+    monkeypatch.setattr(executor_module, "ARTIFACT_ROOT", tmp_path)
+    monkeypatch.setattr(executor_module, "PAGE_TIMEOUT_MS", page_timeout_ms)
+    run_step = AsyncMock(return_value=("success", "opened", {}))
+    monkeypatch.setattr(executor_module, "_run_step", run_step)
+    timeouts = []
+    original_wait_for = asyncio.wait_for
+
+    async def record_wait_for(awaitable, timeout):
+        timeouts.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(executor_module.asyncio, "wait_for", record_wait_for)
+    lane = _JumpLane(_JumpPage())
+    manager = _JumpManager(lane)
+    result = asyncio.run(execute_job(manager, {
+        "job_id": 1, "run_id": 1, "lane_key": "general",
+        "steps": [{"step_key": "navigate", "feature_type": feature_type, "config": config}],
+    }))
+    assert result["status"] == "success"
+    assert result["steps"][0]["status"] == "success"
+    assert timeouts == [expected]
+    run_step.assert_awaited_once()
+    assert manager.released
+    assert lane.task_pages == {}
+
+
+@pytest.mark.parametrize("feature_type", ["flow.open", "action.navigate"])
+@pytest.mark.parametrize("explicit_timeout", [1, 7, 120])
+@pytest.mark.parametrize("times_out", [False, True])
+def test_execute_job_navigation_explicit_timeout_overrides_retry_budget(
+    monkeypatch, tmp_path, feature_type, explicit_timeout, times_out,
+):
+    import worker.executor as executor_module
+
+    monkeypatch.setattr(executor_module, "ARTIFACT_ROOT", tmp_path)
+    captured = []
+
+    async def capture_failure(artifacts, _page, step_key, *_args, **_kwargs):
+        captured.append(step_key)
+        artifacts.screenshots.append({"kind": "screenshot"})
+
+    monkeypatch.setattr(executor_module.JobArtifacts, "capture_failure", capture_failure)
+    canceled = []
+
+    async def run_step(*_args, **_kwargs):
+        if times_out:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                canceled.append(True)
+        return "success", "opened", {}
+
+    monkeypatch.setattr(executor_module, "_run_step", run_step)
+    timeouts = []
+    original_wait_for = asyncio.wait_for
+
+    async def record_wait_for(awaitable, timeout):
+        timeouts.append(timeout)
+        # Exercise actual cancellation without waiting for the configured seconds.
+        return await original_wait_for(awaitable, 0.01 if times_out else timeout)
+
+    monkeypatch.setattr(executor_module.asyncio, "wait_for", record_wait_for)
+    lane = _JumpLane(_JumpPage())
+    manager = _JumpManager(lane)
+    result = asyncio.run(execute_job(manager, {
+        "job_id": 1, "run_id": 1, "lane_key": "general",
+        "steps": [{
+            "step_key": "navigate", "feature_type": feature_type,
+            "timeout_seconds": explicit_timeout, "config": {"retry_count": 20},
+        }],
+    }))
+    assert timeouts == [explicit_timeout]
+    assert result["status"] == ("fail" if times_out else "success")
+    assert result["steps"][0]["status"] == result["status"]
+    if times_out:
+        assert f"{explicit_timeout}s" in result["steps"][0]["message"]
+        assert canceled == [True]
+        assert captured == ["navigate"]
+    else:
+        assert canceled == []
+        assert captured == []
+    assert manager.released
+    assert lane.task_pages == {}
 
 
 def test_non_success_step_statuses_capture_screenshot(monkeypatch, tmp_path) -> None:

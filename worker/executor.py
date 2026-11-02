@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -351,6 +352,7 @@ async def _cf_page_state(page: Any) -> dict[str, Any]:
         # widgets here would also turn solved challenges into false positives.
         marker = None
     token_length = 0
+    token_readable = False
     try:
         token_length = int(
             await asyncio.wait_for(
@@ -369,6 +371,7 @@ async def _cf_page_state(page: Any) -> dict[str, Any]:
             )
             or 0
         )
+        token_readable = True
     except Exception:
         pass
     try:
@@ -422,6 +425,7 @@ async def _cf_page_state(page: Any) -> dict[str, Any]:
     return {
         "marker": marker,
         "token_length": token_length,
+        "token_readable": token_readable,
         "challenge_text": any(word.casefold() in text for word in challenge_words),
         "text_readable": text_readable,
         "frame_challenge": frame_challenge,
@@ -899,6 +903,44 @@ async def _run_turnstile_detection(
     reported_state: str | None = None
     challenge_reported = False
     reported_blockers: tuple[str, ...] | None = None
+    clicked_page_challenge = False
+    token_empty_after_click = False
+    fresh_token_after_click = False
+    evidence_page_cleared = False
+    reported_visual_conflict = False
+    last_heartbeat = time.monotonic()
+    low_confidence_state: str | None = None
+    low_confidence_count = 0
+    low_confidence_url: str | None = None
+    low_confidence_since: float | None = None
+
+    def observe_completion_token(state):
+        nonlocal clicked_page_challenge, token_empty_after_click, fresh_token_after_click
+        nonlocal evidence_page_cleared, no_cf_since
+        if not clicked_page_challenge:
+            return
+        challenge_present = state["marker"] or state["challenge_text"] or state["url_challenge"]
+        if challenge_present and evidence_page_cleared:
+            clicked_page_challenge = False
+            token_empty_after_click = False
+            fresh_token_after_click = False
+            no_cf_since = None
+            return
+        if state["marker"] is False and not challenge_present and state["text_readable"]:
+            evidence_page_cleared = True
+        if not state.get("token_readable"):
+            clicked_page_challenge = False
+            token_empty_after_click = False
+            fresh_token_after_click = False
+        elif int(state.get("token_length") or 0) > 0:
+            fresh_token_after_click = token_empty_after_click
+        elif fresh_token_after_click:
+            # Token expiry starts a new challenge; it cannot reuse the old click.
+            clicked_page_challenge = False
+            token_empty_after_click = False
+            fresh_token_after_click = False
+            no_cf_since = None
+
     diagnostics = diagnostics if diagnostics is not None else {}
     while time.monotonic() < deadline:
         if cancel is not None and cancel.is_set():
@@ -913,6 +955,11 @@ async def _run_turnstile_detection(
             or state["challenge_text"]
             or state["url_challenge"]
         )
+        if (current_url != low_confidence_url or has_cf
+                or state["marker"] is None or not state["text_readable"]):
+            low_confidence_state = None
+            low_confidence_count = 0
+            low_confidence_since = None
         progress = _cf_progress_reason(
             initial_url,
             current_url,
@@ -921,10 +968,7 @@ async def _run_turnstile_detection(
             clicked,
         )
         previous_token_length = token_length
-        if has_cf and progress and (
-            state["challenge_text"] or state["url_challenge"]
-            or progress != "Turnstile token 已更新"
-        ):
+        if has_cf and progress == "页面已跳转":
             note(
                 "INFO",
                 f"检测到新的 Cloudflare 挑战（{progress}，当前地址 {current_url}），"
@@ -936,6 +980,12 @@ async def _run_turnstile_detection(
             last_click_at = None
             use_x_fallback = False
             initial_url = current_url
+            clicked_page_challenge = False
+            token_empty_after_click = False
+            fresh_token_after_click = False
+            evidence_page_cleared = False
+            no_cf_since = None
+        observe_completion_token(state)
         if has_cf:
             seen_cf = True
             if not (
@@ -1023,9 +1073,16 @@ async def _run_turnstile_detection(
                 }:
                     return "fail", "CFbox 响应状态无效", {}
                 states.append(last_state)
-                diagnostics.update(state=last_state, predictions=len(states), clicked=clicked, click_count=click_count)
+                confidence_value = body.get("confidence")
+                confidence = (
+                    float(confidence_value)
+                    if type(confidence_value) in (int, float)
+                    and 0 <= confidence_value <= 1 and math.isfinite(confidence_value)
+                    else None
+                )
+                diagnostics.update(state=last_state, confidence=confidence, predictions=len(states), clicked=clicked, click_count=click_count)
                 if last_state != reported_state:
-                    note("INFO", f"CFbox 识别状态：{last_state}")
+                    note("INFO", f"CFbox 识别状态：{last_state}，confidence={confidence}")
                     reported_state = last_state
                 # Navigation or widget rendering may occur during inference.
                 diagnostics["phase"] = "page_recheck"
@@ -1039,6 +1096,34 @@ async def _run_turnstile_detection(
                     "() => document.readyState !== 'loading' && !!document.body"
                 )
                 diagnostics["ready"] = bool(ready)
+                page_clear = (
+                    state["marker"] is False and not state["challenge_text"]
+                    and not state["url_challenge"] and state["text_readable"] and ready
+                )
+                observed_url = _cf_url_key(getattr(page, "url", ""))
+                low_confidence = last_state in {"error", "unknown"} and confidence is not None and confidence < 0.95
+                if low_confidence and page_clear and observed_url == current_url:
+                    if low_confidence_state != last_state or low_confidence_url != observed_url:
+                        low_confidence_count = 0
+                        low_confidence_since = time.monotonic()
+                    low_confidence_state = last_state
+                    low_confidence_url = observed_url
+                    low_confidence_count += 1
+                    if low_confidence_count <= 3:
+                        note("INFO", f"CFbox 低置信度复核：state={last_state}, confidence={confidence:.4f}, 连续截图={low_confidence_count}/3；页面无可见 CF 挑战")
+                else:
+                    low_confidence_state = None
+                    low_confidence_count = 0
+                    low_confidence_since = None
+                    low_confidence_url = observed_url
+                low_confidence_confirmed = (
+                    low_confidence_count >= 3 and low_confidence_since is not None
+                    and time.monotonic() - low_confidence_since >= 2
+                )
+                diagnostics["low_confidence_count"] = low_confidence_count
+                token_length = int(state.get("token_length") or 0)
+                observe_completion_token(state)
+                diagnostics.update(token_present=token_length > 0, token_readable=state.get("token_readable", False), fresh_token_after_click=fresh_token_after_click)
                 if last_state == "verified":
                     seen_cf = True
                 # A solved Turnstile can remain visible with its response token.
@@ -1048,32 +1133,54 @@ async def _run_turnstile_detection(
                     and not state["challenge_text"]
                     and not state["url_challenge"]
                 )
+                visual_error_confirmed = (
+                    last_state == "error" and clicked_page_challenge
+                    and fresh_token_after_click and token_length > 0
+                    and state["marker"] is False
+                    and not state["challenge_text"] and not state["url_challenge"]
+                )
+                if last_state == "error" and not has_cf and not reported_visual_conflict:
+                    note("WARN", "CFbox 视觉状态 error，但页面挑战标记已消失；继续重新截图，检查连续低置信度或本轮新 token 证据")
+                    reported_visual_conflict = True
+                # A valid low-confidence unknown must complete the same repeat
+                # confirmation as error instead of taking the legacy shortcut.
+                visual_resolved = (
+                    last_state in {"absent", "verified"}
+                    or (last_state == "unknown" and not low_confidence)
+                    or visual_error_confirmed or low_confidence_confirmed
+                )
                 if (
                     (not has_cf or solved_widget)
                     and state["marker"] is not None
                     and state["text_readable"]
                     and ready
                     # Unknown visual inference falls back to a readable, clear page.
-                    and last_state in {"absent", "verified", "unknown"}
+                    and visual_resolved
                 ):
                     diagnostics["blockers"] = []
                     reported_blockers = None
                     if no_cf_since is None:
                         no_cf_since = time.monotonic()
-                    if time.monotonic() - no_cf_since >= 2:
+                    if low_confidence_confirmed or time.monotonic() - no_cf_since >= 2:
                         message = (
-                            "Cloudflare 验证已通过" if solved_widget
+                            "Cloudflare 挑战未检出（连续 3 次低置信度截图，页面无可见 CF 组件）" if low_confidence_confirmed
+                            else "Cloudflare 验证已通过（新 token 与页面状态确认，CFbox 视觉状态 error）" if visual_error_confirmed
+                            else "Cloudflare 验证已通过" if solved_widget
                             else "Cloudflare 挑战已消失" if seen_cf
                             else "未检测到 Cloudflare 挑战"
                         )
                         note("INFO", message)
-                        return "success", message, {
+                        result = {
                             "state": "passed" if seen_cf else "absent",
                             "cfbox_state": last_state,
                             "clicked": clicked,
                             "click_count": click_count,
                             "states": states,
+                            "completion_reason": "low_confidence_and_clear_page" if low_confidence_confirmed else "fresh_token_and_clear_page" if visual_error_confirmed else "dual_confirmation",
                         }
+                        if low_confidence_confirmed:
+                            result.update(confidence=confidence, low_confidence_count=low_confidence_count)
+                        return "success", message, result
                 else:
                     no_cf_since = None
                     blockers = tuple(reason for reason, blocked in (
@@ -1083,12 +1190,15 @@ async def _run_turnstile_detection(
                         ("marker_unreadable", state["marker"] is None),
                         ("text_unreadable", not state["text_readable"]),
                         ("page_not_ready", not ready),
-                        ("cfbox_unresolved", last_state not in {"absent", "verified", "unknown"}),
+                        ("cfbox_unresolved", not visual_resolved),
                     ) if blocked)
                     diagnostics["blockers"] = list(blockers)
                     if blockers != reported_blockers:
                         note("INFO", f"Cloudflare 等待原因：{', '.join(blockers)}（CFbox={last_state}）")
                         reported_blockers = blockers
+                if time.monotonic() - last_heartbeat >= 10:
+                    note("INFO", f"Cloudflare 仍在重新识别：state={last_state}, confidence={confidence}, predictions={len(states)}, low_confidence_count={low_confidence_count}, blockers={diagnostics['blockers']}, token_present={token_length > 0}, fresh_token_after_click={fresh_token_after_click}")
+                    last_heartbeat = time.monotonic()
                 if last_state not in {"absent", "verified", "unknown"}:
                     seen_cf = True
                 if last_state == "absent" and has_cf:
@@ -1114,6 +1224,11 @@ async def _run_turnstile_detection(
                                 page_click_started_at = time.monotonic()
                             click_mode = "page"
                         clicked = True
+                        if has_cf and not clicked_page_challenge:
+                            clicked_page_challenge = bool(state.get("token_readable")) and token_length <= 0
+                            token_empty_after_click = bool(state.get("token_readable")) and token_length <= 0
+                            fresh_token_after_click = False
+                            evidence_page_cleared = False
                         click_count += 1
                         last_click_at = time.monotonic()
                         last_click = {"x": round(x, 1), "y": round(y, 1)}
@@ -1132,6 +1247,7 @@ async def _run_turnstile_detection(
         "unknown",
         f"Turnstile 未在 {wait_seconds}s 内完成（最后状态 {last_state}{suffix}）",
         {
+            **diagnostics,
             "state": last_state,
             "clicked": clicked,
             "click_count": click_count,
@@ -2311,6 +2427,15 @@ def _retryable_navigation_error(exc: Exception) -> bool:
     )
 
 
+def _transient_navigation_error(exc: Exception) -> bool:
+    # Only classify the failure prefix, never URLs or page text in the call log.
+    match = re.match(r"^(?:Page\.goto:\s*)?net::(ERR_[A-Z0-9_]+)(?=\s|$)", str(exc))
+    return match is not None and match.group(1) in {
+        "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_ABORTED",
+        "ERR_TIMED_OUT", "ERR_CONNECTION_TIMED_OUT",
+    }
+
+
 async def _export_site_cookies(
     context: Any,
     base_url: str,
@@ -2392,6 +2517,7 @@ async def _goto_if_needed(
     retry_count: int = 0,
     retry_interval_seconds: float = 1.0,
     check_error_page: bool = False,
+    transient_only: bool = False,
 ) -> bool:
     current = str(getattr(page, "url", "") or "")
     skip_navigation = _same_navigation_url(current, url)
@@ -2417,7 +2543,9 @@ async def _goto_if_needed(
                 return not (attempt == 1 and skip_navigation)
             except Exception as exc:
                 error_page = isinstance(exc, _NavigationPageError)
-                if attempt >= attempts or not (error_page or _retryable_navigation_error(exc)):
+                retryable = (not error_page and _transient_navigation_error(exc) if transient_only
+                             else error_page or _retryable_navigation_error(exc))
+                if attempt >= attempts or not retryable:
                     log(
                         "ERROR",
                         f"{label}打开失败（第 {attempt}/{attempts} 次）："
@@ -3138,7 +3266,7 @@ async def _run_step(
         if not url:
             return "fail", "地址为空", {}
         wait_until = await _wait_until(page, str(config.get("wait_until") or "domcontentloaded"))
-        retry_count = int(config.get("retry_count") or 0) if feature == "flow.open" else 0
+        retry_count = int(config.get("retry_count") or 0)
         try:
             await _goto_if_needed(
                 page,
@@ -3148,6 +3276,7 @@ async def _run_step(
                 "页面",
                 retry_count=retry_count,
                 check_error_page=True,
+                transient_only=feature == "action.navigate",
             )
         except _NavigationPageError as exc:
             return "fail", str(exc), {
@@ -3325,6 +3454,62 @@ async def _run_step(
         else:
             await asyncio.sleep(1)
         return "success", "登录完成", {"url": page.url}
+
+    if feature == "auth.password_verify":
+        if secret_payload is None:
+            return "fail", "密码验证需要受控的站点凭据访问", {}
+        from worker.secret_client import resolve_secret, require_site_origin
+        from worker.browser_input import hold_page_input
+
+        require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
+        secret = await resolve_secret(secret_payload, step)
+        password_value = secret.pop("password", None)
+        secret.clear()
+        if not isinstance(password_value, str) or not password_value:
+            return "fail", "未获取到站点账户密码", {}
+        try:
+            selectors_note("密码输入框", config.get("password_selector"))
+            password_input = await _find_locator(
+                page, list(config.get("password_selector") or []),
+                wait_ms=SELECTOR_WAIT_MS, on_match=matched_note("密码输入框"),
+            )
+            if password_input is None:
+                return "fail", "未找到密码输入框", {}
+            selectors_note("密码验证按钮", config.get("submit_selector"))
+            submit = await _find_locator(
+                page, list(config.get("submit_selector") or []),
+                wait_ms=SELECTOR_WAIT_MS, on_match=matched_note("密码验证按钮"),
+            )
+            if submit is None:
+                return "fail", "未找到密码验证按钮", {}
+            async with hold_page_input(page):
+                require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
+                try:
+                    await password_input.fill(password_value, timeout=PAGE_TIMEOUT_MS)
+                    if await password_input.input_value(timeout=PAGE_TIMEOUT_MS) != password_value:
+                        raise RuntimeError("Password input verification failed")
+                except Exception:
+                    raise RuntimeError("Sensitive password verification fill failed") from None
+        finally:
+            password_value = None
+        note("INFO", "验证密码已填写并校验")
+        async with hold_page_input(page):
+            require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
+            try:
+                await submit.click(timeout=PAGE_TIMEOUT_MS)
+            except Exception:
+                raise RuntimeError("Password verification submit failed") from None
+        note("INFO", "密码验证已提交")
+        success = list(config.get("success_selector") or [])
+        if success:
+            if await _find_locator(
+                page, success, wait_ms=SELECTOR_WAIT_MS,
+                on_match=matched_note("密码验证成功元素"),
+            ) is None:
+                return "fail", "密码验证成功元素未出现", {"url": page.url, "submitted": True, "verified": False}
+            return "success", "密码验证通过", {"url": page.url, "submitted": True, "verified": True}
+        await asyncio.sleep(1)
+        return "success", "密码验证已提交，未配置成功元素检查", {"url": page.url, "submitted": True, "verified": False}
 
     if feature == "challenge.2fa":
         if secret_payload is not None:
@@ -3755,7 +3940,7 @@ async def _execute_admitted_job(
                         model_timeout = float((payload.get("vision") or {}).get("timeout") or 30)
                         success_wait = max(1, min(int(grid_config.get("success_wait_seconds", 10)), 120))
                         timeout = min(3600, (refreshes + 1) * (model_timeout + 20 + success_wait) + 30)
-                    elif feature_type == "flow.open":
+                    elif feature_type in {"flow.open", "action.navigate"}:
                         step_config = step.get("config")
                         if not isinstance(step_config, dict):
                             step_config = {}

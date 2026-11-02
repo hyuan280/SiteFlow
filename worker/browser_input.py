@@ -5,6 +5,18 @@ from contextlib import asynccontextmanager
 from functools import wraps
 
 
+@asynccontextmanager
+async def hold_page_input(page):
+    """Let sensitive actions authorize after waiting for the shared input gate."""
+    context = getattr(page, "context", None)
+    gate = getattr(getattr(context, "_impl_obj", None), "_siteflow_input_guard", None)
+    if gate is None:
+        yield
+        return
+    async with gate.hold(page):
+        yield
+
+
 class _InputGuard:
     def __init__(self):
         self.lock = asyncio.Lock()

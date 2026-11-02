@@ -62,6 +62,23 @@ class AuthFormLoginConfig(FeatureConfig):
     )
 
 
+class AuthPasswordVerifyConfig(FeatureConfig):
+    password_selector: SelectorCandidates = Field(
+        default_factory=lambda: ["input[name='password']"],
+        min_length=1,
+        description=f"账户密码输入框选择器；{SELECTOR_HINT}",
+    )
+    submit_selector: SelectorCandidates = Field(
+        default_factory=lambda: ["button[type='submit']"],
+        min_length=1,
+        description=f"密码验证提交按钮选择器；{SELECTOR_HINT}",
+    )
+    success_selector: SelectorCandidates = Field(
+        default_factory=list,
+        description=f"验证成功后出现的元素，可选；留空仅提交，不证明验证成功；{SELECTOR_HINT}",
+    )
+
+
 class AuthTotpLoginConfig(FeatureConfig):
     code_selector: SelectorCandidates = Field(
         default_factory=lambda: ["input[name='code']"],
@@ -461,6 +478,12 @@ class ActionNavigateConfig(FeatureConfig):
         description="目标地址，支持 {base_url} 占位符",
     )
     wait_until: WaitUntil = Field(default="domcontentloaded", description="页面加载完成条件")
+    retry_count: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description="连接关闭、重置、中止或网络超时后的额外重试次数；默认不重试。仅对确认可重复访问的页面启用，带签到、购买等副作用的 URL 请保持 0",
+    )
 
 
 class ActionClickConfig(FeatureConfig):
@@ -621,6 +644,14 @@ FEATURE_LIST: tuple[Feature, ...] = (
         "single",
         AuthFormLoginConfig,
         description="使用站点用户名和密码登录。",
+    ),
+    _feature(
+        "auth.password_verify",
+        "密码验证",
+        "auth",
+        "multiple",
+        AuthPasswordVerifyConfig,
+        description="仅填写站点账户密码并点击提交按钮；成功条件留空仅提交，不证明验证成功。",
     ),
     _feature(
         "challenge.2fa",

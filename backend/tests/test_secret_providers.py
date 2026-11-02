@@ -11,17 +11,18 @@ from app.services.execution import ExecutionService
 from app.services.secret_providers import SecretDenied
 
 
-@pytest.fixture
-def grant(client):
-    site = client.post("/api/v1/sites", json={"name": "lease-test", "base_url": "https://example.test", "steps": [{"step_key": "login", "feature_type": "auth.form_login"}]}).json()
+@pytest.fixture(params=["auth.form_login", "auth.password_verify"])
+def grant(client, request):
+    purpose = request.param
+    site = client.post("/api/v1/sites", json={"name": "lease-test", "base_url": "https://example.test", "steps": [{"step_key": "login", "feature_type": purpose}]}).json()
     client.put(f"/api/v1/sites/{site['id']}/credential", json={"username": "private-user", "password": "private-password"})
     app = client.app
     providers = app.state.executor.secret_providers
     with app.state.session_factory() as session:
         run = ExecutionService(session, app.state.settings, app.state.crypto).create_run(RunCreate(site_ids=[site["id"]]), "admin")
         job = session.query(SiteJob).filter_by(run_id=run.id).one()
-        token = providers.register(job, session.get(Site, site["id"]), [SimpleNamespace(enabled=True, feature_type="auth.form_login", step_key="login", config={})])
-        args = (token, job.id, site["id"], "login", "auth.form_login", "builtin.manual")
+        token = providers.register(job, session.get(Site, site["id"]), [SimpleNamespace(enabled=True, feature_type=purpose, step_key="login", config={})])
+        args = (token, job.id, site["id"], "login", purpose, "builtin.manual")
     return providers, args
 
 
@@ -34,7 +35,10 @@ def test_one_use_and_no_plaintext_storage(grant):
     lease = call(providers, args)["lease"]
     assert lease not in str(providers.leases)
     assert args[0] not in str(providers.jobs)
-    assert call(providers, args, lease=lease) == {"username": "private-user", "password": "private-password"}
+    expected = {"password": "private-password"}
+    if args[4] == "auth.form_login":
+        expected["username"] = "private-user"
+    assert call(providers, args, lease=lease) == expected
     assert "private-password" not in str(vars(providers))
     with pytest.raises(SecretDenied):
         call(providers, args, lease=lease)
@@ -49,6 +53,34 @@ def test_wrong_scope(grant, index, value):
     with pytest.raises(SecretDenied):
         call(providers, wrong, lease=lease)
     assert call(providers, args, lease=lease)["password"] == "private-password"
+
+
+def test_login_and_password_verify_purposes_are_isolated(grant, client):
+    providers, args = grant
+    other_purpose = "auth.password_verify" if args[4] == "auth.form_login" else "auth.form_login"
+    with client.app.state.session_factory() as session:
+        token = providers.register(session.get(SiteJob, args[1]), session.get(Site, args[2]), [
+            SimpleNamespace(enabled=True, feature_type=args[4], step_key="login", config={}),
+            SimpleNamespace(enabled=True, feature_type=other_purpose, step_key="other", config={}),
+        ])
+    args = (token, *args[1:])
+    lease = call(providers, args)["lease"]
+    with pytest.raises(SecretDenied):
+        call(providers, (*args[:4], other_purpose, args[5]), lease=lease)
+    other = (*args[:3], "other", other_purpose, args[5])
+    with pytest.raises(SecretDenied):
+        call(providers, other, lease=lease)
+    assert call(providers, args, lease=lease)["password"] == "private-password"
+
+
+def test_disabled_step_has_no_secret_grant(grant, client):
+    providers, args = grant
+    with client.app.state.session_factory() as session:
+        token = providers.register(session.get(SiteJob, args[1]), session.get(Site, args[2]), [
+            SimpleNamespace(enabled=False, feature_type=args[4], step_key="login", config={}),
+        ])
+    with pytest.raises(SecretDenied):
+        call(providers, (token, *args[1:]))
 
 
 def test_expired_and_revoked(grant, monkeypatch):
@@ -81,7 +113,7 @@ def test_old_lease_cannot_cross_attempt_registration(grant, client):
     providers, args = grant
     lease = call(providers, args)["lease"]
     with client.app.state.session_factory() as session:
-        token = providers.register(session.get(SiteJob, args[1]), session.get(Site, args[2]), [SimpleNamespace(enabled=True, feature_type="auth.form_login", step_key="login", config={})])
+        token = providers.register(session.get(SiteJob, args[1]), session.get(Site, args[2]), [SimpleNamespace(enabled=True, feature_type=args[4], step_key="login", config={})])
     with pytest.raises(SecretDenied):
         call(providers, (token, *args[1:]), lease=lease)
 
@@ -96,7 +128,9 @@ def test_internal_route(grant, client):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     body["lease"] = response.json()["lease"]
-    assert client.post(path, json=body, headers=headers).json()["password"] == "private-password"
+    result = client.post(path, json=body, headers=headers).json()
+    assert result["password"] == "private-password"
+    assert set(result) == ({"password"} if args[4] == "auth.password_verify" else {"username", "password"})
     assert client.post(path, json=body, headers=headers).status_code == 403
 
 
@@ -182,13 +216,16 @@ def test_bitwarden_legacy_options_snapshot(grant, client, monkeypatch):
         site.bitwarden_match_mode = "custom"
         site.bitwarden_custom_match = "saved-legacy-match"
         session.commit()
-        token = providers.register(session.get(SiteJob, args[1]), site, [SimpleNamespace(enabled=True, feature_type="auth.form_login", step_key="login", config={})])
+        token = providers.register(session.get(SiteJob, args[1]), site, [SimpleNamespace(enabled=True, feature_type=args[4], step_key="login", config={})])
     args = (token, *args[1:5], "builtin.bitwarden")
     lease = call(providers, args)["lease"]
-    assert call(providers, args, lease=lease) == {"username": "vault-user", "password": "vault-password"}
+    expected = {"password": "vault-password"}
+    if args[4] == "auth.form_login":
+        expected["username"] = "vault-user"
+    assert call(providers, args, lease=lease) == expected
 
 
-@pytest.mark.parametrize("state", ["approved", "unapproved", "stopped", "wrong-capability", "rpc-failure", "changed"])
+@pytest.mark.parametrize("state", ["approved", "unapproved", "stopped", "wrong-capability", "rpc-failure", "changed", "permission-changed"])
 def test_remote_security_and_redaction(grant, client, monkeypatch, caplog, state):
     import json
     from app.models.plugin import PluginRegistration, utcnow
@@ -210,7 +247,7 @@ def test_remote_security_and_redaction(grant, client, monkeypatch, caplog, state
         site.bitwarden_custom_match = "saved-plugin-account"
         session.commit()
         token = providers.register(session.get(SiteJob, args[1]), site,
-            [SimpleNamespace(enabled=True, feature_type="auth.form_login", step_key="login", config={"endpoint": "evil:7000"})])
+            [SimpleNamespace(enabled=True, feature_type=args[4], step_key="login", config={"endpoint": "evil:7000"})])
     args = (token, *args[1:5], "plugin.vault")
 
     class Channel:
@@ -235,9 +272,13 @@ def test_remote_security_and_redaction(grant, client, monkeypatch, caplog, state
             assert not hasattr(request, "lease") and not hasattr(request, "token")
             if state == "rpc-failure":
                 raise RuntimeError("private-provider-token private-remote-password")
-            if state == "changed":
+            if state in {"changed", "permission-changed"}:
                 with client.app.state.session_factory() as session:
-                    session.get(PluginRegistration, "vault").generation += 1
+                    row = session.get(PluginRegistration, "vault")
+                    if state == "changed":
+                        row.generation += 1
+                    else:
+                        row.permission_epoch += 1
                     session.commit()
             return SimpleNamespace(username="remote-user", password="private-remote-password")
 
@@ -250,12 +291,15 @@ def test_remote_security_and_redaction(grant, client, monkeypatch, caplog, state
         return
     lease = call(providers, args)["lease"]
     if state == "approved":
-        assert call(providers, args, lease=lease)["password"] == "private-remote-password"
+        expected = {"password": "private-remote-password"}
+        if args[4] == "auth.form_login":
+            expected["username"] = "remote-user"
+        assert call(providers, args, lease=lease) == expected
     else:
         with pytest.raises(SecretDenied) as error:
             call(providers, args, lease=lease)
         assert not str(error.value)
-    assert len(calls) == (1 if state in {"approved", "rpc-failure", "changed"} else 0)
+    assert len(calls) == (1 if state in {"approved", "rpc-failure", "changed", "permission-changed"} else 0)
     assert "private-provider-token" not in caplog.text
     assert "private-remote-password" not in caplog.text
     with pytest.raises(SecretDenied):

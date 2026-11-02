@@ -21,7 +21,7 @@ from app.services.integrations import IntegrationService
 from app.services.notifications import NotificationService
 from app.services.plugin_runtime import PluginRuntimeError, PluginRuntimeService
 from app.services.resign import ResignService
-from app.services.secret_providers import SecretProviders, step_provider
+from app.services.secret_providers import SECRET_PURPOSES, SecretProviders, step_provider
 from app.services.workflows import WorkflowError, WorkflowService
 
 logger = logging.getLogger("siteflow.executor")
@@ -485,7 +485,7 @@ class ExecutionManager:
             "token": self.secret_providers.register(job, site, resolved.steps),
             "providers": {
                 step.step_key: step_provider(site, step)
-                for step in resolved.steps if step.feature_type in {"auth.form_login", "challenge.2fa"}
+                for step in resolved.steps if step.feature_type in SECRET_PURPOSES
             },
         }
         self._active_jobs.setdefault(run_id, set()).add(job_id)

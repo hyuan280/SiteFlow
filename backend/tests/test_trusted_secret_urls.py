@@ -19,7 +19,7 @@ LOGIN_PATTERN = (
     r"https://openid\.13a\.com/oauth2/authorize\?client_id=natfrp"
     r"&redirect_uri=https%3A%2F%2Fwww\.natfrp\.com"
 )
-FEATURES = ["auth.form_login", "challenge.2fa"]
+FEATURES = ["auth.form_login", "auth.password_verify", "challenge.2fa"]
 FAKE_SECRET = {"username": "test-user", "password": "test-password", "code": "123456"}
 
 
@@ -226,12 +226,16 @@ def test_sensitive_step_allows_trusted_cross_origin(sensitive_step, feature, pat
     h.resolver.assert_awaited_once()
     assert h.resolver.call_args.args[0] is h.payload
     assert h.resolver.call_args.args[1]["feature_type"] == feature
-    fields = ("username", "password") if feature == "auth.form_login" else ("code",)
+    fields = {"auth.form_login": ("username", "password"),
+              "auth.password_verify": ("password",), "challenge.2fa": ("code",)}[feature]
     for name in fields:
         h.locators[name].fill.assert_awaited_once_with(
             FAKE_SECRET[name], timeout=executor.PAGE_TIMEOUT_MS,
         )
     h.locators["submit"].click.assert_awaited_once()
+    if feature == "auth.password_verify":
+        h.locators["username"].fill.assert_not_awaited()
+        assert all(call.args[1] != ["username"] for call in h.finder.await_args_list)
     h.otp.assert_not_awaited()
 
 
@@ -293,7 +297,7 @@ def test_username_fill_redirect_denies_password(sensitive_step):
 @pytest.mark.parametrize("feature", FEATURES)
 def test_redirect_after_sensitive_fill_denies_submit(sensitive_step, feature):
     h = sensitive_step
-    field = "password" if feature == "auth.form_login" else "code"
+    field = "code" if feature == "challenge.2fa" else "password"
 
     async def redirect(*args, **kwargs):
         h.page.url = "https://evil.test/login"
@@ -332,7 +336,7 @@ def test_sensitive_step_same_origin_needs_no_allowlist(sensitive_step, feature):
     h.locators["submit"].click.assert_awaited_once()
 
 
-@pytest.mark.parametrize("feature", FEATURES)
+@pytest.mark.parametrize("feature", ["auth.form_login", "challenge.2fa"])
 def test_legacy_sensitive_steps_without_secret_payload_preserved(sensitive_step, feature):
     h = sensitive_step
     assert h.run(feature, legacy=True)[0] == "success"

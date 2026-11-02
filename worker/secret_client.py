@@ -34,7 +34,7 @@ def require_site_origin(current, base, trusted_urls=None):
 async def resolve_secret(payload, step):
     access = payload.get("secret_access") or {}
     purpose = step["feature_type"]
-    if purpose not in {"auth.form_login", "challenge.2fa"}:
+    if purpose not in {"auth.form_login", "auth.password_verify", "challenge.2fa"}:
         raise RuntimeError("Secret request denied")
     body = {
         "job_id": payload["job_id"],
