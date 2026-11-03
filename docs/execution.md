@@ -90,6 +90,7 @@ flow.result
 sign.button / sign.iframe.image_captcha / sign.image_quiz / sign.unit3d_claim
 post.buy_card
 post.resign
+post.resign_click
 ```
 
 - `flow.open`、`action.navigate`：导航完成后检测页面标题和正文中的错误页特征，例如 Bad Gateway、Service Unavailable、502/503/522、Internal Server Error、404、网站维护/正在维护/关闭维护、The website has been stopped 等，即使 HTTP 返回 200 也会检测。`flow.open` 的网络异常和错误页共用 `retry_count` 次额外重试（总尝试次数为 `1 + retry_count`）；错误页重试临时禁用当前任务标签页的缓存，强制重新访问原目标地址，不因 URL 相同而跳过，步骤结束后恢复缓存。不会清除 Cookie 或整个 profile 的缓存。`retry_count=0` 不额外重试。次数耗尽仍是错误页时返回 `fail` 和 `error_page` 数据，随后按该步骤的错误策略 `stop`/`continue`/`defer`/`escalate_interaction` 处理。
@@ -110,6 +111,8 @@ post.resign
 - `challenge.image_captcha`：截取验证码图片，按步骤的 `captcha_method` 选择识别方式后填写；默认 `ddddocr`，也可选择 `vision`（需配置视觉大模型并开启支持视觉）或 `nexusphp_gd5`（支持 NexusPHP GD 5 号字体、6 位字符，标准尺寸 150×40，其他显示尺寸会自动缩放）。配置了 `submit_selector` 时自动提交，否则只填表，交由后续登录/签到步骤提交。`charset` 校验字符集（纯数字、纯小写/大写/大小写字母、数字+字母或不限制），`length` 校验字符数（0 不校验）。`min_confidence` 仅用于 ddddocr。任一校验不通过时先按 `refresh_selector` 刷新验证码（未配置则点击验证码图片），图片未变化或刷新后仍不通过时重新开始任务，最多重新开始 2 次；视觉模型和 NexusPHP GD5 不会静默回退到其他方式。
 - `post.buy_card`：通过商品范围内的页面元素购买，不再构造 POST。`purchase_quantity=0` 按待补签日期减去已有卡数补足，正数固定购买 N 张（范围 1 到 365），不要求待补签日期非空。支持 table/grid/custom 布局、商品/标题/价格候选选择器及魔力值读取；`purchase_clicks` 按列表顺序执行，每项使用 product/page 范围内首个可用候选，点击发出后不切换候选重试。`quantity_selectors` 为空时逐张购买；配置后在唯一商品内填写批量数量，取目标剩余、余额可负担数与输入框 max 的最小值，并按 min/step 向下取合法正整数。使用真实 fill/Tab 处理常见失焦行为，实际点击前重读数量、单张报价与余额，变化或失效时停止。每轮必须核验卡数恰好增加本轮 N 张；独立库存页在提交结束后有界重新 GET 核验。原生弹窗拒绝、数量异常或结果不明返回 `waiting_human`，即使 `on_error=continue` 也停止。已发起购买后禁止任务自动重启、转车道重跑及回跳重购。旧 option/action/submit 请求字段保留但忽略。
 - `post.resign`：读取待补签日期，检查 NexusPHP FullCalendar 日历，翻月定位漏签日期，通过 `ajax.php` 的 `attendanceRetroactive` 执行补签；不负责买卡。
+- `post.resign_click`（页面点击补签）：独立的页面交互功能，不修改旧 `post.resign` 的配置或提交方式。仅处理 API 下发的过去待补签日期；确认月份，唯一定位当月目标日期，点击后确认目标 selected，再点击文字明确包含“补签/補簽”的按钮。日期定位、选中确认及 done 标记必须绑定 `{date}` 或 `{day}`，支持 `{year}/{month}`；`{day}` 仅在目标月已确认且排除相邻月时使用。只在目标日期 done 出现且补签卡恰好减少 1 时确认成功。
+- 页面补签每次提交前调用内部持久化检查点接口，以任务级 token 原子预留 `(site_id, date)`，事务提交并收到 ACK 后才点击。已有未决或终态日期不能重复预留，排队旧任务也不能绕过；页面确认后再次持久化确认。原生弹窗默认拒绝，跨源/新窗口/日期歧义/结果不明时转人工，不被 `on_error=continue` 放行。取消或断连保留已确认部分结果；后续任务对未决日期先只读检查 done，没有明确完成标记则停止，不再消费卡片。预留 ACK 丢失时可能保留“未点击但未决”的保守记录，需要人工核验；这不是远端事务或 exactly-once 保证。
 - 待补签日期由 API 按站点「支持补签最大天数」生成并注入 worker：从该站点最早有运行记录的日期开始，窗口内没有成功运行或成功补签记录的日期都算缺失；今天等当日结束后再判定。补签结果写入 `site_resign_records`，同时合并到状态矩阵和趋势。
 - 站点 Cookie 由系统主动维护：任务开始前注入，站点任务成功后从浏览器导出当前站点 Cookie 并加密更新；失败时保留原配置。
 - `post.resign` 的历史日期范围继续使用站点最大补签天数；购卡自动数量由该范围内的待补签日期决定，固定数量由 `purchase_quantity` 决定。
@@ -161,7 +164,13 @@ post.resign
 
 `flow.result` 不操作页面，按步骤条件输出布尔值 `output_value` 和信息 `message`。条件满足并执行后，会把信息写入站点任务消息、把输出值写入任务输出，并立即结束当前站点任务，不再执行后续步骤；`output_value=false` 时站点任务状态记为 `fail`。条件不满足时跳过并继续。功能块支持多例，可配置多个带不同条件的结果出口，适合“已签到/未签到”分流。
 
-可选模型判断要求「功能设置」中的总开关与步骤卡片的「开启模型判断」同时开启，并遵循全局判断范围。步骤开关默认关闭，旧步骤缺少该字段时保持关闭。站点/模板可通过 `llm_enabled` 开启、`llm_prompt` 提供专用提示词，留空使用全局通用提示词；支持模板继承与站点覆盖。全局关闭时步骤模型设置保留但不生效。视觉模式仅发送页面截图，文本模式仅发送页面文本；模型明确结论替代原输出，请求失败或结论无效则步骤失败，不静默回退。自定义提示词须明确要求只输出 True 或 False。
+可选模型判断要求「功能设置」中的总开关与步骤卡片的「开启模型判断」同时开启，并遵循全局判断范围。步骤开关默认关闭，旧步骤缺少该字段时保持关闭。站点/模板可通过 `llm_enabled` 开启、`llm_prompt` 提供业务判断标准，留空使用全局提示词；支持模板继承与站点覆盖。全局关闭时步骤模型设置保留但不生效。视觉模式仅发送页面截图，文本模式仅发送页面文本；模型明确结论替代原输出，请求失败或结论无效则步骤失败，不静默回退。
+
+结果判断与九宫格识别采用相同兼容策略：声明可选工具 `submit_workflow_result`，`tool_choice=auto`，不强制指定工具、不使用 required 或强制 response_format。模型可以调用一次该工具，也可以在无工具调用时直接返回正文 JSON，例如 `{"result":true,"reason":"简短可见依据"}`。`result` 必须为 boolean，`reason` 必须为 1 到 500 字符的非空简短依据；两条路径均拒绝额外字段、重复 JSON 键和非法 JSON。错误或多个工具调用不会再用正文兜底；不猜测自然语言布尔结论，不从 Markdown 中提取结果，不读取 reasoning_content，允许剥离正文前导且完整闭合的 think 块。
+
+系统将不可编辑的输出协议放入 system 消息，用户业务标准使用独立消息，不把合并后的内容写回配置。功能和步骤卡片显示只读协议说明；旧自定义提示词不自动改写，但其中的输出格式不能替代固定协议。有效 false 仍表示判断步骤执行成功、站点任务失败。匹配原输出时保留配置消息，不匹配时显示模型判断值。
+
+成功依据经已知秘密脱敏、控制字符清理后记录日志及步骤 `data.judgment_reason`，不复制到任务 `outputs`。实际取用的凭据和 OTP 只增加任务内长度/哈希指纹，避免为脱敏长期缓存明文；指纹不发送给模型或写入结果。依据是模型生成文本，仍可能包含未识别的页面隐私，不能将脱敏视为完整 DLP。失败日志及步骤 data 区分 HTTP 错误（带状态码）、timeout、network_error、no_result、invalid_tool_call、invalid_json、schema_error、truncated、content_filtered、refused 等，并记录固定阶段和耗时；无工具时的正文解析标记 content 阶段，证据采集失败标记 evidence_error。不记录原始响应、参数、令牌或底层异常正文，不自动重试。
 
 所有实际执行的 `sign.*`、`post.buy_card` 和 `post.resign` 步骤也会输出：
 
@@ -275,7 +284,13 @@ Turnstile 点击先用 Playwright 截图和鼠标点击。只有页面上的可�
 
 `challenge.turnstile` 每轮同时检查可见页面标记、标题/正文挑战文字、挑战 URL，以及 CFbox `/predict` 截图识别。页面未命中不再跳过 CFbox；任一侧检测到挑战都会继续处理。隐藏组件、残留响应字段和隐藏 iframe 不单独视为挑战。
 
-页面已就绪、组件与文本读取成功、页面检查无挑战且 CFbox 返回 `absent`、`verified` 或明确的 `unknown`，连续稳定两秒后成功。另允许上述 `verified` 加非空 token 的已解决组件保留可见。`unknown` 表示视觉判断不确定，此时根据页面有无可见 CF 组件、挑战文案及挑战 URL 判断，不单独阻塞正常页面；初始不存在、点击后消失和验证通过均遵循稳定窗口。CFbox 检测到未解决挑战、页面仍有未解决挑战或读取失败时不放行。未配置 CFbox 返回 `waiting_human`；截图/请求/响应失败或缺失、非法状态返回 `fail`，总等待超时返回 `unknown`，不能作为“未检测到”成功。截图、页面检查、网络请求和轮询均受步骤 `wait_seconds` 总时限约束。正常稳定清除约需三次识别，成功后不再请求。
+页面已就绪、组件与文本读取成功、页面检查无挑战且 CFbox 返回明确的 `absent` 或 `verified` 时，连续稳定两秒后成功。另允许上述 `verified` 加非空 token 的已解决组件保留可见，但可见 frame 的 marker/token 探测必须完整可读。普通 `unknown` 仅在本步骤从未出现未解决挑战证据时保留页面确认兼容；出现 DOM 挑战、视觉 error/unchecked/processing 或多候选未解决证据后，后续 `unknown/null` 不能自行清除阻塞。符合条件的新 token 或连续低置信度复核仍可独立确认。
+
+CFbox 的非空 `challenges` 数组始终参与聚合，包括顶层 confidence 为 null 的情况。子状态按 unchecked、processing、error、unknown 的未解决优先级处理；只有一个明确 unchecked 时，其他无坐标 unknown/error/processing 不构成第二点击目标，可以使用该唯一坐标，但不能据此判完成。任何其他不同坐标或多个 unchecked 都拒绝选点，不选第一个。多项未解决子结果、歧义 unknown 阻止普通完成和新 token 豁免；若所有未解决子项均为无坐标 error/unknown 且各自置信度有效、严格小于 0.95，则可独立累计三轮及至少两秒的低置信度页面复核。该路径仍要求页面无可见组件、无挑战文字/URL且可读、就绪，不能只凭复选框坐标为空通过。畸形子结果失败关闭。结果保留 `cfbox_summary_state`、`challenge_states`、有效状态及置信度，诊断额外提供子置信度和复核资格。
+
+页面标记扫描支持 open Shadow DOM、非 div 的 CF widget 容器、与可信 Turnstile 脚本关联的 `.ts-box`，并检查可见子 iframe 的内容与实际 URL。隐藏祖先和 slot 隐藏残留不单独作为挑战；扫描超限或可见 frame 检查失败不当作不存在。closed Shadow DOM 内部无法由普通页面脚本扫描，实际可访问的 frame 仍参与检测，不能把未知读取结果当作无挑战。
+
+CFbox 检测到未解决挑战、页面仍有未解决挑战或读取失败时不放行。未配置 CFbox 返回 `waiting_human`；截图/请求/响应失败或缺失、非法状态返回 `fail`，总等待超时返回 `unknown`，不能作为“未检测到”成功。截图、页面检查、网络请求和轮询均受步骤 `wait_seconds` 总时限约束。正常稳定清除约需三次识别，成功后不再请求。
 # Cancellation and Owned Pages
 
 Each admitted job owns its new root page and popup descendants through `JobPages`.

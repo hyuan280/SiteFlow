@@ -7,7 +7,11 @@ from app.models.workflow import WorkflowStep
 
 
 @pytest.mark.parametrize("kind", ["sites", "templates"])
-@pytest.mark.parametrize("prompt", ["", " \n\t ", "  Return True or False.\n", " " + "p" * 4000 + " "])
+@pytest.mark.parametrize("prompt", [
+    "", " \n\t ", "  Return True or False.\n",
+    "  检查页面是否显示已登录和已签到。\n不要猜测。  ",
+    " " + "p" * 4000 + " ",
+])
 def test_result_step_prompt_roundtrip_and_persistence(client, kind, prompt):
     config = {"llm_enabled": True, "llm_prompt": prompt}
     payload = {
@@ -43,6 +47,10 @@ def test_result_step_prompt_roundtrip_and_persistence(client, kind, prompt):
     {"llm_enabled": value} for value in ("true", "false", 0, 1, [], {})
 ] + [
     {"llm_prompt": value} for value in ("p" * 4001, 123, False, [], {})
+] + [
+    {"output_format": "json"},
+    {"system_prompt": "override system"},
+    {"protocol": "submit_workflow_result"},
 ])
 def test_result_step_rejects_invalid_config(client, kind, config):
     payload = {
@@ -95,6 +103,10 @@ def test_result_step_template_opt_in_site_override(client):
     inherited = response.json()["resolved"]["steps"][0]["config"]
     assert inherited["llm_enabled"] is True
     assert inherited["llm_prompt"] == "Template prompt"
+    assert response.json()["steps"] == [], "inheritance must not materialize a site prompt override"
+    assert client.get(path).json()["steps"] == []
+    assert client.get(f"{path}/resolved").json()["steps"][0]["config"] == inherited
+    assert client.get(path).json()["steps"] == [], "resolving must not persist merged prompts"
     for override, expected in [
         ({"llm_enabled": False}, {**inherited, "llm_enabled": False}),
         ({"llm_prompt": " \n "}, {**inherited, "llm_prompt": ""}),
@@ -111,6 +123,10 @@ def test_result_step_template_opt_in_site_override(client):
         assert client.get(path).json()["steps"][0]["config"] == override
     template = client.get(f"/api/v1/templates/{payload['template_id']}/resolved").json()
     assert template["steps"][0]["config"] == inherited
+    template_detail = client.get(f"/api/v1/templates/{payload['template_id']}").json()
+    assert template_detail["steps"][0]["config"] == {
+        "llm_enabled": True, "llm_prompt": " Template prompt ",
+    }
 
 
 def test_result_step_options_not_supported_by_other_features(client):

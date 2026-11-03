@@ -35,7 +35,19 @@ def _execute_payload(client, site_id):
     return manager._post_execute.call_args.args[0]
 
 
-def test_result_settings_default_roundtrip_and_reset(client):
+def test_result_default_prompt_exact():
+    assert RESULT_DEFAULT_PROMPT == (
+        "检查这个页面，判断网站是否已登录，并仔细检查是否存在未签到的标记。"
+        "没有登录、尚未签到或证据不足时，判断结果为 false；只有明确已登录且已签到才为 true。"
+        "简要说明可见的判断依据，不包含账号、密码、Cookie、验证码、令牌或其他敏感信息。"
+    )
+
+
+@pytest.mark.parametrize("prompt", [
+    "Return only True or False.",
+    "检查可见的登录和签到标记。\n证据不足时判断失败。",
+])
+def test_result_settings_default_roundtrip_and_reset(client, prompt):
     features = {item["key"]: item for item in client.get("/api/v1/features").json()}
     view = features["flow.result"]
     assert "action.result" not in features
@@ -45,6 +57,26 @@ def test_result_settings_default_roundtrip_and_reset(client):
     assert set(view["config_schema"]["properties"]) == {
         "output_value", "message", "llm_enabled", "llm_prompt",
     }
+    properties = view["config_schema"]["properties"]
+    assert properties["llm_prompt"]["maxLength"] == 4000
+    for text in (
+        "工具选择为 auto", "可优先调用一次 submit_workflow_result",
+        "未调用工具时直接返回正文 JSON", "result (boolean) 和 reason (string)",
+        "system 约束 JSON schema，不强制工具调用",
+        "多个工具调用、工具名称或参数无效均失败，不回退到正文 JSON",
+    ):
+        assert text in properties["llm_enabled"]["description"]
+    assert "也可直接返回正文 JSON" in properties["llm_prompt"]["description"]
+    assert '{"result":true,"reason":"可见依据"}' in properties["llm_prompt"]["description"]
+    assert "无需手写输出格式" in properties["llm_prompt"]["description"]
+    assert "不合并保存" in properties["llm_prompt"]["description"]
+    assert "页面隐私" in properties["llm_prompt"]["description"]
+    assert "不等于完整 DLP" in properties["llm_prompt"]["description"]
+    for obsolete in (
+        "必须只输出 True 或 False", "必须支持 OpenAI tool calling", "固定要求只调用一次",
+        "未调用、", "不接受纯文本 JSON", "response_format", "tool_choice",
+    ):
+        assert obsolete not in json.dumps(properties, ensure_ascii=False)
     assert view["defaults"] == {
         "output_value": True, "message": "", "llm_enabled": False, "llm_prompt": "",
     }
@@ -58,13 +90,13 @@ def test_result_settings_default_roundtrip_and_reset(client):
             "use_vision": False,
             "judgment_scope": "all",
             "model": "  custom-model  ",
-            "llm_prompt": "  Return only True or False.\n",
+            "llm_prompt": f"  {prompt}\n",
         },
     }
     expected = {
         **payload["execution_settings"],
         "model": "custom-model",
-        "llm_prompt": "Return only True or False.",
+        "llm_prompt": prompt,
     }
     for _ in range(2):
         response = client.put(SETTINGS_PATH, json=payload)
@@ -112,6 +144,9 @@ def test_result_settings_empty_object_restores_defaults(client):
     {"llm_prompt": None},
     {"unknown": True},
     {"api_key": "not-a-result-setting"},
+    {"output_format": "json"},
+    {"system_prompt": "override system"},
+    {"protocol": "submit_workflow_result"},
 ])
 def test_result_settings_reject_invalid_values(client, invalid_settings):
     response = client.put(SETTINGS_PATH, json={

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -19,6 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 from worker.browser_backend import Desktop
+from worker.cfbox_response import resolve_cfbox_prediction
 
 WAIT_UNTIL = {"domcontentloaded", "load", "networkidle"}
 SYSTEM_RESIGN_SIGNAL_KEY = "sys_resign_pending"
@@ -32,27 +34,73 @@ SCREEN_HEIGHT = 1080
 StepCallback = Callable[[dict[str, Any]], Awaitable[None]]
 ARTIFACT_ROOT = Path(os.environ.get("SITEFLOW_ARTIFACT_ROOT", "/app/artifacts"))
 CF_MARKER_SELECTOR = (
-    ".cf-turnstile, div[id^='cf-chl-widget'], "
+    ".cf-turnstile, [id^='cf-chl-widget']:not(input):not(textarea), "
     "iframe[src*='challenges.cloudflare.com'], iframe[src*='challenge-platform']"
 )
-CF_VISIBLE_MARKER_SCRIPT = """() => {
-    const selectors = [
-        '.cf-turnstile',
-        'div[id^="cf-chl-widget"]',
-        'iframe[src*="challenges.cloudflare.com"]',
-        'iframe[src*="challenge-platform"]',
-    ];
-    return selectors.some((selector) =>
-        [...document.querySelectorAll(selector)].some((element) => {
-            const rect = element.getBoundingClientRect();
-            const style = getComputedStyle(element);
-            return rect.width > 0
-                && rect.height > 0
-                && style.display !== 'none'
-                && style.visibility !== 'hidden'
-                && Number(style.opacity || 1) !== 0;
-        })
+# Share the bounded, composed-tree walk between marker and token reads.
+CF_DOM_SCAN_SCRIPT = """
+    const elements = [];
+    const roots = [document];
+    let readable = true;
+    for (let index = 0; index < roots.length; index++) {
+        const walker = document.createTreeWalker(roots[index], NodeFilter.SHOW_ELEMENT);
+        let element;
+        while ((element = walker.nextNode())) {
+            if (elements.length >= 20000) { readable = false; break; }
+            elements.push(element);
+            if (element.shadowRoot) {
+                if (roots.length >= 256) readable = false;
+                else roots.push(element.shadowRoot);
+            }
+        }
+        if (elements.length >= 20000) { readable = false; break; }
+    }
+    const trustedScript = elements.some((element) => {
+        if (!element.matches('script[src]')) return false;
+        try {
+            const url = new URL(element.src, document.baseURI);
+            return url.protocol === 'https:' && !url.username && !url.password && url.hostname === 'challenges.cloudflare.com'
+                && url.pathname.startsWith('/turnstile/');
+        } catch { return false; }
+    });
+    const isMarker = (element) => !element.matches('input, textarea, script') && (
+        element.matches('.cf-turnstile, [id^="cf-chl-widget"], '
+            + 'iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"]')
+        || (trustedScript && element.matches('.ts-box'))
     );
+"""
+CF_ELEMENT_VISIBLE_SCRIPT = """(element) => {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const ownStyle = getComputedStyle(element);
+    if (ownStyle.visibility === 'hidden' || ownStyle.visibility === 'collapse') return false;
+    let node = element;
+    for (let depth = 0; node && depth < 256; depth++) {
+        const style = getComputedStyle(node);
+        if (style.display === 'none' || style.contentVisibility === 'hidden'
+            || Number(style.opacity || 1) === 0) return false;
+        node = node.assignedSlot || node.parentElement || node.getRootNode().host;
+    }
+    if (node) throw new Error('CF visibility depth exceeded');
+    return true;
+}"""
+CF_VISIBLE_MARKER_SCRIPT = "() => {" + CF_DOM_SCAN_SCRIPT + """
+    const visible = """ + CF_ELEMENT_VISIBLE_SCRIPT + """;
+    for (const element of elements) {
+        if (isMarker(element) && visible(element)) return true;
+    }
+    if (!readable) throw new Error('CF DOM scan limit exceeded');
+    return false;
+}"""
+CF_TOKEN_LENGTH_SCRIPT = "() => {" + CF_DOM_SCAN_SCRIPT + """
+    if (!readable) throw new Error('CF token scan limit exceeded');
+    let length = 0;
+    for (const element of elements) {
+        if (element.matches('[name="cf-turnstile-response"]')) {
+            length = Math.max(length, String(element.value || '').length);
+        }
+    }
+    return length;
 }"""
 CF_PAGE_TEXT_SCRIPT = """() => {
     if (!document.body) throw new Error('CF page body unavailable');
@@ -228,8 +276,8 @@ class JobArtifacts:
             return
         try:
             image = await page.screenshot(type="png")
-        except Exception as exc:
-            self.log("WARN", f"failure screenshot failed: {type(exc).__name__}: {exc}")
+        except Exception:
+            self.log("WARN", "failure screenshot failed")
             return
         if not image:
             return
@@ -341,58 +389,98 @@ async def _page_text(page: Any, *, strict: bool = False) -> str:
 
 
 async def _cf_page_state(page: Any) -> dict[str, Any]:
-    try:
-        marker = bool(
-            await asyncio.wait_for(
-                page.evaluate(CF_VISIBLE_MARKER_SCRIPT),
-                timeout=FRAME_OP_TIMEOUT_SECONDS,
-            )
-        )
-    except Exception:
-        # A failed visibility check is not evidence of absence. Counting hidden
-        # widgets here would also turn solved challenges into false positives.
-        marker = None
+    marker: bool | None = False
+    dom_marker: bool | None = False
+    frame_challenge = False
+    frames_checked = frames_hidden = frames_unreadable = 0
     token_length = 0
-    token_readable = False
-    try:
-        token_length = int(
-            await asyncio.wait_for(
-                page.evaluate(
-                    """() => {
-                        let length = 0;
-                        for (const el of document.querySelectorAll(
-                            '[name="cf-turnstile-response"]'
-                        )) {
-                            length = Math.max(length, String(el.value || '').length);
-                        }
-                        return length;
-                    }"""
-                ),
-                timeout=FRAME_OP_TIMEOUT_SECONDS,
-            )
-            or 0
-        )
-        token_readable = True
-    except Exception:
-        pass
+    token_readable = text_readable = True
+    marker_readable = True
+    parts: list[str] = []
     try:
         # Health/state reads must not run the SDK's humanized action pipeline.
-        parts = [await asyncio.wait_for(page.title(), timeout=FRAME_OP_TIMEOUT_SECONDS)]
-        parts.append(await asyncio.wait_for(page.evaluate(CF_PAGE_TEXT_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS))
-        for frame in _page_frames(page):
-            if frame is getattr(page, "main_frame", page):
-                continue
-            element = await asyncio.wait_for(frame.frame_element(), timeout=FRAME_OP_TIMEOUT_SECONDS)
-            if not await asyncio.wait_for(element.is_visible(), timeout=FRAME_OP_TIMEOUT_SECONDS):
-                continue
-            parts.append(await asyncio.wait_for(frame.evaluate(CF_PAGE_TEXT_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS))
-        if not all(isinstance(part, str) for part in parts):
-            raise ValueError("Invalid CF page text")
-        text = "\n".join(parts).casefold()
-        text_readable = True
+        title = await asyncio.wait_for(page.title(), timeout=FRAME_OP_TIMEOUT_SECONDS)
+        if not isinstance(title, str):
+            raise ValueError("Invalid CF page title")
+        parts.append(title)
     except Exception:
-        text = ""
         text_readable = False
+    try:
+        main_frame = getattr(page, "main_frame", page)
+        frames = [frame for frame in page.frames if frame is not main_frame]
+    except Exception:
+        frames = []
+        marker = None
+        marker_readable = False
+        text_readable = token_readable = False
+    if len(frames) > 256:
+        frames = frames[:256]
+        marker = None
+        marker_readable = False
+        text_readable = token_readable = False
+    for frame in [page, *frames]:
+        if frame is not page:
+            # A child can have a layout box even when its outer iframe is hidden.
+            try:
+                ancestors = []
+                ancestor = frame
+                while ancestor is not None and ancestor is not main_frame:
+                    if len(ancestors) >= 64:
+                        raise ValueError("CF frame depth exceeded")
+                    ancestors.append(ancestor)
+                    ancestor = ancestor.parent_frame
+                visible = True
+                for ancestor in reversed(ancestors):
+                    element = await asyncio.wait_for(ancestor.frame_element(), timeout=FRAME_OP_TIMEOUT_SECONDS)
+                    try:
+                        visible = await asyncio.wait_for(element.evaluate(CF_ELEMENT_VISIBLE_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS)
+                        if type(visible) is not bool:
+                            raise ValueError("Invalid CF frame visibility")
+                    finally:
+                        await element.dispose()
+                    if not visible:
+                        break
+                if not visible:
+                    frames_hidden += 1
+                    continue
+            except Exception:
+                frames_unreadable += 1
+                marker_readable = False
+                marker = None if marker is not True else True
+                text_readable = token_readable = False
+                continue
+            frames_checked += 1
+            try:
+                url = str(frame.url).casefold()
+                if "challenges.cloudflare.com" in url or "challenge-platform" in url:
+                    frame_challenge = True
+                    marker = True
+            except Exception:
+                marker_readable = False
+                marker = None if marker is not True else True
+        try:
+            found = await asyncio.wait_for(frame.evaluate(CF_VISIBLE_MARKER_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS)
+            if type(found) is not bool:
+                raise ValueError("Invalid CF marker result")
+            if found:
+                marker = dom_marker = True
+        except Exception:
+            marker_readable = False
+            marker = None if marker is not True else True
+            dom_marker = None if dom_marker is not True else True
+        try:
+            length = await asyncio.wait_for(frame.evaluate(CF_TOKEN_LENGTH_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS)
+            token_length = max(token_length, int(length))
+        except Exception:
+            token_readable = False
+        try:
+            text = await asyncio.wait_for(frame.evaluate(CF_PAGE_TEXT_SCRIPT), timeout=FRAME_OP_TIMEOUT_SECONDS)
+            if not isinstance(text, str):
+                raise ValueError("Invalid CF page text")
+            parts.append(text)
+        except Exception:
+            text_readable = False
+    text = "\n".join(parts).casefold()
     challenge_words = (
         "just a moment",
         "checking your browser",
@@ -409,15 +497,6 @@ async def _cf_page_state(page: Any) -> dict[str, Any]:
         "cf-challenge",
         "确认您是真人",
     )
-    urls: list[str] = []
-    for frame in _page_frames(page):
-        try:
-            urls.append(str(frame.url))
-        except Exception:
-            continue
-    frame_challenge = any(
-        "challenges.cloudflare.com" in url or "challenge-platform" in url for url in urls
-    )
     current_url = _cf_url_key(getattr(page, "url", ""))
     url_challenge = (
         "__cf_chl_" in current_url.casefold()
@@ -425,13 +504,17 @@ async def _cf_page_state(page: Any) -> dict[str, Any]:
     )
     return {
         "marker": marker,
+        "marker_readable": marker_readable,
         "token_length": token_length,
         "token_readable": token_readable,
         "challenge_text": any(word.casefold() in text for word in challenge_words),
         "text_readable": text_readable,
         "frame_challenge": frame_challenge,
         "url_challenge": url_challenge,
-        "urls": urls,
+        "dom_marker": dom_marker,
+        "frames_checked": frames_checked,
+        "frames_hidden": frames_hidden,
+        "frames_unreadable": frames_unreadable,
     }
 
 
@@ -478,9 +561,11 @@ def _cf_progress_reason(
 
 async def _scroll_cf_into_view(page: Any) -> None:
     try:
-        locator = page.locator(CF_MARKER_SELECTOR).first
-        if await locator.count():
-            await locator.scroll_into_view_if_needed(timeout=3000)
+        await asyncio.wait_for(page.evaluate("() => {" + CF_DOM_SCAN_SCRIPT + """
+            const visible = """ + CF_ELEMENT_VISIBLE_SCRIPT + """;
+            const element = elements.find((element) => isMarker(element) && visible(element));
+            if (element) element.scrollIntoView({block: 'nearest', inline: 'nearest'});
+        }"""), timeout=FRAME_OP_TIMEOUT_SECONDS)
     except Exception:
         pass
 
@@ -899,6 +984,8 @@ async def _run_turnstile_detection(
     previous_token_length = 0
     states: list[str] = []
     seen_cf = False
+    seen_page_challenge = False
+    unresolved_challenge = False
     no_cf_since: float | None = None
     first_pass = True
     reported_state: str | None = None
@@ -948,7 +1035,7 @@ async def _run_turnstile_detection(
             return "canceled", "已取消", {}
         diagnostics["phase"] = "page_check"
         state = await _cf_page_state(page)
-        diagnostics["page"] = {key: state[key] for key in ("marker", "challenge_text", "url_challenge", "text_readable")}
+        diagnostics["page"] = {key: state[key] for key in ("marker", "dom_marker", "frame_challenge", "frames_checked", "frames_hidden", "frames_unreadable", "challenge_text", "url_challenge", "text_readable")}
         current_url = _cf_url_key(getattr(page, "url", ""))
         token_length = int(state.get("token_length") or 0)
         has_cf = (
@@ -989,11 +1076,14 @@ async def _run_turnstile_detection(
         observe_completion_token(state)
         if has_cf:
             seen_cf = True
+            seen_page_challenge = True
+            unresolved_challenge = True
             if not (
                 last_state == "verified" and token_length > 0
                 and not state["challenge_text"] and not state["url_challenge"]
             ):
                 no_cf_since = None
+        diagnostics.update(unresolved_challenge=unresolved_challenge, seen_page_challenge=seen_page_challenge)
 
         # Always consult CFbox, including when page markers have disappeared.
         if time.monotonic() < deadline:
@@ -1073,26 +1163,34 @@ async def _run_turnstile_detection(
                     "absent", "verified", "unknown", "unchecked", "processing", "error"
                 }:
                     return "fail", "CFbox 响应状态无效", {}
+                prediction = resolve_cfbox_prediction(body)
+                last_state = prediction["state"]
+                confidence = prediction["effective_confidence"]
+                allow_clear_override = prediction["allow_clear_override"]
                 states.append(last_state)
-                confidence_value = body.get("confidence")
-                confidence = (
-                    float(confidence_value)
-                    if type(confidence_value) in (int, float)
-                    and 0 <= confidence_value <= 1 and math.isfinite(confidence_value)
-                    else None
-                )
-                diagnostics.update(state=last_state, confidence=confidence, predictions=len(states), clicked=clicked, click_count=click_count)
+                diagnostics.update(state=last_state, summary_state=prediction["summary_state"],
+                                   challenge_states=prediction["challenge_states"],
+                                   challenge_confidences=prediction["challenge_confidences"],
+                                   low_confidence_eligible=prediction["low_confidence_eligible"],
+                                   multiple_unresolved=prediction["multiple_unresolved"],
+                                   confidence=confidence, predictions=len(states), clicked=clicked, click_count=click_count)
+                if prediction["summary_state"] != last_state:
+                    note("INFO", f"CFbox 子挑战汇总：顶层={prediction['summary_state']}，子状态={prediction['challenge_states']}，子置信度={prediction['challenge_confidences']}，有效状态={last_state}，可用复选框={'有' if prediction['center'] else '无'}，低置信度复核资格={prediction['low_confidence_eligible']}")
                 if last_state != reported_state:
                     note("INFO", f"CFbox 识别状态：{last_state}，confidence={confidence}")
                     reported_state = last_state
                 # Navigation or widget rendering may occur during inference.
                 diagnostics["phase"] = "page_recheck"
                 state = await _cf_page_state(page)
-                diagnostics["page"] = {key: state[key] for key in ("marker", "challenge_text", "url_challenge", "text_readable")}
+                diagnostics["page"] = {key: state[key] for key in ("marker", "dom_marker", "frame_challenge", "frames_checked", "frames_hidden", "frames_unreadable", "challenge_text", "url_challenge", "text_readable")}
                 has_cf = bool(
                     state["marker"] or state["challenge_text"] or state["url_challenge"]
                 )
                 seen_cf = seen_cf or has_cf
+                seen_page_challenge = seen_page_challenge or has_cf
+                if has_cf or prediction["has_challenge_evidence"] or last_state in {"processing", "unchecked", "error"}:
+                    unresolved_challenge = True
+                    seen_cf = True
                 ready = await page.evaluate(
                     "() => document.readyState !== 'loading' && !!document.body"
                 )
@@ -1103,7 +1201,7 @@ async def _run_turnstile_detection(
                 )
                 observed_url = _cf_url_key(getattr(page, "url", ""))
                 low_confidence = last_state in {"error", "unknown"} and confidence is not None and confidence < 0.95
-                if low_confidence and page_clear and observed_url == current_url:
+                if prediction["low_confidence_eligible"] and page_clear and observed_url == current_url:
                     if low_confidence_state != last_state or low_confidence_url != observed_url:
                         low_confidence_count = 0
                         low_confidence_since = time.monotonic()
@@ -1130,24 +1228,36 @@ async def _run_turnstile_detection(
                 # A solved Turnstile can remain visible with its response token.
                 solved_widget = (
                     last_state == "verified"
+                    and allow_clear_override
+                    and state.get("marker_readable", True)
+                    and state.get("token_readable", False)
                     and int(state.get("token_length") or 0) > 0
                     and not state["challenge_text"]
                     and not state["url_challenge"]
                 )
                 visual_error_confirmed = (
                     last_state == "error" and clicked_page_challenge
+                    and allow_clear_override
                     and fresh_token_after_click and token_length > 0
                     and state["marker"] is False
                     and not state["challenge_text"] and not state["url_challenge"]
                 )
                 if last_state == "error" and not has_cf and not reported_visual_conflict:
-                    note("WARN", "CFbox 视觉状态 error，但页面挑战标记已消失；继续重新截图，检查连续低置信度或本轮新 token 证据")
+                    note("WARN", "CFbox 视觉状态 error，但本轮未检出页面挑战标记；继续重新截图，检查连续低置信度或本轮新 token 证据")
                     reported_visual_conflict = True
-                # A valid low-confidence unknown must complete the same repeat
-                # confirmation as error instead of taking the legacy shortcut.
-                visual_resolved = (
+                # Unknown inference cannot erase a previously unresolved challenge.
+                # Keep the legacy shortcut only for pages with no conflicting evidence.
+                if (
+                    (last_state in {"absent", "verified"} and allow_clear_override and page_clear)
+                    or (solved_widget and state["marker"] is not None and state["text_readable"] and ready)
+                    or (visual_error_confirmed and page_clear)
+                    or low_confidence_confirmed
+                ):
+                    unresolved_challenge = False
+                diagnostics.update(unresolved_challenge=unresolved_challenge, seen_page_challenge=seen_page_challenge)
+                visual_resolved = low_confidence_confirmed or allow_clear_override and (
                     last_state in {"absent", "verified"}
-                    or (last_state == "unknown" and not low_confidence)
+                    or (last_state == "unknown" and not low_confidence and not unresolved_challenge)
                     or visual_error_confirmed or low_confidence_confirmed
                 )
                 if (
@@ -1167,17 +1277,30 @@ async def _run_turnstile_detection(
                             "Cloudflare 挑战未检出（连续 3 次低置信度截图，页面无可见 CF 组件）" if low_confidence_confirmed
                             else "Cloudflare 验证已通过（新 token 与页面状态确认，CFbox 视觉状态 error）" if visual_error_confirmed
                             else "Cloudflare 验证已通过" if solved_widget
-                            else "Cloudflare 挑战已消失" if seen_cf
+                            else "Cloudflare 挑战已消失" if seen_page_challenge
+                            else "Cloudflare 视觉冲突已解除，页面无可见挑战" if seen_cf
                             else "未检测到 Cloudflare 挑战"
                         )
                         note("INFO", message)
                         result = {
                             "state": "passed" if seen_cf else "absent",
                             "cfbox_state": last_state,
+                            "cfbox_summary_state": prediction["summary_state"],
+                            "challenge_states": prediction["challenge_states"],
                             "clicked": clicked,
                             "click_count": click_count,
                             "states": states,
-                            "completion_reason": "low_confidence_and_clear_page" if low_confidence_confirmed else "fresh_token_and_clear_page" if visual_error_confirmed else "dual_confirmation",
+                            "completion_reason": (
+                                "low_confidence_and_clear_page" if low_confidence_confirmed
+                                else "fresh_token_and_clear_page" if visual_error_confirmed
+                                else "verified_and_token" if solved_widget
+                                else "verified_and_clear_page" if last_state == "verified"
+                                else "absent_and_clear_page" if last_state == "absent"
+                                else "unknown_and_clear_page"
+                            ),
+                            "confidence": confidence,
+                            "unresolved_challenge": unresolved_challenge,
+                            "seen_page_challenge": seen_page_challenge,
                         }
                         if low_confidence_confirmed:
                             result.update(confidence=confidence, low_confidence_count=low_confidence_count)
@@ -1198,13 +1321,13 @@ async def _run_turnstile_detection(
                         note("INFO", f"Cloudflare 等待原因：{', '.join(blockers)}（CFbox={last_state}）")
                         reported_blockers = blockers
                 if time.monotonic() - last_heartbeat >= 10:
-                    note("INFO", f"Cloudflare 仍在重新识别：state={last_state}, confidence={confidence}, predictions={len(states)}, low_confidence_count={low_confidence_count}, blockers={diagnostics['blockers']}, token_present={token_length > 0}, fresh_token_after_click={fresh_token_after_click}")
+                    note("INFO", f"Cloudflare 仍在重新识别：state={last_state}, confidence={confidence}, predictions={len(states)}, low_confidence_count={low_confidence_count}, low_confidence_eligible={prediction['low_confidence_eligible']}, child_confidences={prediction['challenge_confidences']}, blockers={diagnostics['blockers']}, token_present={token_length > 0}, fresh_token_after_click={fresh_token_after_click}")
                     last_heartbeat = time.monotonic()
                 if last_state not in {"absent", "verified", "unknown"}:
                     seen_cf = True
                 if last_state == "absent" and has_cf:
                     last_state = "absent (but CF DOM is present)"
-                center = body.get("checkbox_center_pct")
+                center = prediction["center"]
                 if last_state == "unchecked" and isinstance(center, dict):
                     x_pct = float(center.get("x") or 0)
                     y_pct = float(center.get("y") or 0)
@@ -3628,12 +3751,22 @@ async def _run_step(
     plugin_broker: Any = None,
     artifacts: Any = None,
     secret_payload: dict[str, Any] | None = None,
+    resign_progress: StepCallback | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     feature = str(step.get("feature_type") or "")
     config = step.get("config") or {}
     if not isinstance(config, dict):
         return "fail", "步骤配置不是对象", {}
     note = log or (lambda _level, _message: None)
+
+    def record_secret(*values: Any) -> None:
+        if secret_payload is not None:
+            for value in values:
+                if isinstance(value, str) and 0 < len(value) <= 500:
+                    secret_payload.setdefault("_result_secret_fingerprints", set()).add(
+                        (len(value), hashlib.sha256(value.encode("utf-8")).hexdigest())
+                    )
+
     if feature.startswith("plugin."):
         return await _run_plugin_step(
             page,
@@ -3685,20 +3818,36 @@ async def _run_step(
         behavior = (vision or {}).get("execution_settings") or {}
         if (behavior.get("llm_enabled") is True and config.get("llm_enabled") is True
                 and (value or behavior.get("judgment_scope") == "all")):
-            from worker.vision import DEFAULT_RESULT_PROMPT, judge_result
+            from worker.vision import (
+                DEFAULT_RESULT_PROMPT,
+                ResultJudgmentError,
+                judge_result,
+                sanitize_judgment_reason,
+            )
 
+            judgment_started = time.monotonic()
             model = {**(vision or {})}
+            if (secret_payload or {}).get("_result_secret_fingerprints"):
+                model["_result_secret_fingerprints"] = secret_payload["_result_secret_fingerprints"]
             if behavior.get("model"):
                 model["model"] = behavior["model"]
             if not all(model.get(key) for key in ("base_url", "model", "api_key")):
-                return "fail", "未配置大模型，无法判断输出结果", {"reason": "model_unavailable"}
+                message = "未配置大模型，无法判断输出结果"
+                note("ERROR", message)
+                return "fail", message, {"reason": "model_unavailable"}
             use_vision = behavior.get("use_vision", True)
             if use_vision and not model.get("supports_vision", True):
-                return "fail", "大模型未开启视觉支持，无法判断输出结果", {"reason": "vision_not_supported"}
+                message = "大模型未开启视觉支持，无法判断输出结果"
+                note("ERROR", message)
+                return "fail", message, {"reason": "vision_not_supported"}
             note("INFO", f"大模型判断输出结果开始，输入方式：{'页面截图（不含页面文本）' if use_vision else '页面文本'}")
+            stage = "evidence"
             try:
                 if use_vision:
-                    evidence = {"image": await page.screenshot(type="png", timeout=PAGE_TIMEOUT_MS)}
+                    image = await page.screenshot(type="png", timeout=PAGE_TIMEOUT_MS)
+                    if not isinstance(image, bytes) or not image:
+                        raise ValueError()
+                    evidence = {"image": image}
                 else:
                     # innerText excludes input values and hidden DOM; bound what
                     # leaves the browser and treat page content as untrusted data.
@@ -3708,18 +3857,63 @@ async def _run_step(
                     if not isinstance(text, str) or not text.strip():
                         raise ValueError()
                     evidence = {"page_text": text}
+                stage = "provider_request"
+                # Supply job secrets before the provider helper normalizes or truncates reasons.
+                pending = [(model, False), (credentials, True), (twofauth, False),
+                           (cfbox, False), (secret_payload or {}, False)]
+                seen = set()
+                secrets = set()
+                while pending:
+                    item, sensitive = pending.pop()
+                    if isinstance(item, str) and item and sensitive:
+                        secrets.add(item)
+                    elif isinstance(item, (dict, list, tuple)) and (id(item), sensitive) not in seen:
+                        seen.add((id(item), sensitive))
+                        if isinstance(item, dict):
+                            pending.extend((child, sensitive or (isinstance(key, str) and bool(re.search(
+                                r"password|passwd|secret|token|api.?key|credential|authorization|cookie|"
+                                r"username|account|otp|endpoint|(?:^|_)url$|^model$", key, re.I,
+                            )))) for key, child in item.items())
+                        else:
+                            pending.extend((child, sensitive) for child in item)
+                redaction_values = tuple(sorted(secrets))
                 prompt = str(config.get("llm_prompt") or "").strip()
-                judged = await judge_result(model, prompt or behavior.get("llm_prompt") or DEFAULT_RESULT_PROMPT, **evidence)
-                if type(judged) is not bool:
+                judgment = await judge_result(
+                    model, prompt or behavior.get("llm_prompt") or DEFAULT_RESULT_PROMPT,
+                    redaction_values=redaction_values, **evidence,
+                )
+                stage = "response_validation"
+                if (type(judgment) is not dict or set(judgment) != {"result", "reason"}
+                        or type(judgment["result"]) is not bool
+                        or type(judgment["reason"]) is not str
+                        or not judgment["reason"].strip() or len(judgment["reason"]) > 500):
                     raise ValueError()
-            except Exception:
-                return "fail", "大模型判断失败或未返回明确的 True/False 结论", {"reason": "model_judgment_failed"}
+                reason = sanitize_judgment_reason(
+                    judgment["reason"], model, redaction_values=redaction_values,
+                )
+                if not reason:
+                    raise ValueError()
+            except Exception as exc:
+                code = "evidence_error" if stage == "evidence" else "invalid_response"
+                http_status = None
+                if stage != "evidence" and isinstance(exc, ResultJudgmentError):
+                    code, stage, http_status = exc.code, exc.stage, exc.http_status
+                detail = f"{code}，阶段 {stage}"
+                message = (f"大模型判断失败：HTTP {http_status}（{detail}）" if http_status is not None
+                           else f"大模型判断失败：{detail}")
+                note("ERROR", f"{message}；耗时 {time.monotonic() - judgment_started:.2f}s")
+                data = {"reason": "model_judgment_failed", "provider_error": code, "stage": stage}
+                if http_status is not None:
+                    data["http_status"] = http_status
+                return "fail", message, data
+            judged = judgment["result"]
+            note("INFO", f"大模型判断结果: {str(judged).lower()}；判断依据: {reason}")
             message = f"大模型判断结果: {str(judged).lower()}"
-            note("INFO", message)
             if judged == value:
                 message = str(config.get("message") or "").strip() or f"输出结果: {str(value).lower()}"
             return "success", message, {"value": judged, "message": message,
-                                         "original_value": value, "judged_by": "llm"}
+                                         "original_value": value, "judged_by": "llm",
+                                         "judgment_reason": reason}
         message = str(config.get("message") or "").strip()
         if not message:
             message = f"输出结果: {str(value).lower()}"
@@ -3771,10 +3965,14 @@ async def _run_step(
             from worker.secret_client import require_site_origin
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
             credentials = await resolve_secret(secret_payload, step)
+            record_secret(credentials.get("username"), credentials.get("password"))
+        elif credentials:
+            record_secret(credentials.get("username"), credentials.get("password"))
         if not credentials and credential_task is not None:
             note("INFO", "等待 Bitwarden 登录凭据")
             try:
                 credentials = await credential_task
+                record_secret(credentials.get("username"), credentials.get("password"))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3855,6 +4053,7 @@ async def _run_step(
 
         require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         secret = await resolve_secret(secret_payload, step)
+        record_secret(secret.get("password"))
         password_value = secret.pop("password", None)
         secret.clear()
         if not isinstance(password_value, str) or not password_value:
@@ -3909,12 +4108,14 @@ async def _run_step(
             from worker.secret_client import require_site_origin
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
             secret = await resolve_secret(secret_payload, step)
+            record_secret(secret.get("code"))
             code = secret.pop("code", None)
             fetch_status, fetch_message = "fail", "TOTP provider unavailable"
         else:
             code, fetch_status, fetch_message = await _fetch_otp(
                 twofauth, str(config.get("service_hint") or "")
             )
+            record_secret(code)
         if code is None:
             return fetch_status, fetch_message, {}
         selectors_note("动态验证码输入框", config.get("code_selector"))
@@ -4060,6 +4261,23 @@ async def _run_step(
             note,
         )
 
+    if feature == "post.resign_click":
+        from worker.resign_click import run_resign_click
+        from worker.resign_checkpoint import make_resign_checkpoint, ResignCheckpointError
+        payload = secret_payload or {}
+        try:
+            durable_progress = make_resign_checkpoint(payload, step.get("step_key"))
+        except ResignCheckpointError:
+            # Let the runner return its complete fail-closed result before any navigation.
+            durable_progress = None
+        return await run_resign_click(
+            page, config, list(resign_pending_dates or []), note,
+            today=payload.get("resign_today"),
+            unresolved=payload.get("resign_unresolved_dates"),
+            base_url=payload.get("base_url"), progress=resign_progress,
+            durable_progress=durable_progress,
+        )
+
     if feature == "post.resign":
         return await _run_resign(
             page,
@@ -4090,7 +4308,28 @@ async def execute_job(
                     return
                 await asyncio.sleep(.2)
 
-        execution = asyncio.create_task(_execute_admitted_job(manager, payload, cancel, on_step))
+        last_progress: dict[str, Any] = {}
+
+        async def track_progress(progress: dict[str, Any]) -> None:
+            nonlocal last_progress
+            if any(row.get("feature_type") == "post.resign_click" and
+                   isinstance(row.get("data", {}).get("resign"), dict)
+                   for row in progress.get("steps", [])):
+                last_progress = copy.deepcopy(progress)
+            if on_step is not None:
+                await on_step(progress)
+
+        def interrupted_result(status: str, message: str) -> dict[str, Any]:
+            if not last_progress:
+                return {"status": status, "message": message, "steps": []}
+            partial = copy.deepcopy(last_progress)
+            partial.update(status="waiting_human", message=message + "；补签检查点已保留，请人工核验")
+            for row in partial.get("steps", []):
+                if row.get("status") == "running":
+                    row.update(status="waiting_human", message=partial["message"])
+            return partial
+
+        execution = asyncio.create_task(_execute_admitted_job(manager, payload, cancel, track_progress))
         watcher = asyncio.create_task(cancel.wait()) if cancel is not None else None
         backend_watcher = asyncio.create_task(wait_for_disconnect())
         try:
@@ -4102,9 +4341,15 @@ async def execute_job(
                 execution.cancel()
                 await asyncio.gather(execution, return_exceptions=True)
                 if backend_watcher in done:
-                    return {"status": "error", "message": "Browser backend disconnected; task was not replayed", "steps": []}
-                return {"status": "canceled", "message": "已取消", "steps": []}
+                    return interrupted_result("error", "Browser backend disconnected; task was not replayed")
+                return interrupted_result("canceled", "已取消")
             return await execution
+        except asyncio.CancelledError:
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+            if last_progress:
+                return interrupted_result("canceled", "已取消")
+            raise
         finally:
             execution.cancel()
             if watcher is not None:
@@ -4136,6 +4381,7 @@ async def _execute_admitted_job(
     job_artifacts = JobArtifacts(payload)
     credential_task: asyncio.Task[dict[str, str]] | None = None
     payment_steps: set[str] = set()
+    resign_dispatched_steps: set[str] = set()
 
     def finish(
         status: str,
@@ -4220,6 +4466,10 @@ async def _execute_admitted_job(
             results,
             job_artifacts.snapshot(),
         )
+
+    async def resign_progress(data: dict[str, Any]) -> None:
+        results[-1]["data"] = copy.deepcopy(data)
+        await emit_progress()
 
     try:
         if steps:
@@ -4325,6 +4575,9 @@ async def _execute_admitted_job(
                         timeout = _buy_timeout(step_config)
                     elif feature_type == "post.resign":
                         timeout = 300
+                    elif feature_type == "post.resign_click":
+                        from worker.resign_click import resign_click_timeout
+                        timeout = resign_click_timeout(step.get("config") or {}, pending_dates)
                     elif feature_type == "challenge.grid_captcha":
                         grid_config = step.get("config") or {}
                         refreshes = max(0, min(int(grid_config.get("max_refresh", 3)), 10))
@@ -4392,15 +4645,19 @@ async def _execute_admitted_job(
                             getattr(manager, "plugin_broker", None),
                             job_artifacts,
                             payload,
+                            **({"resign_progress": resign_progress}
+                               if step.get("feature_type") == "post.resign_click" else {}),
                         ),
                         timeout=max(1, int(timeout)),
                     )
                 except asyncio.TimeoutError:
-                    status = "waiting_human" if step.get("feature_type") == "post.buy_card" else "fail"
-                    message, data = f"步骤超时（{timeout}s）", {}
+                    status = "waiting_human" if step.get("feature_type") in {"post.buy_card", "post.resign_click"} else "fail"
+                    message = f"步骤超时（{timeout}s）"
+                    data = results[-1].get("data", {}) if step.get("feature_type") == "post.resign_click" else {}
                 except asyncio.CancelledError:
-                    results[-1] = _step_result(step, "canceled", "已取消", started=started)
-                    job_status = "canceled"
+                    partial = results[-1].get("data", {}) if step.get("feature_type") == "post.resign_click" else {}
+                    job_status = "waiting_human" if "resign" in partial else "canceled"
+                    results[-1] = _step_result(step, job_status, "已取消", started=started, data=partial)
                     job_message = "执行已取消"
                     job_artifacts.log("WARN", f"step {step.get('step_key')} canceled")
                     await emit_progress()
@@ -4412,6 +4669,16 @@ async def _execute_admitted_job(
                         {},
                     )
                 feature = str(step.get("feature_type") or "")
+                if feature == "post.resign_click":
+                    partial = results[-1].get("data", {})
+                    if "resign" not in data and "resign" in partial:
+                        data = {**data, "resign": partial["resign"]}
+                    resign = data.get("resign", {})
+                    if resign.get("submit_attempted") or resign.get("success"):
+                        payment_steps.add(str(step.get("step_key") or ""))
+                        resign_dispatched_steps.add(str(step.get("step_key") or ""))
+                    if status not in {"success", "skipped", "restart", "fallback_interaction"}:
+                        status = "waiting_human"
                 purchase = data.get("buy_card") if isinstance(data, dict) else None
                 if feature == "post.buy_card" and isinstance(purchase, dict) and (
                     purchase.get("payment_attempted") or purchase.get("bought", 0)
@@ -4419,7 +4686,9 @@ async def _execute_admitted_job(
                     payment_steps.add(str(step.get("step_key") or ""))
                 if payment_steps and status in {"restart", "fallback_interaction"}:
                     status = "waiting_human"
-                    message = "本任务已发起购卡点击，禁止自动重跑以避免重复购买，请人工核验"
+                    message = ("本任务已发起补签等副作用点击，禁止自动重跑，请人工核验"
+                               if resign_dispatched_steps else
+                               "本任务已发起购卡点击，禁止自动重跑以避免重复购买，请人工核验")
                 page = job_artifacts.pages.active
                 category = str(step.get("category") or feature.split(".", 1)[0])
                 if category in {"sign", "post"} and status != "skipped":
@@ -4480,7 +4749,9 @@ async def _execute_admitted_job(
                         str(item.get("step_key") or "") for item in steps[target_index:index + 1]
                     ):
                         job_status = "waiting_human"
-                        job_message = "跳转将重复执行已发起的购卡步骤，已停止，请人工核验"
+                        job_message = ("跳转将重复执行已发起的补签等副作用步骤，已停止，请人工核验"
+                                       if resign_dispatched_steps else
+                                       "跳转将重复执行已发起的购卡步骤，已停止，请人工核验")
                         results[-1] = _step_result(step, job_status, job_message, started=started, data=data)
                         job_artifacts.log("WARN", job_message)
                         await emit_progress()

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import Field, StringConstraints, ValidationInfo, field_validator, model_validator
 
 from app.features.base import Feature, FeatureConfig
 from app.features.captcha import (
@@ -524,11 +525,25 @@ class FlowResultConfig(FeatureConfig):
     llm_enabled: bool = Field(
         default=False,
         strict=True,
-        description="启用本步骤的大模型结果判断；还需启用全局大模型判断开关，模型必须只输出 True 或 False",
+        description=(
+            "启用本步骤的大模型结果判断；还需启用全局大模型判断开关。"
+            "工具选择为 auto，可优先调用一次 submit_workflow_result，也可在未调用工具时"
+            "直接返回正文 JSON；两种方式均须符合固定 JSON schema："
+            "result (boolean) 和 reason (string)。system 约束 JSON schema，不强制工具调用；"
+            "多个工具调用、工具名称或参数无效均失败，不回退到正文 JSON"
+        ),
     )
     llm_prompt: Annotated[str, StringConstraints(strip_whitespace=True, max_length=4000)] = Field(
         default="",
-        description="可选的本步骤判断提示词；留空时使用全局提示词；需同时启用全局和本步骤大模型判断，模型必须只输出 True 或 False",
+        description=(
+            "可选的本步骤业务判断提示词；留空时使用全局提示词，也可继承模板提示词；"
+            "需同时启用全局和本步骤大模型判断。仅填写业务判断规则，无需手写输出格式；"
+            "worker 在运行时添加不可被业务提示词覆盖的 system 输出约束，不合并保存。"
+            '可优先通过工具 submit_workflow_result 提交，也可直接返回正文 JSON，示例：'
+            '{"result":true,"reason":"可见依据"}。'
+            "reason 保存到步骤 data 并记录日志，可能包含页面隐私；系统要求不输出账号、密码、"
+            "Cookie、验证码、令牌等敏感信息，已知密钥脱敏不等于完整 DLP 防护"
+        ),
     )
 
 
@@ -736,6 +751,135 @@ class PostResignConfig(FeatureConfig):
     ajax_date_param: str = Field(default="params[date]", description="补签日期参数名")
 
 
+class PostResignClickConfig(FeatureConfig):
+    attendance_url: str = Field(
+        default="{base_url}/calendar",
+        min_length=1,
+        title="签到页地址",
+        description="页面点击补签的日历地址，支持 {base_url} 占位符；仅处理 pending 中的过去日期",
+    )
+    calendar_title_selector: SelectorCandidates = Field(
+        default_factory=lambda: [".cal-board > .cal-water"],
+        min_length=1,
+        max_length=20,
+        title="日历标题选择器",
+        description=(
+            "日历月份标题必须唯一匹配；_month_label 只解析数字年月，不支持英文月份或自定义正则；"
+            f"Playwright 选择器模板仅支持 {{date}}/{{day}}/{{month}}/{{year}}，不支持普通 CSS 花括号；{SELECTOR_HINT}"
+        ),
+    )
+    calendar_prev_selector: SelectorCandidates = Field(
+        default_factory=lambda: ['.cal-arr[aria-label="上一月"]'],
+        min_length=1,
+        max_length=20,
+        title="上一月选择器",
+        description=f"上一月按钮必须唯一匹配；仅支持日期占位符的 Playwright 选择器模板；{SELECTOR_HINT}",
+    )
+    calendar_next_selector: SelectorCandidates = Field(
+        default_factory=lambda: ['.cal-arr[aria-label="下一月"]'],
+        min_length=1,
+        max_length=20,
+        title="下一月选择器",
+        description=f"下一月按钮必须唯一匹配；仅支持日期占位符的 Playwright 选择器模板；{SELECTOR_HINT}",
+    )
+    calendar_day_selector: SelectorCandidates = Field(
+        default_factory=lambda: [
+            '.cal-grid > button.cal-cell:not(.mute):has(.cal-num:text-is("{day}"))',
+        ],
+        min_length=1,
+        max_length=20,
+        title="日历日期选择器",
+        description=(
+            "目标日期单元格必须唯一匹配，按当月筛选并排除相邻月；"
+            f"每个 Playwright 选择器模板必须包含 {{date}} 或 {{day}}，也支持 {{month}}/{{year}}；{SELECTOR_HINT}"
+        ),
+    )
+    calendar_selected_selector: SelectorCandidates = Field(
+        default_factory=lambda: [
+            '.cal-grid > button.cal-cell.on:not(.mute):has(.cal-num:text-is("{day}"))',
+        ],
+        min_length=1,
+        max_length=20,
+        title="目标日期选中选择器",
+        description=(
+            "选中状态必须绑定目标日期并唯一匹配，按当月筛选并排除相邻月；"
+            f"每个 Playwright 选择器模板必须包含 {{date}} 或 {{day}}，也支持 {{month}}/{{year}}；{SELECTOR_HINT}"
+        ),
+    )
+    done_selector: SelectorCandidates = Field(
+        default_factory=lambda: [
+            '.cal-grid > button.cal-cell:not(.mute):has(.cal-num:text-is("{day}")) .cal-badge.att',
+        ],
+        min_length=1,
+        max_length=20,
+        title="目标日期已签到选择器",
+        description=(
+            "已签到标记必须绑定目标日期并唯一匹配，不能用其他日期的标记判定成功；"
+            "按当月筛选并排除相邻月；"
+            f"每个 Playwright 选择器模板必须包含 {{date}} 或 {{day}}，也支持 {{month}}/{{year}}；{SELECTOR_HINT}"
+        ),
+    )
+    button_selector: SelectorCandidates = Field(
+        default_factory=lambda: [".cal-att button.cal-att-pill.act"],
+        min_length=1,
+        max_length=20,
+        title="按钮选择器",
+        description=(
+            "提交按钮必须唯一匹配，按钮文字必须包含“补签”，不能点击普通签到按钮；"
+            f"仅支持日期占位符的 Playwright 选择器模板；{SELECTOR_HINT}"
+        ),
+    )
+    card_count_selector: SelectorCandidates = Field(
+        default_factory=lambda: [".cal-help"],
+        max_length=20,
+        title="补签卡数量选择器",
+        description=(
+            "读取已有补签卡数量的元素必须唯一匹配；留空使用 body；"
+            f"仅支持日期占位符的 Playwright 选择器模板；{SELECTOR_HINT}"
+        ),
+    )
+    card_count_regex: str = Field(
+        default=r"补签卡（当前\s*(\d+)\s*张",
+        title="补签卡数量正则",
+        description="页面补签卡数量正则，第一个分组为数量；不是选择器模板",
+    )
+    success_wait_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        title="成功等待秒数",
+        description="点击补签后等待目标日期已签到标记的最长秒数",
+    )
+    max_month_jumps: int = Field(
+        default=12,
+        ge=0,
+        le=120,
+        title="最大翻月次数",
+        description="定位目标年月时最多翻月次数；0 表示不翻月，仅处理当前月份",
+    )
+
+    @field_validator(
+        "calendar_title_selector", "calendar_prev_selector", "calendar_next_selector",
+        "calendar_day_selector", "calendar_selected_selector", "done_selector",
+        "button_selector", "card_count_selector",
+    )
+    @classmethod
+    def _validate_selector_templates(
+        cls, value: SelectorCandidates, info: ValidationInfo,
+    ) -> SelectorCandidates:
+        for selector in value:
+            literal = re.sub(r"\{(?:date|day|month|year)\}", "", selector)
+            if "{" in literal or "}" in literal:
+                raise ValueError(
+                    "Playwright 选择器模板仅支持 {date}/{day}/{month}/{year}，不支持其他花括号语法"
+                )
+            if info.field_name in {
+                "calendar_day_selector", "calendar_selected_selector", "done_selector",
+            } and not any(token in selector for token in ("{date}", "{day}")):
+                raise ValueError("每个目标日期选择器模板必须包含 {date} 或 {day}")
+        return value
+
+
 def _feature(
     key: str,
     name: str,
@@ -929,6 +1073,19 @@ FEATURE_LIST: tuple[Feature, ...] = (
         "multiple",
         PostResignConfig,
         description="读取漏签日期并执行 NexusPHP 日历补签。",
+    ),
+    _feature(
+        "post.resign_click",
+        "页面点击补签",
+        "post",
+        "multiple",
+        PostResignClickConfig,
+        description=(
+            "基于 pending 仅处理过去日期，通过页面点击补签，不发送旧补签 AJAX 请求；"
+            "日历按当月筛选并排除相邻月，选择器匹配必须唯一；"
+            "选中状态及 done 标记绑定目标日期，按钮文字必须包含“补签”；"
+            "Playwright 选择器仅作模板，支持 {date}/{day}/{month}/{year}，不支持普通 CSS 花括号。"
+        ),
     ),
 )
 

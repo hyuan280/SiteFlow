@@ -79,14 +79,15 @@ def test_resizing_preserves_active_slots_and_waiters():
 def test_progress_marks_only_admitted_job_running():
     from app.services.executor import ExecutionManager
 
-    job = SimpleNamespace(status="queued", started_at=None)
+    job = SimpleNamespace(id=1, status="queued", started_at=None)
     session = SimpleNamespace(
         get=lambda *_: job, commit=lambda: None,
+        scalars=lambda *_: [],
     )
     context = MagicMock()
     context.__enter__.return_value = session
     manager = ExecutionManager(lambda: context, SimpleNamespace(
-        execution_max_runs=1, execution_max_jobs=20
+        execution_max_runs=1, execution_max_jobs=20, scheduler_timezone="Asia/Shanghai",
     ), None)
     manager._save_steps = lambda *args, **kwargs: None
     manager._persist_progress(1, {"status": "running", "steps": []})

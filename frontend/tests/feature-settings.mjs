@@ -104,9 +104,10 @@ try {
       } },
       execution_settings: {
         llm_enabled: false, use_vision: true, judgment_scope: "success_only", model: "",
-        llm_prompt: "请判断当前页面是否已登录且已签到，仅输出 True 或 False。",
+        llm_prompt: "检查这个页面，判断网站是否已登录，并仔细检查是否存在未签到的标记。没有登录、尚未签到或证据不足时，判断结果为 false；只有明确已登录且已签到才为 true。简要说明可见的判断依据，不包含账号、密码、Cookie、验证码、令牌或其他敏感信息。",
       },
     };
+    const defaultResultPrompt = resultFeature.execution_settings.llm_prompt;
     let resultEditor;
     await renderToString(createSSRApp({ setup() {
       Editor.setup({ feature: resultFeature }, {
@@ -129,13 +130,29 @@ try {
     const renderEditor = (value) => renderToString(createSSRApp(Editor, { feature: value })
       .use(ElementPlus).provide(ID_INJECTION_KEY, { prefix: 0, current: 0 })
       .provide(ZINDEX_INJECTION_KEY, { current: 0 }));
+    const assertReadonlyProtocol = (html) => {
+      const note = html.match(/<div[^>]*role="note"[^>]*aria-label="系统输出协议（只读）"[^>]*>([\s\S]*?)<\/div>/)?.[1];
+      assert.ok(note, "result prompts must have a readonly system protocol note");
+      for (const text of ["固定 system 输出约束", "不与业务提示词合并保存", "不能被业务提示词中的格式要求覆盖",
+        "无需用户手写输出格式", "仅约束 JSON schema，不强制工具调用", "auto", "可优先调用一次", "submit_workflow_result",
+        "{result: boolean, reason: string}", '{"result":true,"reason":"可见依据"}', "未调用工具时直接返回正文 JSON",
+        "存在工具调用时只接受一个有效的", "多个工具调用、工具名称或参数无效均失败", "不回退到正文 JSON",
+        "步骤 data", "记录日志", "页面隐私", "账号、密码、Cookie、验证码、令牌",
+        "已知密钥脱敏不等于完整 DLP 防护"]) {
+        assert.ok(note.replaceAll("&quot;", '"').includes(text), text);
+      }
+      assert.doesNotMatch(note, /<(?:textarea|input|select)\b|contenteditable|role="switch"/);
+      assert.doesNotMatch(note, /必须支持.*tool calling|必须且只能调用|不接受.*JSON|response_format|tool_choice.*(?:named|required)/);
+      assert.doesNotMatch(html, /自定义提示词必须明确要求|只返回 True 或 False|仅输出 True\/False/);
+    };
     const disabledHtml = await renderEditor(resultFeature);
-    for (const label of ["大模型结果判断总开关", "使用视觉判断", "判断范围", "模型 ID 覆盖", "结果判断提示词"]) {
+    for (const label of ["大模型结果判断总开关", "使用视觉判断", "判断范围", "模型 ID 覆盖", "业务判断提示词"]) {
       assert.ok(disabledHtml.includes(label), label);
     }
-     for (const notice of ["不发送页面文本", "supports_vision", "页面文本模式", "系统默认模型", "API 密钥", "必须明确要求", "外部模型提供商", "不会静默回退"]) {
+     for (const notice of ["不发送页面文本", "supports_vision", "页面文本模式", "系统默认模型", "API 密钥", "外部模型提供商", "不会静默回退"]) {
        assert.ok(disabledHtml.includes(notice), notice);
      }
+     assertReadonlyProtocol(disabledHtml);
      assert.match(disabledHtml, /旧步骤未配置时默认不调用模型/);
      assert.match(disabledHtml, /步骤自定义提示词留空时使用这里的全局提示词/);
     assert.match(disabledHtml, /role="switch"[^>]*aria-checked="false"/);
@@ -148,17 +165,18 @@ try {
     resultEditor.executionSettings.value.use_vision = false;
     resultEditor.executionSettings.value.judgment_scope = "all";
     resultEditor.executionSettings.value.model = "provider/model-id";
-    resultEditor.executionSettings.value.llm_prompt = "检查登录和签到状态，结论仅输出 True/False。";
+    resultEditor.executionSettings.value.llm_prompt = "  检查可见的登录和签到标记。\n证据不足时判断失败。  ";
     assert.equal(resultFeature.execution_settings.llm_enabled, false, "editing must not mutate the feature");
     const enabledHtml = await renderEditor({ ...resultFeature, execution_settings: resultEditor.executionSettings.value });
     assert.match(enabledHtml, /role="switch"[^>]*aria-checked="true"/);
     assert.doesNotMatch(enabledHtml, /<(?:input|textarea)[^>]* disabled/);
     assert.match(enabledHtml, /<input[^>]*value="all"[^>]* checked/);
     assert.doesNotMatch(enabledHtml, /视觉模型提示词|图片答题提示词/);
+    assertReadonlyProtocol(enabledHtml);
     const quizHtml = await renderEditor({ ...feature, key: "sign.image_quiz" });
     assert.match(quizHtml, /图片答题提示词/);
      assert.match(quizHtml, /需要人工处理/);
-     assert.doesNotMatch(quizHtml, /大模型结果判断总开关/);
+     assert.doesNotMatch(quizHtml, /大模型结果判断总开关|submit_workflow_result|系统输出协议/);
      const gridFeature = {
        ...feature, key: "challenge.grid_captcha", requires: ["vision"],
        defaults: { max_refresh: 2, success_signals: ["验证成功"], success_when_missing: [] },
@@ -174,7 +192,7 @@ try {
      assert.match(gridHtml, /九宫格验证码提示词/);
      assert.match(gridHtml, /需要系统设置中的大模型开启「支持视觉」/);
      assert.match(gridHtml, /需要人工处理/);
-     assert.doesNotMatch(gridHtml, /大模型结果判断总开关|默认识别方式|图片答题提示词/);
+     assert.doesNotMatch(gridHtml, /大模型结果判断总开关|默认识别方式|图片答题提示词|submit_workflow_result|系统输出协议/);
      let gridEditor;
      await renderToString(createSSRApp({ setup() {
        Editor.setup({ feature: gridFeature }, {
@@ -208,7 +226,7 @@ try {
      } finally { globalThis.fetch = originalFetch; }
      const captchaHtml = await renderEditor(feature);
     assert.match(captchaHtml, /视觉模型提示词/);
-    assert.doesNotMatch(captchaHtml, /大模型结果判断总开关/);
+    assert.doesNotMatch(captchaHtml, /大模型结果判断总开关|submit_workflow_result|系统输出协议/);
     const settings = resultEditor.executionSettings.value;
     const prompt = settings.llm_prompt;
     for (const invalid of ["", "   ", "a".repeat(4001)]) {
@@ -231,6 +249,8 @@ try {
         url: "/api/v1/features/flow.result/settings",
         defaults: resultFeature.defaults, required_fields: [], execution_settings: { ...settings },
       });
+      assert.equal(request.execution_settings.llm_prompt, prompt, "save the business prompt verbatim without system constraints");
+      assert.equal(resultFeature.execution_settings.llm_prompt, defaultResultPrompt, "saving edits must not rewrite the source feature prompt");
       settings.llm_enabled = false;
       await resultEditor.save();
       assert.equal(request.execution_settings.llm_enabled, false);
@@ -330,6 +350,7 @@ try {
      assert.match(inheritedHtml, /role="switch"[^>]*aria-checked="true"[^>]*aria-label="开启模型判断"/);
      assert.match(inheritedHtml, /继承模板设置/);
      assert.match(inheritedHtml, /继承模板提示词/);
+     assertReadonlyProtocol(inheritedHtml);
      // Element Plus SSR omits textarea contents, but renders the bound character count.
      assert.ok(inheritedHtml.includes(`${inherited.llm_prompt.length} / 4000`));
      assert.match(inheritedHtml, /llm-badge/);
@@ -348,16 +369,18 @@ try {
      assert.deepEqual(props.step.config, {});
      assert.equal(inherited.llm_enabled, true, "site overrides must not mutate the template");
 
-     fields.llmPrompt.value = "Custom prompt: output True or False";
-     assert.equal(props.step.config.llm_prompt, "Custom prompt: output True or False");
+     const customPrompt = "  检查页面是否显示已登录和已签到。\n不要猜测。  ";
+     fields.llmPrompt.value = customPrompt;
+     assert.deepEqual(props.step.config, { llm_prompt: customPrompt }, "only store the verbatim business prompt override");
      assert.ok((await renderStep(props)).includes(`${props.step.config.llm_prompt.length} / 4000`));
+     assertReadonlyProtocol(await renderStep(props));
      fields.llmPrompt.value = "";
      assert.equal(fields.llmPrompt.value, "", "explicit blank must override the inherited prompt");
      assert.equal(props.step.config.llm_prompt, "");
      const blankHtml = await renderStep(props);
      assert.match(blankHtml, /留空使用全局结果判断提示词/);
      assert.match(blankHtml, /maxlength="4000"/);
-     assert.match(blankHtml, /必须明确要求以 True 或 False 作结论/);
+     assertReadonlyProtocol(blankHtml);
      assert.doesNotMatch(blankHtml, /Template prompt: True\/False/);
      props.readonly = true;
      const blankReadonly = await renderStep(props);
@@ -366,6 +389,7 @@ try {
      assertNoGenericControls(blankReadonly);
      fields.resetResultField("llm_prompt");
      assert.equal(fields.llmPrompt.value, inherited.llm_prompt);
+     assert.deepEqual(props.step.config, {}, "reset must not materialize the template prompt or system protocol");
      const inheritedReadonly = await renderStep(props);
      assert.match(inheritedReadonly, /开启模型判断：是（继承）/);
      assert.match(inheritedReadonly, /Template prompt: True\/False（继承）/);
@@ -381,6 +405,7 @@ try {
      assert.match(globalOffHtml, /role="switch"[^>]*aria-checked="true"/);
      assert.match(globalOffHtml, /<textarea(?=[^>]* disabled)(?=[^>]*aria-label="步骤模型判断提示词")[^>]*>/);
      assert.match(globalOffHtml, /当前步骤配置不生效/);
+     assertReadonlyProtocol(globalOffHtml);
      assert.match(globalOffHtml, /<button(?=[^>]* disabled)[^>]*>[\s\S]*?恢复继承/);
      assert.equal(fields.llmPrompt.value, savedConfig.llm_prompt);
      assert.doesNotMatch(globalOffHtml, /llm-badge/);

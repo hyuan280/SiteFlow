@@ -84,9 +84,10 @@ def test_dual_confirmation(monkeypatch, fake_clock, marker, predictions, token_l
             calls.append(state)
             if state == "connect_error":
                 raise httpx.ConnectError("unavailable")
-            return httpx.Response(200, json={
-                "state": state, "checkbox_center_pct": {"x": 50, "y": 50}
-            })
+            body = {"state": state}
+            if state == "unchecked":
+                body["checkbox_center_pct"] = {"x": 50, "y": 50}
+            return httpx.Response(200, json=body)
 
     async def scroll(page):
         pass
@@ -143,10 +144,10 @@ def test_click_uses_screenshot_size_when_remote_viewport_is_absent(monkeypatch, 
         async def post(self, *args, **kwargs):
             state = "unchecked" if not calls else "absent"
             calls.append(state)
-            return httpx.Response(200, json={
-                "state": state,
-                "checkbox_center_pct": {"x": 50, "y": 50},
-            })
+            body = {"state": state}
+            if state == "unchecked":
+                body["checkbox_center_pct"] = {"x": 50, "y": 50}
+            return httpx.Response(200, json=body)
 
     async def scroll(page):
         pass
@@ -205,16 +206,23 @@ def test_timeout_preserves_detection_phase():
 @pytest.mark.parametrize("visible,failing,expected", [(False, True, True), (True, True, False), (True, False, True)])
 def test_cf_text_skips_hidden_frames_and_humanized_reads(visible, failing, expected):
     class Element:
-        async def is_visible(self):
+        async def evaluate(self, script):
             return visible
+        async def dispose(self):
+            pass
 
     class Frame:
         url = "about:blank"
+        parent_frame = None
         async def frame_element(self):
             return Element()
         async def evaluate(self, script):
             if failing:
                 raise RuntimeError("frame body unavailable")
+            if script == executor.CF_VISIBLE_MARKER_SCRIPT:
+                return False
+            if script == executor.CF_TOKEN_LENGTH_SCRIPT:
+                return 0
             return "Normal child frame"
         async def inner_text(self, selector):
             raise AssertionError("Must not use humanized text reads")
@@ -231,7 +239,7 @@ def test_cf_text_skips_hidden_frames_and_humanized_reads(visible, failing, expec
 
     state = asyncio.run(executor._cf_page_state(Page()))
     assert state["text_readable"] is expected
-    assert state["marker"] is False
+    assert state["marker"] is (None if visible and failing else False)
 
 
 def test_main_body_unreadable_is_not_absence():
@@ -242,6 +250,38 @@ def test_main_body_unreadable_is_not_absence():
             return await super().evaluate(script)
 
     assert asyncio.run(executor._cf_page_state(Page()))["text_readable"] is False
+
+
+@pytest.mark.parametrize("script,field", [
+    (executor.CF_VISIBLE_MARKER_SCRIPT, "marker"),
+    (executor.CF_TOKEN_LENGTH_SCRIPT, "token_readable"),
+    (executor.CF_PAGE_TEXT_SCRIPT, "text_readable"),
+])
+def test_main_dom_null_result_is_unreadable(script, field):
+    class Page(_CfStatePage):
+        async def evaluate(self, expression):
+            if expression == script:
+                return None
+            return await super().evaluate(expression)
+
+    state = asyncio.run(executor._cf_page_state(Page()))
+    assert state[field] is (None if field == "marker" else False)
+    if field == "marker":
+        assert state["dom_marker"] is None
+    assert state["token_length"] == 0
+
+
+@pytest.mark.parametrize("existing_marker", [False, True])
+def test_unreadable_frame_list_is_not_clear_page(existing_marker):
+    class Page(_CfStatePage):
+        @property
+        def frames(self):
+            raise RuntimeError("frame list unavailable")
+
+    state = asyncio.run(executor._cf_page_state(Page(marker=existing_marker)))
+    assert state["marker"] is (True if existing_marker else None)
+    assert state["text_readable"] is False
+    assert state["token_readable"] is False
 
 
 def test_challenge_title_without_widget():
@@ -309,16 +349,45 @@ def visual_error_scenario(monkeypatch, fake_clock):
         calls=[],
         screenshots=[],
         submitted_images=[],
+        image=None,
         clicks=[],
         logs=[],
+        diagnostics={},
         on_predict=None,
         blockers_before_click=False,
     )
+
+    class Element:
+        async def evaluate(self, script):
+            return True
+
+        async def dispose(self):
+            pass
+
+    class Frame:
+        url = "https://challenges.cloudflare.com/turnstile/widget"
+        parent_frame = None
+
+        async def frame_element(self):
+            if scenario.page.blocker == "frame_read":
+                raise RuntimeError("frame host unavailable")
+            return Element()
+
+        async def evaluate(self, script):
+            if script == executor.CF_PAGE_TEXT_SCRIPT:
+                return "Normal frame"
+            if script == executor.CF_TOKEN_LENGTH_SCRIPT:
+                return 0
+            return False
 
     class Page(_CfStatePage):
         viewport_size = {"width": 100, "height": 100}
         token_after_click = 100
         blocker = None
+
+        @property
+        def frames(self):
+            return [Frame()] if self.blocker in {"frame", "frame_read"} else []
 
         @property
         def mouse(self):
@@ -356,7 +425,7 @@ def visual_error_scenario(monkeypatch, fake_clock):
             return await super().evaluate(script)
 
         async def screenshot(self, **kwargs):
-            image = f"fake-png-{len(scenario.screenshots)}".encode()
+            image = scenario.image or f"fake-png-{len(scenario.screenshots)}".encode()
             scenario.screenshots.append((fake_clock.now, image))
             return image
 
@@ -387,9 +456,11 @@ def visual_error_scenario(monkeypatch, fake_clock):
                 return httpx.Response(200, json=[{"state": "error"}])
             if prediction == "invalid_state":
                 return httpx.Response(200, json={"state": "invalid"})
-            body = {
-                "state": prediction, "checkbox_center_pct": {"x": 50, "y": 50},
-            }
+            if isinstance(prediction, dict):
+                return httpx.Response(200, content=json.dumps(prediction).encode())
+            body = {"state": prediction}
+            if prediction == "unchecked":
+                body["checkbox_center_pct"] = {"x": 50, "y": 50}
             if scenario.confidences is not None:
                 confidence = scenario.confidences[min(index, len(scenario.confidences) - 1)]
                 if confidence is not ...:
@@ -399,6 +470,12 @@ def visual_error_scenario(monkeypatch, fake_clock):
 
     async def scroll(page):
         pass
+
+    detect = executor._run_turnstile_detection
+
+    async def capture_diagnostics(*args):
+        scenario.diagnostics = args[-1]
+        return await detect(*args)
 
     def run(wait_seconds=8):
         return asyncio.run(executor._run_turnstile(
@@ -411,6 +488,7 @@ def visual_error_scenario(monkeypatch, fake_clock):
     scenario.run = run
     monkeypatch.setattr(executor.httpx, "AsyncClient", Client)
     monkeypatch.setattr(executor, "_scroll_cf_into_view", scroll)
+    monkeypatch.setattr(executor, "_run_turnstile_detection", capture_diagnostics)
     return scenario
 
 
@@ -422,10 +500,15 @@ def test_persistent_visual_error_passes_with_fresh_token_and_clear_page(visual_e
     assert result[2] == {
         "state": "passed",
         "cfbox_state": "error",
+        "cfbox_summary_state": "error",
+        "challenge_states": [],
         "clicked": True,
         "click_count": 1,
         "states": ["processing", "unchecked", "error", "error", "error"],
         "completion_reason": "fresh_token_and_clear_page",
+        "confidence": None,
+        "unresolved_challenge": False,
+        "seen_page_challenge": True,
     }
     assert [(x, y) for _, x, y in scenario.clicks] == [(50.0, 50.0)]
     error_times = [at for at, prediction in scenario.calls if prediction == "error"]
@@ -473,7 +556,7 @@ def test_absent_confirmation_survives_continuous_token_read_failure(visual_error
 
     assert result[0] == "success"
     assert result[2]["cfbox_state"] == "absent"
-    assert result[2]["completion_reason"] == "dual_confirmation"
+    assert result[2]["completion_reason"] == "absent_and_clear_page"
     assert result[2]["click_count"] == 1
     assert result[2]["states"] == ["processing", "unchecked", "absent", "absent", "absent"]
     assert scenario.calls[-1][0] - scenario.calls[2][0] == 2
@@ -656,6 +739,8 @@ def test_visual_error_requires_all_step_evidence(visual_error_scenario, missing)
     assert result[2]["clicked"] is (missing != "click")
     assert result[2]["page"] == {
         "marker": False, "challenge_text": False, "url_challenge": False, "text_readable": True,
+        "dom_marker": False, "frame_challenge": False,
+        "frames_checked": 0, "frames_hidden": 0, "frames_unreadable": 0,
     }
     assert "cfbox_unresolved" in result[2]["blockers"]
 
@@ -733,7 +818,7 @@ def test_visual_error_recovers_when_later_inference_is_absent(visual_error_scena
 
     assert result[0] == "success"
     assert result[2]["cfbox_state"] == "absent"
-    assert result[2]["completion_reason"] == "dual_confirmation"
+    assert result[2]["completion_reason"] == "absent_and_clear_page"
     assert result[2]["states"] == ["processing", "unchecked", "error", "absent", "absent", "absent"]
     assert len(scenario.calls) == len(result[2]["states"])
 
@@ -894,7 +979,7 @@ def test_non_low_confidence_preserves_legacy_confirmation(
         assert "cfbox_unresolved" in result[2]["blockers"]
     else:
         assert result[0] == "success"
-        assert result[2]["completion_reason"] == "dual_confirmation"
+        assert result[2]["completion_reason"] == "unknown_and_clear_page"
         assert result[2]["states"] == ["unknown"] * 3
     assert any(f"confidence={expected_confidence}" in message
                for _, _, message in scenario.logs)
@@ -941,9 +1026,11 @@ def test_fresh_token_completion_timer_survives_alternating_confidence(
     assert scenario.calls[-1][0] - scenario.calls[2][0] == 2
 
 
-@pytest.mark.parametrize("prediction", ["error", "unknown"])
+@pytest.mark.parametrize("prediction", ["error", "unknown", "multiple_errors"])
 @pytest.mark.parametrize("blocker,expected_blocker", [
     ("marker", "visible_widget"),
+    ("frame", "visible_widget"),
+    ("frame_read", "marker_unreadable"),
     ("text", "challenge_text"),
     ("body_text", "challenge_text"),
     ("url", "challenge_url"),
@@ -957,7 +1044,11 @@ def test_low_confidence_cannot_bypass_blocked_page(
 ):
     scenario = visual_error_scenario
     scenario.page.marker = False
-    scenario.predictions = [prediction]
+    scenario.predictions = [{
+        "state": "error", "confidence": 0.7024, "ambiguous": True,
+        "challenges": [{"state": "error", "confidence": 0.7024},
+                       {"state": "error", "confidence": 0.92}],
+    }] if prediction == "multiple_errors" else [prediction]
     scenario.confidences = [0.1]
     scenario.blockers_before_click = True
     scenario.page.blocker = blocker
@@ -969,6 +1060,7 @@ def test_low_confidence_cannot_bypass_blocked_page(
     assert result[0] == "unknown"
     assert expected_blocker in result[2]["blockers"]
     assert result[2]["low_confidence_count"] == 0
+    assert result[2]["low_confidence_eligible"] is True
     assert scenario.clicks == []
     assert len(scenario.calls) == len(scenario.screenshots) == 4
 
@@ -1098,4 +1190,490 @@ def test_request_failure_cannot_complete_low_confidence_streak(
     assert result[0] == "fail"
     assert "completion_reason" not in result[2]
     assert len(scenario.calls) == len(scenario.screenshots) == 3
+    assert scenario.clicks == []
+
+
+@pytest.mark.parametrize("evidence", ["error", "processing", "unchecked", "marker"])
+@pytest.mark.parametrize("confidence", [None, ..., "0.1", False, float("nan"), 0.95, 1])
+def test_unknown_cannot_clear_unresolved_challenge(visual_error_scenario, evidence, confidence):
+    scenario = visual_error_scenario
+    scenario.page.marker = evidence == "marker"
+    scenario.predictions = ["unknown" if evidence == "marker" else evidence, "unknown"]
+    scenario.confidences = [None, confidence]
+
+    def clear_page(page, index):
+        if index >= 1:
+            page.marker = False
+
+    scenario.on_predict = clear_page
+    result = scenario.run(wait_seconds=5)
+
+    assert result[0] == "unknown"
+    assert result[2]["unresolved_challenge"] is True
+    assert "cfbox_unresolved" in result[2]["blockers"]
+    assert len(scenario.calls) == len(scenario.screenshots) == 5
+    assert not any("挑战已消失" in message for _, _, message in scenario.logs)
+
+
+def test_absent_clear_resolves_latch_for_later_unknown(visual_error_scenario):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = ["error", "unknown", "absent", "unknown"]
+    result = scenario.run()
+    assert result[0] == "success"
+    assert result[2]["states"] == ["error", "unknown", "absent", "unknown", "unknown"]
+    assert result[2]["unresolved_challenge"] is False
+    assert result[2]["seen_page_challenge"] is False
+    assert "挑战已消失" not in result[1]
+
+
+def test_absent_with_visible_widget_does_not_resolve_latch(visual_error_scenario):
+    scenario = visual_error_scenario
+    scenario.predictions = ["error", "absent", "unknown"]
+
+    def clear_page(page, index):
+        if index >= 2:
+            page.marker = False
+
+    scenario.on_predict = clear_page
+    result = scenario.run(wait_seconds=5)
+    assert result[0] == "unknown"
+    assert result[2]["unresolved_challenge"] is True
+    assert "cfbox_unresolved" in result[2]["blockers"]
+
+
+@pytest.fixture
+def multiple_widgets_scenario(visual_error_scenario):
+    scenario = visual_error_scenario
+    image = io.BytesIO()
+    Image.new("RGB", (1920, 947), "white").save(image, format="PNG")
+    scenario.image = image.getvalue()
+    # Deliberately differ from the screenshot to catch viewport-based clicks.
+    scenario.page.viewport_size = {"width": 100, "height": 100}
+    scenario.page.marker = False
+    scenario.predictions = [{
+        "state": "unknown",
+        "confidence": None,
+        "ambiguous": True,
+        "reason": "multiple_widgets",
+        "has_cf_challenge": True,
+        "checkbox_center_pct": None,
+        "challenges": [
+            {"state": "unchecked", "confidence": 0.9259,
+             "checkbox_center_pct": {"x": 42.77, "y": 92.99}},
+            {"state": "unknown", "confidence": None, "checkbox_center_pct": None},
+        ],
+    }]
+    return scenario
+
+
+@pytest.mark.parametrize("others", [
+    ["unknown"], ["error"], ["processing"], ["unknown", "error"],
+])
+@pytest.mark.parametrize("confidence", [None, 0, 0.3, 0.95, 1])
+def test_multiple_widgets_clicks_exact_target_then_absent_can_succeed(
+    multiple_widgets_scenario, others, confidence,
+):
+    scenario = multiple_widgets_scenario
+    body = scenario.predictions[0]
+    body["challenges"][1:] = [
+        {"state": state, "confidence": confidence, "checkbox_center_pct": None}
+        for state in others
+    ]
+    scenario.predictions.append({"state": "absent", "confidence": None})
+
+    def check_click_before_absent(page, index):
+        if index == 1:
+            assert len(scenario.clicks) == 1
+            assert scenario.clicks[0][1:] == pytest.approx((821.184, 880.6153))
+            assert page.marker is False
+
+    scenario.on_predict = check_click_before_absent
+    result = scenario.run()
+
+    assert result[0] == "success"
+    assert len(scenario.clicks) == 1
+    # 947 * 92.99 / 100 = 880.6153 (880.616 within 0.001 pixel).
+    assert scenario.clicks[0][1:] == pytest.approx((821.184, 880.616), abs=0.001)
+    assert [prediction for _, prediction in scenario.calls] == [body] + [
+        {"state": "absent", "confidence": None},
+    ] * 3
+    assert result[2]["states"] == ["unchecked", "absent", "absent", "absent"]
+    assert result[2]["completion_reason"] == "absent_and_clear_page"
+    assert result[2]["cfbox_summary_state"] == "absent"
+    assert result[2]["challenge_states"] == []
+    assert result[2]["clicked"] is True
+    assert result[2]["unresolved_challenge"] is False
+
+
+@pytest.mark.parametrize("others", [
+    ["unknown"], ["error"], ["processing"], ["unknown", "error"],
+])
+@pytest.mark.parametrize("confidence", [None, 0, 0.3, 0.95, 1])
+@pytest.mark.parametrize("marker", [False, True], ids=["visual-only", "fresh-token"])
+def test_persistent_multiple_widgets_never_passes(
+    multiple_widgets_scenario, others, confidence, marker,
+):
+    scenario = multiple_widgets_scenario
+    scenario.page.marker = marker
+    scenario.predictions[0]["challenges"][1:] = [
+        {"state": state, "confidence": confidence, "checkbox_center_pct": None}
+        for state in others
+    ]
+    result = scenario.run(wait_seconds=3)
+
+    assert result[0] == "unknown"
+    assert scenario.clicks
+    assert all((x, y) == pytest.approx((821.184, 880.6153)) for _, x, y in scenario.clicks)
+    assert set(result[2]["states"]) == {"unchecked"}
+    assert result[2]["state"] != "passed"
+    assert result[2]["summary_state"] == "unknown"
+    assert result[2]["challenge_states"] == ["unchecked", *others]
+    assert result[2]["multiple_unresolved"] is True
+    assert result[2]["unresolved_challenge"] is True
+    assert result[2]["low_confidence_count"] == 0
+    assert scenario.page.marker is False
+    assert scenario.page.token_length == 100
+    assert "cfbox_unresolved" in result[2]["blockers"]
+    assert "completion_reason" not in result[2]
+
+
+def test_persistent_unchecked_with_centerless_error_can_fallback(multiple_widgets_scenario):
+    scenario = multiple_widgets_scenario
+    scenario.predictions[0]["challenges"][1].update(state="error", confidence=1)
+    result = scenario.run()
+
+    assert result[0] == "fallback_interaction"
+    assert scenario.clicks
+    assert all((x, y) == pytest.approx((821.184, 880.6153)) for _, x, y in scenario.clicks)
+    assert set(result[2]["states"]) == {"unchecked"}
+    assert result[2]["state"] != "passed"
+    assert "completion_reason" not in result[2]
+
+
+@pytest.mark.parametrize("other,center", [
+    *[(state, {"x": 10, "y": 20})
+      for state in ("unchecked", "processing", "error", "unknown", "verified", "absent")],
+    ("unchecked", {"x": 42.77, "y": 92.99}),
+    ("unchecked", None),
+])
+def test_competing_targets_neither_click_nor_pass(multiple_widgets_scenario, other, center):
+    scenario = multiple_widgets_scenario
+    scenario.predictions[0]["challenges"][1] = {
+        "state": other, "confidence": 0.99, "checkbox_center_pct": center,
+    }
+    result = scenario.run(wait_seconds=5)
+
+    assert result[0] == "unknown"
+    assert scenario.clicks == []
+    assert result[2]["states"] == ["unchecked"] * 5
+    assert result[2]["multiple_unresolved"] is (other not in {"verified", "absent"})
+    assert result[2]["low_confidence_count"] == 0
+    assert "cfbox_unresolved" in result[2]["blockers"]
+
+
+@pytest.mark.parametrize("unknown_confidence", [None, 0.3])
+def test_multiple_children_with_token_require_all_low_confidences(
+    visual_error_scenario, unknown_confidence,
+):
+    scenario = visual_error_scenario
+    scenario.predictions = [
+        "unchecked",
+        {"state": "unknown", "challenges": [
+            {"state": "error", "confidence": 0.3}, {"state": "unknown"},
+        ]},
+        {"state": "verified", "confidence": 1, "challenges": [
+            {"state": "verified", "confidence": 1},
+            {"state": "unknown", "confidence": unknown_confidence},
+            {"state": "error", "confidence": 0.3},
+        ]},
+    ]
+    result = scenario.run(wait_seconds=6)
+
+    assert len(scenario.clicks) == 1
+    assert scenario.page.marker is False
+    assert scenario.page.token_length == 100
+    if unknown_confidence is not None:
+        assert result[0] == "success"
+        assert result[2]["completion_reason"] == "low_confidence_and_clear_page"
+        assert result[2]["states"] == ["unchecked"] + ["error"] * 4
+        assert result[2]["cfbox_summary_state"] == "verified"
+        assert result[2]["challenge_states"] == ["verified", "unknown", "error"]
+        assert result[2]["low_confidence_count"] == 3
+        assert result[2]["unresolved_challenge"] is False
+        assert scenario.calls[-1][0] - scenario.calls[2][0] == 2
+        return
+    assert result[0] == "unknown"
+    assert result[2]["states"] == ["unchecked"] + ["error"] * 5
+    assert result[2]["summary_state"] == "verified"
+    assert result[2]["challenge_states"] == ["verified", "unknown", "error"]
+    assert result[2]["multiple_unresolved"] is True
+    assert result[2]["unresolved_challenge"] is True
+    assert result[2]["low_confidence_count"] == 0
+    assert result[2]["low_confidence_eligible"] is False
+    assert "cfbox_unresolved" in result[2]["blockers"]
+    assert "completion_reason" not in result[2]
+
+
+def test_parent_absent_cannot_hide_unchecked_child(multiple_widgets_scenario):
+    scenario = multiple_widgets_scenario
+    scenario.predictions[0].update(state="absent", confidence=1, ambiguous=False)
+    scenario.predictions[0]["challenges"] = scenario.predictions[0]["challenges"][:1]
+    result = scenario.run(wait_seconds=3)
+
+    assert result[0] == "unknown"
+    assert len(scenario.clicks) == 3
+    assert scenario.clicks[0][1:] == pytest.approx((821.184, 880.6153))
+    assert result[2]["summary_state"] == "absent"
+    assert result[2]["challenge_states"] == ["unchecked"]
+    assert result[2]["states"] == ["unchecked"] * 3
+    assert result[2]["unresolved_challenge"] is True
+
+
+@pytest.mark.parametrize("summary", ["absent", "verified", "unknown"])
+def test_processing_child_never_passes_clear_page(visual_error_scenario, summary):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = [{
+        "state": summary, "confidence": 1,
+        "challenges": [{"state": "processing", "confidence": 0.3}],
+    }]
+    result = scenario.run(wait_seconds=5)
+
+    assert result[0] == "unknown"
+    assert scenario.clicks == []
+    assert result[2]["states"] == ["processing"] * 5
+    assert result[2]["low_confidence_count"] == 0
+    assert "cfbox_unresolved" in result[2]["blockers"]
+
+
+@pytest.mark.parametrize("challenges", [[], [{"state": "unknown", "confidence": None}]])
+def test_flagged_ambiguous_unknown_never_passes_clear_page(visual_error_scenario, challenges):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = [{
+        "state": "unknown", "confidence": None, "ambiguous": True,
+        "has_cf_challenge": True, "challenges": challenges,
+    }]
+    result = scenario.run(wait_seconds=5)
+
+    assert result[0] == "unknown"
+    assert scenario.clicks == []
+    assert result[2]["multiple_unresolved"] is True
+    assert result[2]["unresolved_challenge"] is True
+    assert result[2]["low_confidence_count"] == 0
+
+
+@pytest.mark.parametrize("states,confidences", [
+    (["error", "error"], [0.7024, 0.92]),
+    (["error", "unknown"], [0.8, 0.9]),
+])
+@pytest.mark.parametrize("summary", ["error", "unknown"])
+@pytest.mark.parametrize("after_click", [False, True], ids=["no-token", "fresh-token"])
+def test_all_low_children_pass_after_three_fresh_clear_screenshots(
+    visual_error_scenario, states, confidences, summary, after_click,
+):
+    scenario = visual_error_scenario
+    scenario.page.marker = after_click
+    body = {
+        "state": summary, "confidence": min(confidences), "ambiguous": True,
+        "has_cf_challenge": True, "reason": "multiple_widgets",
+        "challenges": [{"state": state, "confidence": confidence}
+                       for state, confidence in zip(states, confidences)],
+    }
+    scenario.predictions = ["unchecked", body] if after_click else [body]
+
+    result = scenario.run()
+
+    assert result[0] == "success"
+    assert result[2]["completion_reason"] == "low_confidence_and_clear_page"
+    assert result[2]["cfbox_state"] == "error"
+    assert result[2]["cfbox_summary_state"] == summary
+    assert result[2]["challenge_states"] == states
+    assert result[2]["confidence"] == min(confidences)
+    assert result[2]["low_confidence_count"] == 3
+    assert result[2]["states"] == (["unchecked"] if after_click else []) + ["error"] * 3
+    assert result[2]["unresolved_challenge"] is False
+    assert len(scenario.clicks) == int(after_click)
+    assert scenario.page.token_length == (100 if after_click else 0)
+    assert len(scenario.calls) == len(scenario.screenshots) == 3 + int(after_click)
+    assert scenario.submitted_images == [image for _, image in scenario.screenshots]
+    assert len(set(scenario.submitted_images)) == len(scenario.calls)
+    assert scenario.calls[-1][0] - scenario.calls[int(after_click)][0] == 2
+    assert scenario.diagnostics["challenge_confidences"] == confidences
+    assert scenario.diagnostics["low_confidence_eligible"] is True
+    assert scenario.diagnostics["multiple_unresolved"] is True
+    if summary == "unknown":
+        assert any(f"子置信度={confidences}" in message and "低置信度复核资格=True" in message
+                   for _, _, message in scenario.logs)
+
+
+@pytest.mark.parametrize("other", ["error", "unknown"])
+@pytest.mark.parametrize("confidence", [0.95, 1, None, "0.8", False])
+@pytest.mark.parametrize("after_click", [False, True], ids=["no-token", "fresh-token"])
+def test_one_non_low_child_blocks_even_with_low_aggregated_confidence(
+    visual_error_scenario, other, confidence, after_click,
+):
+    scenario = visual_error_scenario
+    scenario.page.marker = after_click
+    body = {
+        "state": "unknown", "confidence": 0.7024, "ambiguous": True,
+        "challenges": [{"state": "error", "confidence": 0.7024},
+                       {"state": other, "confidence": confidence}],
+    }
+    scenario.predictions = ["unchecked", body] if after_click else [body]
+
+    result = scenario.run(wait_seconds=5)
+
+    assert result[0] == "unknown"
+    assert result[2]["challenge_confidences"] == [
+        0.7024, float(confidence) if type(confidence) in (int, float) else None,
+    ]
+    assert result[2]["low_confidence_eligible"] is False
+    assert result[2]["low_confidence_count"] == 0
+    assert result[2]["multiple_unresolved"] is True
+    assert result[2]["unresolved_challenge"] is True
+    assert result[2]["fresh_token_after_click"] is after_click
+    assert result[2]["token_present"] is after_click
+    assert "cfbox_unresolved" in result[2]["blockers"]
+    assert "completion_reason" not in result[2]
+    assert len(scenario.clicks) == int(after_click)
+    assert len(scenario.calls) == len(scenario.screenshots) == 5
+    assert any("子置信度=" in message and "低置信度复核资格=False" in message
+               for _, _, message in scenario.logs)
+
+
+@pytest.mark.parametrize("state", ["error", "unknown", "verified", "absent", "unchecked", "processing"])
+def test_child_center_blocks_low_confidence_even_if_not_exposed_as_click_target(
+    visual_error_scenario, state,
+):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = [{
+        "state": "error", "confidence": 0.7024, "ambiguous": True,
+        "challenges": [{"state": "error", "confidence": 0.7024},
+                       {"state": state, "confidence": 0.1,
+                        "checkbox_center_pct": {"x": 50, "y": 50}}],
+    }]
+
+    result = scenario.run(wait_seconds=4)
+
+    assert result[0] == "unknown"
+    assert result[2]["low_confidence_eligible"] is False
+    assert result[2]["low_confidence_count"] == 0
+    assert "cfbox_unresolved" in result[2]["blockers"]
+    assert "completion_reason" not in result[2]
+    assert bool(scenario.clicks) is (state == "unchecked")
+
+
+@pytest.mark.parametrize("state", ["error", "unknown"])
+def test_summary_center_explicitly_blocks_low_confidence(visual_error_scenario, state):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = [{"state": state, "confidence": 0.7024, "ambiguous": True,
+                             "checkbox_center_pct": {"x": 50, "y": 50}}]
+
+    result = scenario.run(wait_seconds=4)
+
+    assert result[0] == "unknown"
+    assert result[2]["low_confidence_eligible"] is False
+    assert result[2]["low_confidence_count"] == 0
+    assert scenario.clicks == []
+    assert "completion_reason" not in result[2]
+
+
+def test_single_error_child_allows_three_low_confidence_rechecks(visual_error_scenario):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = [{
+        "state": "unknown", "confidence": None, "has_cf_challenge": True,
+        "challenges": [{"state": "error", "confidence": 0.3}],
+    }]
+    result = scenario.run()
+
+    assert result[0] == "success"
+    assert result[2]["completion_reason"] == "low_confidence_and_clear_page"
+    assert result[2]["cfbox_state"] == "error"
+    assert result[2]["cfbox_summary_state"] == "unknown"
+    assert result[2]["challenge_states"] == ["error"]
+    assert result[2]["confidence"] == 0.3
+    assert result[2]["low_confidence_count"] == 3
+    assert len(scenario.calls) == len(scenario.screenshots) == 3
+    assert scenario.calls[-1][0] - scenario.calls[0][0] == 2
+    assert len(set(scenario.submitted_images)) == 3
+    assert scenario.clicks == []
+
+
+@pytest.mark.parametrize("other", ["unknown", "error", "processing", "unchecked"])
+@pytest.mark.parametrize("confidence", [None, 0.8])
+@pytest.mark.parametrize("after_click", [False, True], ids=["initial-clear", "fresh-token"])
+def test_mixed_children_only_pass_with_strict_low_confidence_evidence(
+    visual_error_scenario, other, confidence, after_click,
+):
+    scenario = visual_error_scenario
+    body = {
+        "state": "unknown", "confidence": None,
+        "challenges": [{"state": "error", "confidence": 0.3},
+                       {"state": other, "confidence": confidence}],
+    }
+    scenario.page.marker = after_click
+    scenario.predictions = ["unchecked", body] if after_click else [body]
+    result = scenario.run(wait_seconds=6)
+
+    if other in {"error", "unknown"} and confidence is not None:
+        assert result[0] == "success"
+        assert result[2]["completion_reason"] == "low_confidence_and_clear_page"
+        assert result[2]["low_confidence_count"] == 3
+        assert result[2]["unresolved_challenge"] is False
+        assert scenario.diagnostics["low_confidence_eligible"] is True
+        assert len(scenario.calls) == 3 + int(after_click)
+        assert scenario.calls[-1][0] - scenario.calls[int(after_click)][0] == 2
+        assert len(scenario.clicks) == int(after_click)
+        return
+    assert result[0] == "unknown"
+    assert len(scenario.calls) == 6
+    assert len(scenario.clicks) == int(after_click)
+    assert scenario.page.marker is False
+    assert scenario.page.token_length == (100 if after_click else 0)
+    assert result[2]["multiple_unresolved"] is True
+    assert result[2]["unresolved_challenge"] is True
+    assert result[2]["low_confidence_count"] == 0
+    assert "cfbox_unresolved" in result[2]["blockers"]
+    assert "completion_reason" not in result[2]
+
+
+@pytest.mark.parametrize("challenges", [
+    {}, "invalid", False, [None], [{}], [{"state": "invalid"}],
+    [{"state": "verified"}, {"state": "invalid"}],
+    [{"state": "unchecked", "checkbox_center_pct": {"x": True, "y": 50}}],
+    [{"state": "unchecked", "checkbox_center_pct": {"x": 101, "y": 50}}],
+    [{"state": "unchecked", "checkbox_center_pct": {"x": float("nan"), "y": 50}}],
+])
+def test_malformed_children_fail_before_click_or_pass(visual_error_scenario, challenges):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = [{"state": "absent", "confidence": 1, "challenges": challenges}]
+    result = scenario.run()
+
+    assert result[0] == "fail"
+    assert "ValueError" in result[1]
+    assert len(scenario.calls) == 1
+    assert scenario.clicks == []
+    assert "completion_reason" not in result[2]
+
+
+@pytest.mark.parametrize("challenges", [{}, {"challenges": None}, {"challenges": []}])
+def test_plain_unknown_clear_page_keeps_legacy_success(visual_error_scenario, challenges):
+    scenario = visual_error_scenario
+    scenario.page.marker = False
+    scenario.predictions = [{"state": "unknown", "confidence": None, **challenges}]
+    result = scenario.run()
+
+    assert result[0] == "success"
+    assert result[2]["state"] == "absent"
+    assert result[2]["completion_reason"] == "unknown_and_clear_page"
+    assert result[2]["cfbox_summary_state"] == "unknown"
+    assert result[2]["challenge_states"] == []
+    assert result[2]["states"] == ["unknown"] * 3
+    assert result[2]["unresolved_challenge"] is False
     assert scenario.clicks == []

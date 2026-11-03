@@ -84,7 +84,10 @@ class SecretProviders:
     def register(self, job, site, steps):
         token = secrets.token_urlsafe(32)
         allowed = {}
+        resign_steps = set()
         for step in steps:
+            if step.enabled and step.feature_type == "post.resign_click":
+                resign_steps.add(step.step_key)
             if step.enabled and step.feature_type in SECRET_PURPOSES:
                 provider = step_provider(site, step)
                 options = dict(step.config)
@@ -96,8 +99,27 @@ class SecretProviders:
                 allowed[step.step_key] = (step.feature_type, provider, options)
         with self.lock:
             self.leases = {key: value for key, value in self.leases.items() if value[0] != job.id}
-            self.jobs[job.id] = (self.digest(token), site.id, job.attempt, time.monotonic() + self.settings.execution_timeout, allowed)
+            self.jobs[job.id] = (self.digest(token), site.id, job.attempt, time.monotonic() + self.settings.execution_timeout, allowed, frozenset(resign_steps))
         return token
+
+    def authorize_resign(self, token, job_id, site_id, step_key, session):
+        with self.lock:
+            grant = self.jobs.get(job_id)
+            if (
+                not grant or not secrets.compare_digest(grant[0], self.digest(token))
+                or grant[1] != site_id or grant[3] <= time.monotonic()
+                or step_key not in grant[5]
+            ):
+                raise SecretDenied()
+        job = session.get(SiteJob, job_id, populate_existing=True)
+        run = session.get(Run, job.run_id, populate_existing=True) if job else None
+        if (
+            not job or not run or run.cancel_requested or run.status not in {"queued", "running"}
+            or job.site_id != site_id or job.attempt != grant[2]
+            or job.status not in {"queued", "running"}
+        ):
+            raise SecretDenied()
+        return job
 
     def revoke(self, job_id):
         with self.lock:

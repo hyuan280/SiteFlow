@@ -361,7 +361,7 @@ function errorValue(): string {
       <p v-else class="muted">默认关闭；仅当前步骤开启后，才会按全局判断范围调用模型。</p>
       <template v-if="llmEnabled">
         <div class="config-head">
-          <span>自定义判断提示词（可选）</span>
+          <span>自定义业务判断提示词（可选）</span>
           <el-button
             v-if="Object.hasOwn(step.config, 'llm_prompt')"
             size="small" text :disabled="!globalLlmEnabled"
@@ -374,7 +374,13 @@ function errorValue(): string {
           :disabled="!globalLlmEnabled" placeholder="留空使用全局结果判断提示词"
           aria-label="步骤模型判断提示词"
         />
-        <p class="muted">最多 4000 字符，留空使用全局提示词。自定义提示词必须明确要求以 True 或 False 作结论。</p>
+        <p class="muted">最多 4000 字符，仅填写业务判断规则，留空使用全局提示词；未覆盖时可继承模板提示词。已有自定义提示词不会自动改写。</p>
+        <div class="muted" role="note" aria-label="系统输出协议（只读）">
+          <strong>系统输出协议（只读）</strong>
+          <p>worker 在运行时添加固定 system 输出约束，不与业务提示词合并保存，也不能被业务提示词中的格式要求覆盖；仅约束 JSON schema，不强制工具调用，无需用户手写输出格式。</p>
+          <p>工具选择为 auto，可优先调用一次 <code>submit_workflow_result</code>，也可在未调用工具时直接返回正文 JSON。工具参数与正文 JSON 均须符合固定 schema <code>{result: boolean, reason: string}</code>，示例：<code>{"result":true,"reason":"可见依据"}</code>。存在工具调用时只接受一个有效的 <code>submit_workflow_result</code>；多个工具调用、工具名称或参数无效均失败，不回退到正文 JSON。</p>
+          <p><code>reason</code> 将保存到步骤 data 并记录日志，判断依据可能包含页面隐私。系统要求不输出账号、密码、Cookie、验证码、令牌或其他敏感信息；已知密钥脱敏不等于完整 DLP 防护。</p>
+        </div>
       </template>
     </div>
 

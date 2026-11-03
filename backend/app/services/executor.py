@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import Settings
 from app.core.crypto import CryptoService
 from app.models.execution import JobArtifact, JobStep, Run, SiteJob
-from app.models.workflow import Site
+from app.models.workflow import Site, SiteResignRecord
 from app.services.credentials import CredentialError, CredentialService
 from app.services.execution import ExecutionService, FINAL_JOB_STATUSES, FINAL_RUN_STATUSES
 from app.services.integrations import IntegrationService
@@ -214,6 +214,74 @@ class ExecutionManager:
         }
         return value if value in allowed else "error"
 
+    @staticmethod
+    def _merge_resign_checkpoints(session, job: SiteJob, step_rows: list[Any]) -> list[Any]:
+        # Only the click feature carries checkpoints that must survive incomplete snapshots.
+        rows = list(step_rows)
+        for saved in session.scalars(
+            select(JobStep).where(
+                JobStep.site_job_id == job.id,
+                JobStep.feature_type == "post.resign_click",
+            ).order_by(JobStep.id)
+        ):
+            data = json.loads(saved.data_json)
+            previous = data.get("resign") if isinstance(data, dict) else None
+            if not isinstance(previous, dict) or not previous:
+                continue
+            index = next((
+                i for i, row in enumerate(rows)
+                if isinstance(row, dict) and row.get("step_key") == saved.step_key
+                and row.get("feature_type") == "post.resign_click"
+            ), None)
+            if index is None:
+                rows.append({
+                    "step_key": saved.step_key,
+                    "feature_type": saved.feature_type,
+                    "label": saved.label,
+                    "status": saved.status,
+                    "message": saved.message,
+                    "data": data,
+                    "started_at": saved.started_at.isoformat() if saved.started_at else None,
+                    "finished_at": saved.finished_at.isoformat() if saved.finished_at else None,
+                })
+                continue
+            current_data = rows[index].get("data")
+            current_data = current_data if isinstance(current_data, dict) else {}
+            current = current_data.get("resign")
+            current = current if isinstance(current, dict) else {}
+            merged = {**previous, **current}
+            merged["submit_attempted"] = bool(
+                previous.get("submit_attempted") or current.get("submit_attempted")
+            )
+            for key in ("success", "already_signed", "unconfirmed"):
+                entries = []
+                for item in (previous.get(key) or []) + (current.get(key) or []):
+                    if item not in entries:
+                        entries.append(item)
+                if entries:
+                    merged[key] = entries
+            rows[index] = {**rows[index], "data": {**data, **current_data, "resign": merged}}
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or row.get("feature_type") != "post.resign_click":
+                continue
+            data = row.get("data")
+            merged = data.get("resign") if isinstance(data, dict) else None
+            if not isinstance(merged, dict):
+                continue
+            confirmed = {
+                item.get("date") if isinstance(item, dict) else item
+                for key in ("success", "already_signed") for item in merged.get(key) or []
+            }
+            merged = dict(merged)
+            for key in ("unconfirmed", "remaining"):
+                if isinstance(merged.get(key), list):
+                    merged[key] = [
+                        item for item in merged[key]
+                        if (item.get("date") if isinstance(item, dict) else item) not in confirmed
+                    ]
+            rows[index] = {**row, "data": {**data, "resign": merged}}
+        return rows
+
     def _save_steps(
         self,
         session,
@@ -235,6 +303,11 @@ class ExecutionManager:
                 if allow_running
                 else self._canonical_status(raw_status)
             )
+            if (
+                not allow_running and raw_status == "running"
+                and item.get("feature_type") == "post.resign_click"
+            ):
+                status = "waiting_human"
             session.add(
                 JobStep(
                     site_job_id=job.id,
@@ -305,7 +378,19 @@ class ExecutionManager:
                 job.started_at = datetime.now(timezone.utc)
             steps = event.get("steps")
             step_rows = steps if isinstance(steps, list) else []
+            step_rows = self._merge_resign_checkpoints(session, job, step_rows)
             self._save_steps(session, job, step_rows, allow_running=True)
+            resign_service = ResignService(session, self.settings)
+            for row in step_rows:
+                if not isinstance(row, dict) or row.get("feature_type") != "post.resign_click":
+                    continue
+                data = row.get("data")
+                resign_result = data.get("resign") if isinstance(data, dict) else None
+                if isinstance(resign_result, dict):
+                    resign_service.record_results(
+                        job.site_id, job.run_id, job.id, resign_result,
+                        feature_type="post.resign_click",
+                    )
             if "artifacts" in event:
                 self._save_artifacts(session, job, event.get("artifacts"))
             message = str(event.get("message") or "").strip()
@@ -413,8 +498,9 @@ class ExecutionManager:
                     return
 
             resign_days = site.resign_max_days if site.support_resign else 0
+            resign_service = ResignService(session, self.settings)
             resign_pending = (
-                ResignService(session, self.settings).pending_dates(site.id, resign_days)
+                resign_service.pending_dates(site.id, resign_days)
                 if resign_days
                 else []
             )
@@ -467,6 +553,13 @@ class ExecutionManager:
                 "feature_execution_settings": feature_execution_settings,
                 "vision": integrations.vision_runtime() if needs_vision_runtime else None,
                 "resign_pending_dates": resign_pending,
+                "resign_today": datetime.now(resign_service.timezone).date().isoformat(),
+                "resign_unresolved_dates": list(session.scalars(
+                    select(SiteResignRecord.resign_date).where(
+                        SiteResignRecord.site_id == site.id,
+                        SiteResignRecord.status == "unknown",
+                    ).order_by(SiteResignRecord.resign_date)
+                )),
                 "resign_max_days": resign_days,
                 "plugin_runtimes": plugin_runtimes,
             }
@@ -511,6 +604,20 @@ class ExecutionManager:
                 if not active:
                     self._active_jobs.pop(run_id, None)
 
+        with self.session_factory() as session:
+            job = session.get(SiteJob, job_id)
+            if job is None:
+                return
+            steps = result.get("steps")
+            result = {**result, "steps": self._merge_resign_checkpoints(
+                session, job, steps if isinstance(steps, list) else []
+            )}
+            resign_reserved = session.scalar(select(SiteResignRecord.id).where(
+                SiteResignRecord.job_id == job.id,
+                SiteResignRecord.run_id == job.run_id,
+                SiteResignRecord.status.in_({"unknown", "success", "already_signed"}),
+            ).limit(1)) is not None
+
         if str(result.get("status") or "") in {"restart", "fallback_interaction"}:
             paid = any(
                 isinstance(row, dict) and row.get("feature_type") == "post.buy_card"
@@ -523,6 +630,16 @@ class ExecutionManager:
             if paid:
                 result = {**result, "status": "waiting_human",
                           "message": "本任务已发起购卡点击，禁止自动重跑以避免重复购买，请人工核验"}
+            elif resign_reserved or any(
+                isinstance(row, dict) and row.get("feature_type") == "post.resign_click"
+                and isinstance(row.get("data"), dict)
+                and isinstance(row["data"].get("resign"), dict)
+                and (row["data"]["resign"].get("submit_attempted")
+                     or row["data"]["resign"].get("success"))
+                for row in result["steps"]
+            ):
+                result = {**result, "status": "waiting_human",
+                          "message": "本任务已发起补签点击，禁止自动重跑以避免重复补签，请人工核验"}
 
         if str(result.get("status") or "") == "fallback_interaction":
             with self.session_factory() as session:
@@ -608,13 +725,16 @@ class ExecutionManager:
             self._save_steps(session, job, step_rows)
             resign_service = ResignService(session, self.settings)
             for row in step_rows:
-                if not isinstance(row, dict) or row.get("feature_type") != "post.resign":
+                if not isinstance(row, dict) or row.get("feature_type") not in {
+                    "post.resign", "post.resign_click",
+                }:
                     continue
                 data = row.get("data")
                 resign_result = data.get("resign") if isinstance(data, dict) else None
                 if isinstance(resign_result, dict):
                     resign_service.record_results(
-                        job.site_id, job.run_id, job.id, resign_result
+                        job.site_id, job.run_id, job.id, resign_result,
+                        feature_type=row["feature_type"],
                     )
             if isinstance(result.get("artifacts"), list):
                 self._save_artifacts(session, job, result.get("artifacts"))

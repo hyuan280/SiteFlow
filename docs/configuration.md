@@ -124,9 +124,15 @@ state: absent | unchecked | verified | processing | error | unknown
 confidence: 0 到 1 的数值或 null
 checkbox_center_pct: {x, y}
 widget_box_pct
+ambiguous / reason
+challenges: [{state, confidence, checkbox_center_pct, ...}]
 ```
 
 `state=error` 表示截图中识别到视觉错误状态，和请求异常、HTTP 非 200 或非法响应不同。Worker 会继续重新识别；状态不变时不重复打印每轮日志，等待期间会输出低频进度。`error/unknown` 的有效 `confidence < 0.95` 时，连续 3 次同状态的新截图和至少 2 秒的清晰页面状态可用于排除误检测；缺失或非法置信度不按 0 处理。完整完成判据、新 token 及连续低置信度确认见 [任务执行](execution.md)。
+
+顶层 `unknown`、`confidence=null` 可能是 `multiple_widgets` 汇总，而不是未检测到组件。Worker 会遍历非空 `challenges`，以未解决子状态优先判断；唯一明确的 unchecked 坐标可以点击，多个 unchecked 不擅自选点。含未解决子挑战的多候选结果不能通过普通 unknown 或新 token 路径直接放行。只有所有未解决子项均为 error/unknown、各自具有有效且小于 0.95 的置信度、全部子项均无复选框坐标时，才允许独立的连续低置信度页面复核。任一高置信度、未知置信度、unchecked/processing 或坐标都会阻止该复核，不以聚合最小值代表所有子项。日志和结果保留顶层、子状态、各自置信度及复核资格，不把父级 null 当作 0。
+
+唯一 unchecked 有有效坐标时，其他无坐标的 unknown/error/processing 不构成第二个点击目标，不再阻止该次点击；任何其他不同坐标或多个 unchecked 仍拒绝选点。允许点击与允许完成独立：未解决子结果继续阻塞通过，必须在后续截图和页面检查中确认。
 
 配置：
 

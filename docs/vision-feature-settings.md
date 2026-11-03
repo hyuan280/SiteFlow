@@ -222,7 +222,7 @@ scope, provider/model selection and common prompt. Each output step must also op
 | `use_vision` | `true` | Send only the current page screenshot, not page text. Requires system `supports_vision`. When false, send page text without a screenshot. |
 | `judgment_scope` | `"success_only"` | Revalidate only output steps whose effective `output_value` is `true`. `"all"` judges both True and False output steps. |
 | `model` | `""` | Optional model ID, at most 256 characters. Empty uses the system default model. |
-| `llm_prompt` | Chinese instruction to check login and signed-in status and output only True/False | Custom instruction, 1-4000 characters. It must explicitly request a True/False conclusion; the system enforces the final True/False result. |
+| `llm_prompt` | Chinese business criteria to check login and signed-in status and describe visible evidence | Business criteria, 1-4000 characters. The worker separately adds a fixed system tool-output protocol; users do not need to write output-format instructions. |
 
 The model override is a free-text ID, not a model registry entry or a provider
 selector. It uses the existing system provider endpoint and API key. All dependent
@@ -241,7 +241,7 @@ Example settings payload (omit `model` or use `""` for the system default):
     "use_vision": true,
     "judgment_scope": "success_only",
     "model": "",
-    "llm_prompt": "请判断当前页面是否已登录且已签到，仅输出 True 或 False。"
+    "llm_prompt": "检查页面是否明确已登录且今日已签到，证据不足则判为未完成，并简要说明可见依据，不包含账号或秘密。"
   }
 }
 ```
@@ -264,8 +264,14 @@ A valid False conclusion is a successfully evaluated step that outputs false and
 fails the site task; a True conclusion outputs true. Model judgement replaces the
 configured result within the selected scope. Failed model calls produce no Boolean
 output and follow the step's error policy; choosing `continue` can therefore allow
-later steps to run. Final conclusions accept only True/False (case-insensitive),
-optionally after balanced leading reasoning blocks; prose and JSON are rejected.
+later steps to run. As with grid recognition, the worker declares the optional tool
+`submit_workflow_result` with `tool_choice=auto`, without a named/required choice or
+forced response format. It accepts either one valid tool call or, when there are
+no calls, a JSON object in message content. Both require exactly `result` (strict
+boolean) and `reason` (nonblank string, 1-500 characters). Invalid or multiple calls
+are not rescued by message content. Natural-language conclusions, Markdown,
+duplicate JSON keys, extra fields and malformed JSON are rejected. Balanced leading
+think blocks may be stripped from content; `reasoning_content` is never a result.
 The default step deadline allows the provider timeout plus screenshot overhead;
 an explicit step timeout still takes precedence. Requests are cancellable and are
 never automatically retried. Page text is limited to 24,000 visible body characters;
@@ -279,9 +285,29 @@ is enabled; no migration or automatic opt-in occurs. The UI disables the local
 controls while the global switch is off, retaining saved choices for later use.
 
 `config.llm_prompt` is optional (at most 4000 characters). A nonblank value overrides
-the common prompt; an empty/whitespace-only value uses the global prompt. Users
-must explicitly request a True/False conclusion. Both fields follow normal
+the common business criteria; an empty/whitespace-only value uses the global prompt.
+The immutable output protocol is a separate system message, never merged into saved
+user configuration, and takes precedence over user-specified output formats. Both fields follow normal
 template inheritance: a site can override inherited true with false, or override
 a template prompt with an empty string to use the global prompt. Reset controls
 remove the local override and restore inheritance. Input mode, model selection
 and judgment scope remain global.
+
+The tool returns JSON arguments such as:
+
+```json
+{"result": false, "reason": "The page still shows a pending check-in action."}
+```
+
+The reason is sanitized against known job secrets before normalization or truncation,
+stored in step `data.judgment_reason`, and included in the execution log, not task
+`outputs`. It is untrusted model text and may still reveal unknown page privacy;
+sanitization is not comprehensive DLP. Existing configured result messages retain
+their prior semantics and are not replaced by the reason.
+
+Failures retain `reason=model_judgment_failed` and add a fixed `provider_error` code,
+`stage`, and optional `http_status`. Codes distinguish HTTP errors, timeout, network
+errors, missing results, wrong/multiple tool calls, invalid JSON or schema, truncation, content
+filtering and refusal. Evidence collection errors use `evidence_error`. Logs include
+these safe diagnostics and elapsed time, never raw provider bodies, arguments,
+credentials or transport exception text. Calls remain non-retrying and cancellable.

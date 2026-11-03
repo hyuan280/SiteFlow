@@ -1,0 +1,74 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Isolated Resign Calendar</title>
+<main aria-busy="true"></main>
+<script>
+const opts = FIXTURE_OPTIONS;
+const main = document.querySelector('main');
+let month = opts.month || '2026-10', selected = null;
+let cards = opts.cards ?? 3;
+const signed = new Set(opts.signed || []);
+window.clicks = [];
+window.flips = [];
+function render() {
+  main.innerHTML = `<p class="cal-help">补签卡（当前 ${cards} 张）</p>
+    <div class="cal-board"><h2 class="cal-water">${month.replace('-', '年')}月</h2></div>
+    <button class="cal-arr" aria-label="上一月">prev</button>
+    <button class="cal-arr" aria-label="下一月">next</button>
+    <div class="cal-grid"></div>
+    <div class="cal-att"><button class="cal-att-pill act">${opts.button ?? '补签'}</button></div>`;
+  const grid = main.querySelector('.cal-grid');
+  for (let day = 1; day <= 31; day++) {
+    const date = `${month}-${String(day).padStart(2, '0')}`;
+    const cell = document.createElement('button');
+    cell.className = 'cal-cell' + (selected === date ? ' on' : '');
+    if (!opts.noDates) cell.dataset.date = opts.contradiction && day === 1 ? '2026-09-01' : date;
+    if (opts.ariaConflict && day === 1) cell.setAttribute('aria-label', '2026年9月1日');
+    cell.innerHTML = `<span class="cal-num">${day}</span>` +
+      (signed.has(date) ? '<span class="cal-badge att">done</span>' : '');
+    if (opts.duplicateDone && signed.has(date)) cell.insertAdjacentHTML('beforeend', '<span class="cal-badge att">done</span>');
+    cell.onclick = () => {
+      selected = opts.wrongSelected ? `${month}-02` : date;
+      render();
+      if (opts.changeMonth) {
+        month = '2026-09'; render();
+      }
+    };
+    grid.append(cell);
+  }
+  grid.insertAdjacentHTML('afterbegin', '<button class="cal-cell mute" data-date="2026-09-01">' +
+    '<span class="cal-num">1</span><span class="cal-badge att">done</span></button>');
+  if (opts.noDates) grid.querySelector('.mute').removeAttribute('data-date');
+  if (opts.ambiguous) grid.append(grid.children[1].cloneNode(true));
+  if (opts.ambiguousTitle) main.querySelector('.cal-board').append(main.querySelector('h2').cloneNode(true));
+  main.querySelectorAll('.cal-arr').forEach((el, index) => el.onclick = () => {
+    window.flips.push(index);
+    if (opts.stuckMonth) return;
+    main.setAttribute('aria-busy', 'true');
+    setTimeout(() => {
+      const d = new Date(`${month}-15T00:00:00Z`);
+      d.setUTCMonth(d.getUTCMonth() + (index ? 1 : -1));
+      month = d.toISOString().slice(0, 7);
+      render(); main.removeAttribute('aria-busy');
+    }, opts.flipDelay || 20);
+  });
+  const button = main.querySelector('.cal-att button');
+  if (opts.ambiguousButton) button.after(button.cloneNode(true));
+  if (opts.target) button.setAttribute('formtarget', opts.target);
+  if (opts.action) button.setAttribute('formaction', opts.action);
+  button.onclick = async () => {
+    window.clicks.push(selected);
+    if (opts.dialog && !confirm('confirm')) return;
+    await fetch('/submit', {method: 'POST', body: selected});
+    if (opts.noResult) return;
+    signed.add(selected);
+    render();
+    setTimeout(() => {
+      cards -= opts.delta ?? 1;
+      render();
+      if (opts.postBusy) main.setAttribute('aria-busy', 'true');
+    }, opts.stockDelay || 0);
+  };
+}
+setTimeout(() => { render(); main.removeAttribute('aria-busy'); }, opts.readyDelay || 0);
+</script>
