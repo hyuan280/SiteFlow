@@ -5,8 +5,9 @@ import json
 from functools import wraps
 
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import aliased
 
 from app.core.crypto import CryptoError
 from app.features.catalog import get_feature
@@ -259,6 +260,35 @@ class WorkflowHistoryMixin:
                 history_key=row.history_key, owner_type=row.owner_type, snapshot=json.loads(raw))
         except (CryptoError, ValueError, TypeError):
             raise WorkflowValidationError("历史配置无法安全读取") from None
+
+    @atomic_workflow_write
+    def delete_archived_version(self, history_key, revision):
+        from app.services.workflows import WorkflowConflictError, WorkflowNotFoundError
+
+        newer = aliased(WorkflowHistory)
+        condition = (WorkflowHistory.history_key == str(history_key), WorkflowHistory.revision == revision)
+        # Keep both the newest archive row and the actual live revision, even if they differ.
+        # These guards belong in DELETE, not a preflight read that can become stale.
+        result = self.session.execute(delete(WorkflowHistory).where(
+            *condition,
+            select(newer.id).where(
+                newer.history_key == WorkflowHistory.history_key,
+                newer.revision > WorkflowHistory.revision,
+            ).exists(),
+            ~select(Site.id).where(
+                Site.history_key == WorkflowHistory.history_key,
+                Site.config_revision == WorkflowHistory.revision,
+            ).exists(),
+            ~select(Template.id).where(
+                Template.history_key == WorkflowHistory.history_key,
+                Template.version == WorkflowHistory.revision,
+            ).exists(),
+        ).execution_options(synchronize_session=False))
+        if result.rowcount != 1:
+            if self.session.scalar(select(WorkflowHistory.id).where(*condition)) is None:
+                raise WorkflowNotFoundError("历史版本不存在")
+            raise WorkflowConflictError("不能删除最新历史版本或当前配置版本")
+        self.session.commit()
 
     @atomic_workflow_write
     def restore_version(self, owner_type, owner_id, revision, payload):

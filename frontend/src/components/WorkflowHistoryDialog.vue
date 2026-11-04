@@ -29,6 +29,7 @@ const pageSize = 20;
 const loading = ref(false);
 const snapshotLoading = ref(false);
 const restoring = ref(false);
+const deletingRevision = ref<number | null>(null);
 const error = ref("");
 const snapshotError = ref("");
 const restoreError = ref("");
@@ -37,6 +38,7 @@ let session = 0;
 let listRequest = 0;
 let detailRequest = 0;
 let restoreRequest = 0;
+let deleteRequest = 0;
 
 const title = computed(() => `${props.target?.name ?? ""} · 配置历史`);
 const canRestore = computed(() => Boolean(
@@ -46,7 +48,7 @@ const canRestore = computed(() => Boolean(
   snapshot.value.history_key === versions.value.history_key &&
   snapshot.value.owner_type === props.target.ownerType &&
   snapshot.value.operation !== "delete" &&
-  !loading.value && !snapshotLoading.value && !restoring.value,
+  !loading.value && !snapshotLoading.value && !restoring.value && deletingRevision.value === null,
 ));
 
 function basePath(target: WorkflowHistoryTarget): string {
@@ -93,6 +95,12 @@ async function loadVersions(): Promise<void> {
       error.value = "对象已替换，请关闭历史并刷新列表后重新打开";
       return;
     }
+    const lastPage = Math.max(1, Math.ceil(result.total / pageSize));
+    if (page.value > lastPage) {
+      page.value = lastPage;
+      await loadVersions();
+      return;
+    }
     versions.value = result;
   } catch (cause) {
     if (await handleUnauthorized(cause)) return;
@@ -104,13 +112,14 @@ async function loadVersions(): Promise<void> {
 }
 
 function changePage(value: number): void {
+  if (restoring.value || deletingRevision.value !== null) return;
   page.value = value;
   void loadVersions();
 }
 
 async function viewSnapshot(revision: number): Promise<void> {
   const target = props.target;
-  if (!props.modelValue || !target || !versions.value || loading.value || restoring.value) return;
+  if (!props.modelValue || !target || !versions.value || loading.value || restoring.value || deletingRevision.value !== null) return;
   clearSnapshot();
   const currentSession = session;
   const request = ++detailRequest;
@@ -185,6 +194,51 @@ async function restore(): Promise<void> {
   }
 }
 
+function canDelete(revision: number): boolean {
+  return Boolean(
+    props.modelValue && props.target?.historyKey && versions.value &&
+    versions.value.history_key === props.target.historyKey &&
+    revision < versions.value.current_revision &&
+    versions.value.items.some(item => item.revision === revision) &&
+    !loading.value && !snapshotLoading.value && !restoring.value && deletingRevision.value === null,
+  );
+}
+
+async function deleteVersion(revision: number): Promise<void> {
+  if (!canDelete(revision) || !props.target || !versions.value) return;
+  const target = { ...props.target };
+  const historyKey = versions.value.history_key;
+  const currentSession = session;
+  const request = ++deleteRequest;
+  deletingRevision.value = revision;
+  error.value = "";
+  try {
+    try {
+      await ElMessageBox.confirm(
+        `确认永久删除 ${target.name} 的 v${revision} 历史版本？删除后无法查看或恢复此快照，不影响当前配置和其他版本。`,
+        "删除版本",
+        { confirmButtonText: "确认删除", cancelButtonText: "取消", type: "warning" },
+      );
+    } catch {
+      return;
+    }
+    if (currentSession !== session || request !== deleteRequest) return;
+    await apiRequest<void>(`/workflow-history/${historyKey}/versions/${revision}`, { method: "DELETE" });
+    if (currentSession !== session || request !== deleteRequest) return;
+    ElMessage.success("已删除历史版本");
+    await loadVersions();
+  } catch (cause) {
+    if (await handleUnauthorized(cause)) return;
+    if (currentSession !== session || request !== deleteRequest) return;
+    const message = cause instanceof Error ? cause.message : "删除版本失败";
+    error.value = cause instanceof ApiError && cause.status === 409
+      ? `${message}。未自动重试；请刷新历史后重新确认。`
+      : message;
+  } finally {
+    if (currentSession === session && request === deleteRequest) deletingRevision.value = null;
+  }
+}
+
 function operationLabel(item: WorkflowVersionSummary): string {
   const labels = { baseline: "基线", create: "创建", update: "更新", restore: "恢复", delete: "删除" };
   return labels[item.operation];
@@ -195,6 +249,8 @@ watch(
   () => {
     session++;
     listRequest++;
+    deleteRequest++;
+    deletingRevision.value = null;
     clearSnapshot();
     versions.value = null;
     error.value = "";
@@ -208,6 +264,8 @@ watch(
 onBeforeUnmount(() => {
   session++;
   listRequest++;
+  deleteRequest++;
+  deletingRevision.value = null;
   clearSnapshot();
 });
 </script>
@@ -226,14 +284,14 @@ onBeforeUnmount(() => {
     />
     <div class="history-toolbar">
       <span class="muted">当前版本：{{ versions ? `v${versions.current_revision}` : "-" }}</span>
-      <el-button :loading="loading" :disabled="restoring" @click="loadVersions">刷新历史</el-button>
+      <el-button :loading="loading" :disabled="restoring || deletingRevision !== null" @click="loadVersions">刷新历史</el-button>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="notice" />
     <el-table :data="versions?.items ?? []" v-loading="loading" row-key="revision" max-height="300">
       <el-table-column label="版本" width="80">
         <template #default="{ row }">v{{ row.revision }}</template>
       </el-table-column>
-      <el-table-column label="操作" min-width="130">
+      <el-table-column label="操作类型" min-width="130">
         <template #default="{ row }">
           {{ operationLabel(row) }}
           <span v-if="row.restored_from_revision !== null">（来自 v{{ row.restored_from_revision }}）</span>
@@ -243,9 +301,10 @@ onBeforeUnmount(() => {
         <template #default="{ row }">{{ formatServerDateTime(row.created_at) }}</template>
       </el-table-column>
       <el-table-column prop="created_by" label="操作人" min-width="120" show-overflow-tooltip />
-      <el-table-column label="操作" width="100" fixed="right">
+      <el-table-column label="操作" width="190" fixed="right">
         <template #default="{ row }">
-          <el-button link type="primary" :disabled="loading || restoring" @click="viewSnapshot(row.revision)">查看快照</el-button>
+          <el-button link type="primary" :disabled="loading || restoring || deletingRevision !== null" @click="viewSnapshot(row.revision)">查看快照</el-button>
+          <el-button link type="danger" :disabled="!canDelete(row.revision)" :loading="deletingRevision === row.revision" :title="row.revision === versions?.current_revision ? '当前版本不可删除' : '永久删除此历史快照'" @click="deleteVersion(row.revision)">删除版本</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -253,7 +312,7 @@ onBeforeUnmount(() => {
       <el-pagination
         :current-page="page" :page-size="pageSize" :total="versions?.total ?? 0"
         layout="prev, pager, next" :pager-count="5" small
-        :disabled="loading || restoring" @current-change="changePage"
+        :disabled="loading || restoring || deletingRevision !== null" @current-change="changePage"
       />
     </div>
     <div v-loading="snapshotLoading" class="snapshot-panel">
@@ -273,7 +332,7 @@ onBeforeUnmount(() => {
             <pre class="config-preview">{{ JSON.stringify(snapshot.snapshot.resolved, null, 2) }}</pre>
           </el-tab-pane>
         </el-tabs>
-        <el-checkbox v-model="acceptCurrentDependencies" :disabled="restoring" class="dependency-choice">
+        <el-checkbox v-model="acceptCurrentDependencies" :disabled="restoring || deletingRevision !== null" class="dependency-choice">
           接受当前依赖（允许历史依赖漂移，使用当前模板及全局策略；缺失依赖或版本不兼容仍会拒绝）
         </el-checkbox>
         <el-alert v-if="restoreError" :title="restoreError" type="error" :closable="false" show-icon class="notice" />

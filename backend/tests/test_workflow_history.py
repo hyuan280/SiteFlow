@@ -7,14 +7,15 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect, select, text
+from sqlalchemy import delete, inspect, select, text, update
+from sqlalchemy.exc import OperationalError
 
 from app.core.crypto import CryptoError
 from app.core.schema_updates import ensure_workflow_history_keys
 from app.main import create_app
 from app.models.workflow import Site, SiteCredential, Template, WorkflowHistory, WorkflowStep
 from app.schemas.workflow import SiteWrite
-from app.services.workflows import WorkflowConflictError, WorkflowService
+from app.services.workflows import WorkflowConflictError, WorkflowNotFoundError, WorkflowService
 from tests.helpers import login_client
 
 
@@ -27,7 +28,7 @@ def create(client, kind="sites", **values):
 
 def history_bytes(client):
     with client.app.state.session_factory() as session:
-        return [(row.history_key, row.revision, row.ciphertext, row.nonce, row.content_hash)
+        return [(row.history_key, row.revision, row.ciphertext, row.nonce, row.content_hash, row.key_version)
                 for row in session.scalars(select(WorkflowHistory).order_by(WorkflowHistory.id))]
 
 
@@ -563,3 +564,194 @@ def test_reads_and_writes_do_not_silently_baseline(client):
     assert client.put(url, json=payload).status_code == 409
     assert client.delete(url).status_code == 409
     assert history_bytes(client) == []
+
+
+@pytest.mark.parametrize("kind,revision_field", [("sites", "config_revision"), ("templates", "version")])
+def test_delete_history_version_leaves_current_and_remaining_bytes_unchanged(client, kind, revision_field):
+    owner, payload = create(client, kind)
+    url = f"/api/v1/{kind}/{owner['id']}"
+    archive = f"/api/v1/workflow-history/{owner['history_key']}/versions"
+    for name in ("second", "third"):
+        assert client.put(url, json={**payload, "name": name}).status_code == 200
+    current = client.get(url).json()
+    before = history_bytes(client)
+    assert client.delete(f"{archive}/3").status_code == 409
+    assert history_bytes(client) == before
+    response = client.delete(f"{archive}/2")
+    assert response.status_code == 204 and response.content == b""
+    assert history_bytes(client) == [row for row in before if row[1] != 2]
+    assert client.get(url).json() == current
+    for prefix in (url, f"/api/v1/workflow-history/{owner['history_key']}"):
+        listing = client.get(f"{prefix}/versions").json()
+        assert listing["total"] == 2 and listing["current_revision"] == 3
+        assert [item["revision"] for item in listing["items"]] == [3, 1]
+        assert client.get(f"{prefix}/versions/2").status_code == 404
+    assert client.get(f"{archive}?limit=1&offset=1").json()["items"][0]["revision"] == 1
+    assert client.delete(f"{archive}/2").status_code == 404
+    assert client.delete(f"{archive}/999").status_code == 404
+    assert client.delete(f"/api/v1/workflow-history/{uuid4()}/versions/1").status_code == 404
+    assert client.post(f"{url}/versions/2/restore", json={"expected_revision": 3}).status_code == 404
+    assert client.get(url).json() == current
+    assert client.post(f"{url}/versions/1/restore", json={"expected_revision": 3}).status_code == 200
+    assert client.get(url).json()[revision_field] == 4
+    assert client.put(url, json={**payload, "expected_revision": 4}).status_code == 200
+    assert client.get(url).json()[revision_field] == 5
+    assert [item["revision"] for item in client.get(archive).json()["items"]] == [5, 4, 3, 1]
+    assert history_bytes(client)[:2] == [row for row in before if row[1] != 2]
+
+
+@pytest.mark.parametrize("kind", ["sites", "templates"])
+def test_delete_history_archive_preserves_terminal_and_reused_id(client, kind):
+    owner, _ = create(client, kind)
+    url = f"/api/v1/{kind}/{owner['id']}"
+    archive = f"/api/v1/workflow-history/{owner['history_key']}/versions"
+    before = history_bytes(client)
+    assert client.delete(f"{archive}/1").status_code == 409
+    assert history_bytes(client) == before
+    assert client.delete(url).status_code == 204
+    replacement, _ = create(client, kind, name="replacement")
+    assert replacement["id"] == owner["id"]
+    assert replacement["history_key"] != owner["history_key"]
+    current = client.get(url).json()
+    before = history_bytes(client)
+    assert client.delete(f"{archive}/2").status_code == 409
+    assert client.delete(f"{archive}/1").status_code == 204
+    assert history_bytes(client) == [row for row in before if not (row[0] == owner["history_key"] and row[1] == 1)]
+    listing = client.get(archive).json()
+    assert listing["total"] == 1 and listing["current_revision"] == 2
+    assert listing["items"][0]["operation"] == "delete"
+    assert client.delete(f"{archive}/2").status_code == 409
+    assert client.get(url).json() == current
+    assert client.get(f"{url}/versions/1").status_code == 200
+
+
+def test_delete_history_auth_csrf_and_path_validation(client, anon_client):
+    owner, payload = create(client)
+    assert client.put(f"/api/v1/sites/{owner['id']}", json=payload).status_code == 200
+    archive = f"/api/v1/workflow-history/{owner['history_key']}/versions"
+    before = history_bytes(client)
+    assert anon_client.delete(f"{archive}/1").status_code == 401
+    for revision in ("0", "-1", "abc", "1.5"):
+        assert client.delete(f"{archive}/{revision}").status_code == 422
+    assert client.delete("/api/v1/workflow-history/not-a-uuid/versions/1").status_code == 422
+    assert client.delete(f"{archive}/1", headers={"X-CSRF-Token": "invalid"}).status_code == 403
+    client.headers.pop("X-CSRF-Token")
+    assert client.delete(f"{archive}/1").status_code == 403
+    assert history_bytes(client) == before
+
+
+def test_delete_corrupt_history_requires_no_crypto(client, monkeypatch):
+    owner, payload = create(client)
+    url = f"/api/v1/sites/{owner['id']}"
+    assert client.put(url, json=payload).status_code == 200
+    app = client.app
+    with app.state.session_factory() as session:
+        first = session.scalar(select(WorkflowHistory).where(WorkflowHistory.revision == 1))
+        first.ciphertext = b"corrupt"
+        first.schema_version = 999
+        session.commit()
+    current = client.get(url).json()
+    before = history_bytes(client)
+
+    def broken(*args, **kwargs):
+        pytest.fail("history deletion must not encrypt or decrypt")
+
+    monkeypatch.setattr(app.state.crypto, "encrypt", broken)
+    monkeypatch.setattr(app.state.crypto, "decrypt", broken)
+    with app.state.session_factory() as session:
+        WorkflowService(session, app.state.settings, crypto=None).delete_archived_version(owner["history_key"], 1)
+    assert history_bytes(client) == before[1:]
+    assert client.get(url).json() == current
+
+
+@pytest.mark.parametrize("kind,model,revision_field", [("sites", Site, "config_revision"), ("templates", Template, "version")])
+def test_delete_history_protects_live_revision_even_with_newer_history(client, kind, model, revision_field):
+    owner, payload = create(client, kind)
+    url = f"/api/v1/{kind}/{owner['id']}"
+    assert client.put(url, json=payload).status_code == 200
+    # Simulate a live revision that differs from the newest stored snapshot.
+    with client.app.state.session_factory() as session:
+        session.execute(update(model).where(model.id == owner["id"]).values({revision_field: 1}))
+        session.commit()
+    before = history_bytes(client)
+    archive = f"/api/v1/workflow-history/{owner['history_key']}/versions"
+    assert client.delete(f"{archive}/1").status_code == 409
+    assert client.delete(f"{archive}/2").status_code == 409
+    assert history_bytes(client) == before
+    assert client.get(url).json()[revision_field] == 1
+
+
+@pytest.mark.parametrize("protection", ["newest", "live"])
+def test_delete_history_rechecks_protection_in_delete_statement(client, monkeypatch, protection):
+    owner, payload = create(client)
+    assert client.put(f"/api/v1/sites/{owner['id']}", json=payload).status_code == 200
+    app = client.app
+    with app.state.session_factory() as session:
+        service = WorkflowService(session, app.state.settings, app.state.crypto)
+        execute = session.execute
+
+        def race(statement, *args, **kwargs):
+            if getattr(statement, "is_delete", False):
+                # A separate writer changes protection after any preflight read.
+                with app.state.session_factory() as concurrent:
+                    if protection == "newest":
+                        concurrent.execute(delete(WorkflowHistory).where(WorkflowHistory.revision == 2))
+                    else:
+                        concurrent.execute(update(Site).where(Site.id == owner["id"]).values(config_revision=1))
+                    concurrent.commit()
+            return execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", race)
+        with pytest.raises(WorkflowConflictError):
+            service.delete_archived_version(owner["history_key"], 1)
+    assert history_bytes(client)[0][1] == 1
+
+
+@pytest.mark.parametrize("database_error", [False, True])
+def test_delete_history_commit_failure_rolls_back(client, monkeypatch, database_error):
+    owner, payload = create(client)
+    url = f"/api/v1/sites/{owner['id']}"
+    assert client.put(url, json=payload).status_code == 200
+    current = client.get(url).json()
+    before = history_bytes(client)
+    app = client.app
+    with app.state.session_factory() as session:
+        service = WorkflowService(session, app.state.settings, app.state.crypto)
+
+        def broken():
+            if database_error:
+                raise OperationalError("commit", {}, RuntimeError("database failure"))
+            raise RuntimeError("unexpected failure")
+
+        monkeypatch.setattr(session, "commit", broken)
+        with pytest.raises(WorkflowConflictError if database_error else RuntimeError):
+            service.delete_archived_version(owner["history_key"], 1)
+        assert session.scalar(select(WorkflowHistory.id).where(WorkflowHistory.revision == 1)) is not None
+    assert history_bytes(client) == before
+    assert client.get(url).json() == current
+
+
+def test_simultaneous_history_deletes_preserve_newest(client):
+    owner, payload = create(client)
+    url = f"/api/v1/sites/{owner['id']}"
+    for _ in range(2):
+        assert client.put(url, json=payload).status_code == 200
+    current = client.get(url).json()
+    before = history_bytes(client)
+    app = client.app
+
+    def remove(revision):
+        with app.state.session_factory() as session:
+            try:
+                WorkflowService(session, app.state.settings, app.state.crypto).delete_archived_version(
+                    owner["history_key"], revision)
+                return 204
+            except WorkflowNotFoundError:
+                return 404
+            except WorkflowConflictError:
+                return 409
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert sorted(pool.map(remove, [1, 1, 2, 3])) == [204, 204, 404, 409]
+    assert history_bytes(client) == before[2:]
+    assert client.get(url).json() == current

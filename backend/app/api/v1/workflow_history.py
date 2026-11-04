@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends, Query
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Path, Query, Response
 
 from app.api.v1.sites import _raise, get_service
-from app.api.deps import get_current_session
+from app.api.deps import get_current_session, require_csrf
 from app.schemas.workflow import WorkflowVersionDetail, WorkflowVersionList
-from app.services.workflows import WorkflowNotFoundError, WorkflowService, WorkflowValidationError
+from app.services.workflows import WorkflowConflictError, WorkflowNotFoundError, WorkflowService, WorkflowValidationError
 
 
 # SiteFlow currently has only authenticated administrators.
@@ -33,3 +35,17 @@ def get_archived_version(
         return service.get_archived_version(history_key, revision)
     except (WorkflowNotFoundError, WorkflowValidationError) as exc:
         _raise(exc)
+
+
+@router.delete("/{history_key}/versions/{revision}", status_code=204,
+               dependencies=[Depends(require_csrf)])
+def delete_archived_version(
+    history_key: UUID,
+    revision: int = Path(ge=1),
+    service: WorkflowService = Depends(get_service),
+) -> Response:
+    try:
+        service.delete_archived_version(str(history_key), revision)
+    except (WorkflowNotFoundError, WorkflowConflictError, WorkflowValidationError) as exc:
+        _raise(exc)
+    return Response(status_code=204)

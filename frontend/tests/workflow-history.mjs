@@ -6,7 +6,7 @@ import { createRenderer, reactive, nextTick, ref, ssrContextKey } from "vue";
 
 // Vite SSR loads the real SFC; a minimal renderer keeps its watchers/lifecycle live without a DOM.
 const source = await readFile(new URL("../src/components/WorkflowHistoryDialog.vue", import.meta.url), "utf8");
-const exposed = "loadVersions, changePage, viewSnapshot, restore, versions, snapshot, selectedRevision, page, loading, snapshotLoading, restoring, error, snapshotError, restoreError, acceptCurrentDependencies, canRestore";
+const exposed = "loadVersions, changePage, viewSnapshot, restore, deleteVersion, canDelete, deletingRevision, versions, snapshot, selectedRevision, page, loading, snapshotLoading, restoring, error, snapshotError, restoreError, acceptCurrentDependencies, canRestore";
 const server = await createServer({
   optimizeDeps: { noDiscovery: true, include: [] },
   server: { middlewareMode: true, hmr: false },
@@ -290,6 +290,114 @@ try {
   replacementList.resolve(list(1, "replacement-seven"));
   await tick();
   assert.equal(ui.versions.value.history_key, "replacement-seven");
+  const deletionList = ui.loadVersions();
+  requests.at(-1).resolve(list(5, "replacement-seven"));
+  await deletionList;
+  assert.equal(ui.canDelete(5), false, "current version is protected");
+  assert.equal(ui.canDelete(99), false, "unlisted revisions cannot be deleted");
+  assert.equal(ui.canDelete(2), true);
+  const deleteCount = requests.length;
+  await ui.deleteVersion(5);
+  assert.equal(requests.length, deleteCount);
+  const cancelDelete = ui.deleteVersion(2);
+  assert.match(confirmations.at(-1).message, /Template|New/);
+  assert.match(confirmations.at(-1).message, /v2.*无法查看或恢复.*不影响当前配置/);
+  assert.equal(requests.length, deleteCount, "deletion requires confirmation");
+  const confirmationCount = confirmations.length;
+  await ui.deleteVersion(3);
+  assert.equal(confirmations.length, confirmationCount, "duplicate deletion is blocked");
+  ui.changePage(2);
+  await ui.viewSnapshot(2);
+  await ui.restore();
+  assert.equal(requests.length, deleteCount, "other actions are blocked while deleting");
+  confirmations.at(-1).reject("cancel");
+  await cancelDelete;
+  assert.equal(ui.deletingRevision.value, null);
+
+  const beforeDeleteView = ui.viewSnapshot(2);
+  requests.at(-1).resolve(detail(2, "replacement-seven", "template"));
+  await beforeDeleteView;
+  const conflictDelete = ui.deleteVersion(2);
+  assert.equal(ui.canRestore.value, false, "restore is disabled during deletion");
+  confirmations.at(-1).resolve();
+  await tick();
+  assert.equal(requests.at(-1).url, "/workflow-history/replacement-seven/versions/2");
+  assert.equal(requests.at(-1).method, "DELETE");
+  const conflictCount = requests.length;
+  requests.at(-1).reject(new ApiError(409, "当前版本不可删除"));
+  await conflictDelete;
+  assert.equal(requests.length, conflictCount, "conflicts are never retried automatically");
+  assert.match(ui.error.value, /当前版本不可删除.*未自动重试/);
+  assert.equal(ui.snapshot.value.revision, 2, "failed deletion preserves snapshot");
+
+  const successfulDelete = ui.deleteVersion(2);
+  confirmations.at(-1).resolve();
+  await tick();
+  requests.at(-1).resolve();
+  await tick();
+  assert.equal(ui.snapshot.value, null, "deleted snapshot cannot remain restorable");
+  assert.equal(requests.at(-1).url, "/templates/7/versions?limit=20&offset=0");
+  requests.at(-1).resolve({ ...list(5, "replacement-seven"), total: 1, items: [summary(5)] });
+  await successfulDelete;
+  assert.equal(ui.deletingRevision.value, null);
+  assert.equal(ui.versions.value.total, 1);
+
+  // Removing the last item on a page must select the last remaining page.
+  ui.changePage(2);
+  requests.at(-1).resolve({ ...list(22, "replacement-seven"), total: 21, items: [summary(1)] });
+  await tick();
+  const lastPageDelete = ui.deleteVersion(1);
+  confirmations.at(-1).resolve();
+  await tick();
+  requests.at(-1).resolve();
+  await tick();
+  assert.equal(requests.at(-1).url, "/templates/7/versions?limit=20&offset=20");
+  requests.at(-1).resolve({ ...list(22, "replacement-seven"), total: 20, items: [] });
+  await tick();
+  assert.equal(ui.page.value, 1);
+  assert.equal(requests.at(-1).url, "/templates/7/versions?limit=20&offset=0");
+  requests.at(-1).resolve({ ...list(22, "replacement-seven"), total: 20 });
+  await lastPageDelete;
+
+  const unauthorizedDelete = ui.deleteVersion(2);
+  confirmations.at(-1).resolve();
+  await tick();
+  requests.at(-1).reject(new ApiError(401, "登录过期"));
+  await unauthorizedDelete;
+  assert.equal(cleared, 4, "deletion uses the shared auth handler");
+
+  const staleDeleteConfirmation = ui.deleteVersion(2);
+  const oldDeleteConfirm = confirmations.at(-1);
+  props.target = { ownerType: "site", id: 1, name: "One", historyKey: "site-one" };
+  const switchedDeleteCount = requests.length;
+  oldDeleteConfirm.resolve();
+  await staleDeleteConfirmation;
+  assert.equal(requests.length, switchedDeleteCount, "target change invalidates delete confirmation");
+  requests.at(-1).resolve(list());
+  await tick();
+  const lateDelete = ui.deleteVersion(2);
+  confirmations.at(-1).resolve();
+  await tick();
+  const deleteInFlight = requests.at(-1);
+  assert.equal(deleteInFlight.url, "/workflow-history/site-one/versions/2");
+  props.modelValue = false;
+  props.modelValue = true;
+  const reopenedList = requests.at(-1);
+  deleteInFlight.resolve();
+  await lateDelete;
+  assert.equal(requests.at(-1), reopenedList, "late delete cannot refresh a new dialog session");
+  assert.equal(ui.deletingRevision.value, null);
+  reopenedList.resolve(list());
+  await tick();
+  const closedDelete = ui.deleteVersion(2);
+  props.modelValue = false;
+  const closedDeleteCount = requests.length;
+  confirmations.at(-1).resolve();
+  await closedDelete;
+  assert.equal(requests.length, closedDeleteCount, "closing invalidates delete confirmation");
+  props.modelValue = true;
+  requests.at(-1).resolve(list());
+  await tick();
   const beforeMissingIdentity = requests.length;
   props.target = { ...props.target, historyKey: "" };
   await tick();
@@ -314,6 +422,9 @@ try {
   assert.doesNotMatch(source, /已脱敏/);
   assert.match(source, /96vw/);
   assert.match(source, /white-space: normal/);
+  assert.match(source, /label="操作类型"/);
+  assert.equal((source.match(/label="操作"/g) ?? []).length, 1);
+  assert.match(source, /查看快照<\/el-button>\s*<el-button[^>]*type="danger"[^>]*>删除版本<\/el-button>/);
 
   // Follow the repo's AST-based tests to exercise real view functions without router/DOM setup.
   const importUtils = await server.ssrLoadModule("/src/utils/exportFile.ts");
