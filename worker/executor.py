@@ -24,6 +24,7 @@ from worker.cfbox_response import resolve_cfbox_prediction
 
 WAIT_UNTIL = {"domcontentloaded", "load", "networkidle"}
 SYSTEM_RESIGN_SIGNAL_KEY = "sys_resign_pending"
+CHECKPOINT_RESIGN_FEATURES = frozenset({"post.resign_click", "post.resign_dialog"})
 PAGE_TIMEOUT_MS = 30000
 SELECTOR_WAIT_MS = 10000
 SIGNAL_WAIT_MS = 3000
@@ -4511,8 +4512,11 @@ async def _run_step(
             note,
         )
 
-    if feature == "post.resign_click":
-        from worker.resign_click import run_resign_click
+    if feature in CHECKPOINT_RESIGN_FEATURES:
+        if feature == "post.resign_dialog":
+            from worker.resign_dialog import run_resign_dialog as run_resign
+        else:
+            from worker.resign_click import run_resign_click as run_resign
         from worker.resign_checkpoint import make_resign_checkpoint, ResignCheckpointError
         payload = secret_payload or {}
         try:
@@ -4520,7 +4524,7 @@ async def _run_step(
         except ResignCheckpointError:
             # Let the runner return its complete fail-closed result before any navigation.
             durable_progress = None
-        return await run_resign_click(
+        return await run_resign(
             page, config, list(resign_pending_dates or []), note,
             today=payload.get("resign_today"),
             unresolved=payload.get("resign_unresolved_dates"),
@@ -4562,7 +4566,7 @@ async def execute_job(
 
         async def track_progress(progress: dict[str, Any]) -> None:
             nonlocal last_progress
-            if any(row.get("feature_type") == "post.resign_click" and
+            if any(row.get("feature_type") in CHECKPOINT_RESIGN_FEATURES and
                    isinstance(row.get("data", {}).get("resign"), dict)
                    for row in progress.get("steps", [])):
                 last_progress = copy.deepcopy(progress)
@@ -4828,6 +4832,9 @@ async def _execute_admitted_job(
                     elif feature_type == "post.resign_click":
                         from worker.resign_click import resign_click_timeout
                         timeout = resign_click_timeout(step.get("config") or {}, pending_dates)
+                    elif feature_type == "post.resign_dialog":
+                        from worker.resign_dialog import resign_dialog_timeout
+                        timeout = resign_dialog_timeout(step.get("config") or {}, pending_dates)
                     elif feature_type == "challenge.grid_captcha":
                         grid_config = step.get("config") or {}
                         refreshes = max(0, min(int(grid_config.get("max_refresh", 3)), 10))
@@ -4905,21 +4912,21 @@ async def _execute_admitted_job(
                             job_artifacts,
                             payload,
                             **({"resign_progress": resign_progress}
-                               if step.get("feature_type") == "post.resign_click" else {}),
+                               if step.get("feature_type") in CHECKPOINT_RESIGN_FEATURES else {}),
                         ),
                         timeout=max(1, int(timeout)),
                     )
                 except asyncio.TimeoutError:
                     status = ("unknown" if assistant_side_effect else
-                              "waiting_human" if feature in {"post.buy_card", "post.resign_click"} else "fail")
+                              "waiting_human" if feature in {"post.buy_card", *CHECKPOINT_RESIGN_FEATURES} else "fail")
                     message = f"步骤超时（{timeout}s）"
-                    data = {**(results[-1].get("data", {}) if feature == "post.resign_click" else {}),
+                    data = {**(results[-1].get("data", {}) if feature in CHECKPOINT_RESIGN_FEATURES else {}),
                             "reason": "outcome_uncertain" if assistant_side_effect else "execution_timeout",
                             "stage": "step_execution"}
                     if assistant_side_effect:
                         data["cause"] = "execution_timeout"
                 except asyncio.CancelledError:
-                    partial = results[-1].get("data", {}) if step.get("feature_type") == "post.resign_click" else {}
+                    partial = results[-1].get("data", {}) if feature in CHECKPOINT_RESIGN_FEATURES else {}
                     job_status = "waiting_human" if "resign" in partial else "canceled"
                     results[-1] = _step_result(step, job_status, "已取消", started=started, data=partial)
                     job_message = "执行已取消"
@@ -4942,7 +4949,7 @@ async def _execute_admitted_job(
                         if not assistant_side_effect:
                             data["reason"] = "input_validation_failed"
                         data["field"] = exc.field
-                if feature == "post.resign_click":
+                if feature in CHECKPOINT_RESIGN_FEATURES:
                     partial = results[-1].get("data", {})
                     if "resign" not in data and "resign" in partial:
                         data = {**data, "resign": partial["resign"]}

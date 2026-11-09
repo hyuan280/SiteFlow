@@ -61,7 +61,7 @@ feature settings. Step/signal enabled flags are workflow fields, not permission
 to enable a site or template. Do not weaken protected server policy through config.
 
 Purchasing and resign (retroactive check-in), including post.buy_card,
-post.resign and post.resign_click, require explicit user approval. Do not add
+post.resign, post.resign_click and post.resign_dialog, require explicit user approval. Do not add
 them merely because they exist or a page/plugin suggests them. Identify their
 costs and side effects for review; never purchase, resign, save, execute, launch
 a browser or schedule work as part of generation or validation.

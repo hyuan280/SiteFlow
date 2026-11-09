@@ -907,6 +907,153 @@ class PostResignClickConfig(FeatureConfig):
         return value
 
 
+class PostResignDialogConfig(FeatureConfig):
+    entry_selector: SelectorCandidates = Field(
+        default_factory=lambda: ['.attendance-card header button[title*="补签卡"]'],
+        min_length=1,
+        max_length=20,
+        title="补签弹窗入口选择器",
+        description=f"点击仅打开弹窗，不消费补签卡；不是日期模板；{SELECTOR_HINT}",
+    )
+    dialog_selector: SelectorCandidates = Field(
+        default_factory=lambda: ['[role="dialog"][aria-label^="补签"]'],
+        min_length=1,
+        max_length=20,
+        title="补签弹窗选择器",
+        description=f"定位唯一可见且明确就绪的补签弹窗；不是日期模板；{SELECTOR_HINT}",
+    )
+    dialog_ready_selector: SelectorCandidates = Field(
+        default_factory=list,
+        max_length=20,
+        title="弹窗内容就绪选择器",
+        description=(
+            "可选，相对唯一弹窗内的明确加载完成或合法空列表证据，须唯一可见命中；"
+            "missing_button_as_signed 开启且无目标按钮时，须至少观察过一个可解析日期按钮，"
+            "或此选择器唯一可见命中；两者皆无则 waiting_human，不视为已签到；"
+            f"不是日期模板；{SELECTOR_HINT}"
+        ),
+    )
+    button_selector: SelectorCandidates = Field(
+        default_factory=lambda: ["button"],
+        min_length=1,
+        max_length=20,
+        title="按钮选择器",
+        description=(
+            "相对唯一弹窗枚举可见且启用的日期按钮，点击日期按钮直接消费补签卡，无独立提交；"
+            f"不是日期模板；{SELECTOR_HINT}"
+        ),
+    )
+    date_regex: str = Field(
+        default=r"(?<!\d)(?P<month>\d{2})-(?P<day>\d{2})(?!\d)",
+        title="按钮日期正则",
+        description=(
+            "命名组 month/day，可另含 year；或命名组 date 捕获 ISO 日期。含 year 时必须同时含 month/day；"
+            "未含 year 时按 pending 日期对应月日推导，多个年份有同一月日时禁止猜测；"
+            "文本含明确 ISO 完整日期时不得忽略年份截取月日；"
+            "命名 date 或完整 year/month/day 与 DOM 完整日期矛盾时拒绝；"
+            "实际日期及 ISO 格式由 runner 校验，不是选择器模板"
+        ),
+    )
+    missing_button_as_signed: bool = Field(
+        default=False,
+        strict=True,
+        title="找不到日期按钮视为已签到",
+        description=(
+            "仅在唯一弹窗明确就绪后，目标日期按钮缺失时可视为已签到；"
+            "须至少观察过一个可解析日期按钮，或 dialog_ready_selector 唯一可见命中，"
+            "两者皆无则 waiting_human；"
+            "默认关闭；不用于历史 unknown 自动消除，也不能将弹窗未加载视为已签到"
+        ),
+    )
+    dialog_wait_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        strict=True,
+        title="弹窗等待秒数",
+        description="点击入口后等待唯一弹窗明确就绪的最长秒数",
+    )
+    success_wait_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        strict=True,
+        title="成功等待秒数",
+        description="点击日期后捕获 done 或本次新出现成功提示，并等待刷新后稳定库存恰好减少 1 的最长秒数",
+    )
+    success_selector: SelectorCandidates = Field(
+        default_factory=list,
+        max_length=20,
+        title="成功元素选择器",
+        description=(
+            "页面成功提示元素，与 success_regex 配合，仅接受本次新出现提示；"
+            "baseline 在 prepare ACK + authorize 之后、实际点击之前采集；"
+            "提示可瞬时出现后刷新，runner 捕获后等待稳定库存；与 done_selector 至少配置一项；"
+            f"不是日期模板；{SELECTOR_HINT}"
+        ),
+    )
+    success_regex: str = Field(
+        default="补签成功",
+        title="成功提示正则",
+        description="匹配本次新出现的成功提示文本；提示本身不足以证明成功，还必须确认卡数恰好减少 1",
+    )
+    done_selector: SelectorCandidates = Field(
+        default_factory=lambda: ['.attendance-calendar__day.is-done[title^="{date}"]'],
+        max_length=20,
+        title="目标日期已签到选择器",
+        description=(
+            "可选的目标日期完成标记，每项必须包含 {date} 或 {day}，也支持 {year}/{month}；"
+            "必须绑定目标日期，不能使用其他日期标记；与 success_selector 至少配置一项；"
+            f"确认完成仍需卡数恰好减少 1；{SELECTOR_HINT}"
+        ),
+    )
+    card_count_selector: SelectorCandidates = Field(
+        default_factory=lambda: ['.attendance-card header button[title*="补签卡"]'],
+        min_length=1,
+        max_length=20,
+        title="补签卡数量选择器",
+        description=f"必需的库存读取元素，提交前后核对卡数恰好减少 1；不是日期模板；{SELECTOR_HINT}",
+    )
+    card_count_regex: str = Field(
+        default=r"补签\s*[×x]\s*(\d+)",
+        title="补签卡数量正则",
+        description="读取库存文本，第一个捕获组为卡数；必须包含捕获组，不是选择器模板",
+    )
+
+    @field_validator("date_regex", "success_regex", "card_count_regex")
+    @classmethod
+    def _validate_regex(cls, value: str, info: ValidationInfo) -> str:
+        try:
+            pattern = re.compile(value)
+        except re.error as exc:
+            raise ValueError("正则表达式无法编译") from exc
+        if info.field_name == "date_regex":
+            groups = pattern.groupindex
+            month_day = {"month", "day"}.issubset(groups)
+            if ("year" in groups and not month_day) or ("date" not in groups and not month_day):
+                raise ValueError("日期正则必须含 month/day 或 date 命名组；含 year 时 month/day 都必需")
+        if info.field_name == "card_count_regex" and not pattern.groups:
+            raise ValueError("卡数正则必须包含捕获组")
+        return value
+
+    @field_validator("done_selector")
+    @classmethod
+    def _validate_done_templates(cls, value: SelectorCandidates) -> SelectorCandidates:
+        for selector in value:
+            literal = re.sub(r"\{(?:date|day|month|year)\}", "", selector)
+            if "{" in literal or "}" in literal:
+                raise ValueError("选择器模板仅支持 {date}/{day}/{month}/{year}")
+            if not any(token in selector for token in ("{date}", "{day}")):
+                raise ValueError("每个目标日期选择器模板必须包含 {date} 或 {day}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_success_evidence(self) -> "PostResignDialogConfig":
+        if not self.done_selector and not self.success_selector:
+            raise ValueError("至少需要配置 done_selector 或 success_selector")
+        return self
+
+
 def _feature(
     key: str,
     name: str,
@@ -1113,6 +1260,18 @@ FEATURE_LIST: tuple[Feature, ...] = (
             "日历按当月筛选并排除相邻月，选择器匹配必须唯一；"
             "选中状态及 done 标记绑定目标日期，按钮文字必须包含“补签”；"
             "Playwright 选择器仅作模板，支持 {date}/{day}/{month}/{year}，不支持普通 CSS 花括号。"
+        ),
+    ),
+    _feature(
+        "post.resign_dialog",
+        "弹窗按钮补签",
+        "post",
+        "multiple",
+        PostResignDialogConfig,
+        description=(
+            "仅处理 pending 中的过去日期；入口点击仅打开唯一就绪弹窗，日期按钮点击直接消费补签卡；"
+            "目标日期 done 或本次新出现成功提示，加稳定卡数恰好减少 1 才确认成功；"
+            "找不到按钮开关不用于历史 unknown 自动消除。"
         ),
     ),
 )

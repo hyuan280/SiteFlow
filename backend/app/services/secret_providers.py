@@ -20,6 +20,7 @@ from app.services.bitwarden import BitwardenService
 from app.services.credentials import CredentialService
 from app.services.integrations import IntegrationService
 from app.services.plugin_audit import record
+from app.services.resign import CHECKPOINT_RESIGN_FEATURES
 
 logger = logging.getLogger("siteflow.secrets")
 CREDENTIAL_PURPOSES = frozenset({"auth.form_login", "auth.password_verify"})
@@ -86,7 +87,7 @@ class SecretProviders:
         allowed = {}
         resign_steps = set()
         for step in steps:
-            if step.enabled and step.feature_type == "post.resign_click":
+            if step.enabled and step.feature_type in CHECKPOINT_RESIGN_FEATURES:
                 resign_steps.add(step.step_key)
             if step.enabled and step.feature_type in SECRET_PURPOSES:
                 provider = step_provider(site, step)

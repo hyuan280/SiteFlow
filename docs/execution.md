@@ -91,6 +91,7 @@ sign.button / sign.iframe.image_captcha / sign.image_quiz / sign.unit3d_claim
 post.buy_card
 post.resign
 post.resign_click
+post.resign_dialog
 ```
 
 - `flow.open`、`action.navigate`：导航完成后检测页面标题和正文中的错误页特征，例如 Bad Gateway、Service Unavailable、502/503/522、Internal Server Error、404、网站维护/正在维护/关闭维护、The website has been stopped 等，即使 HTTP 返回 200 也会检测。`flow.open` 的网络异常和错误页共用 `retry_count` 次额外重试（总尝试次数为 `1 + retry_count`）；错误页重试临时禁用当前任务标签页的缓存，强制重新访问原目标地址，不因 URL 相同而跳过，步骤结束后恢复缓存。不会清除 Cookie 或整个 profile 的缓存。`retry_count=0` 不额外重试。次数耗尽仍是错误页时返回 `fail` 和 `error_page` 数据，随后按该步骤的错误策略 `stop`/`continue`/`defer`/`escalate_interaction` 处理。
@@ -112,6 +113,7 @@ post.resign_click
 - `post.buy_card`：通过商品范围内的页面元素购买，不再构造 POST。`purchase_quantity=0` 按待补签日期减去已有卡数补足，正数固定购买 N 张（范围 1 到 365），不要求待补签日期非空。支持 table/grid/custom 布局、商品/标题/价格候选选择器及魔力值读取；`purchase_clicks` 按列表顺序执行，每项使用 product/page 范围内首个可用候选，点击发出后不切换候选重试。`quantity_selectors` 为空时逐张购买；配置后在唯一商品内填写批量数量，取目标剩余、余额可负担数与输入框 max 的最小值，并按 min/step 向下取合法正整数。使用真实 fill/Tab 处理常见失焦行为，实际点击前重读数量、单张报价与余额，变化或失效时停止。每轮必须核验卡数恰好增加本轮 N 张；独立库存页在提交结束后有界重新 GET 核验。原生弹窗拒绝、数量异常或结果不明返回 `waiting_human`，即使 `on_error=continue` 也停止。已发起购买后禁止任务自动重启、转车道重跑及回跳重购。旧 option/action/submit 请求字段保留但忽略。
 - `post.resign`：读取待补签日期，检查 NexusPHP FullCalendar 日历，翻月定位漏签日期，通过 `ajax.php` 的 `attendanceRetroactive` 执行补签；不负责买卡。
 - `post.resign_click`（页面点击补签）：独立的页面交互功能，不修改旧 `post.resign` 的配置或提交方式。仅处理 API 下发的过去待补签日期；确认月份，唯一定位当月目标日期，点击后确认目标 selected，再点击文字明确包含“补签/補簽”的按钮。日期定位、选中确认及 done 标记必须绑定 `{date}` 或 `{day}`，支持 `{year}/{month}`；`{day}` 仅在目标月已确认且排除相邻月时使用。只在目标日期 done 出现且补签卡恰好减少 1 时确认成功。
+- `post.resign_dialog`（弹窗按钮补签）：在当前页面点击入口并等待唯一弹窗，按配置的正则提取按钮日期，只点击 pending 对应的唯一过去日期。日期点击前完成持久化预留；支持成功提示短暂出现后刷新，必须同时核验目标 done 或本次新提示及卡数恰好减少 1。可配置按钮缺失时记为已签到，但须有日期列表就绪证据，推断结果不能覆盖已有 unknown；历史 unknown 仍只接受日期绑定的 done。每次提交最多点击一次，刷新后可重新打开弹窗处理下一日期，不自动重放消费。字段及配置示例见[使用指南](usage.md#弹窗按钮补签)。
 - 页面补签每次提交前调用内部持久化检查点接口，以任务级 token 原子预留 `(site_id, date)`，事务提交并收到 ACK 后才点击。已有未决或终态日期不能重复预留，排队旧任务也不能绕过；页面确认后再次持久化确认。原生弹窗默认拒绝，跨源/新窗口/日期歧义/结果不明时转人工，不被 `on_error=continue` 放行。取消或断连保留已确认部分结果；后续任务对未决日期先只读检查 done，没有明确完成标记则停止，不再消费卡片。预留 ACK 丢失时可能保留“未点击但未决”的保守记录，需要人工核验；这不是远端事务或 exactly-once 保证。
 - 待补签日期由 API 按站点「支持补签最大天数」生成并注入 worker：从该站点最早有运行记录的日期开始，窗口内没有成功运行或成功补签记录的日期都算缺失；今天等当日结束后再判定。补签结果写入 `site_resign_records`，同时合并到状态矩阵和趋势。
 - 站点 Cookie 由系统主动维护：任务开始前注入，站点任务成功后从浏览器导出当前站点 Cookie 并加密更新；失败时保留原配置。

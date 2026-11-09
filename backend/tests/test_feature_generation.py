@@ -14,7 +14,7 @@ from app.schemas.workflow import FeatureView
 
 def test_all_builtins_have_reviewed_generation_metadata():
     assert set(GENERATION_HINTS) == set(FEATURES)
-    assert len(FEATURE_LIST) == 22
+    assert len(FEATURE_LIST) == 23
     for feature in FEATURE_LIST:
         hints = feature.generation_hints
         assert isinstance(hints, GenerationHints), feature.key
@@ -56,6 +56,17 @@ def test_sensitive_hints_cover_security_and_result_semantics():
     resign = FEATURES["post.resign_click"].generation_hints
     assert "pending" in " ".join(resign.prerequisites)
     assert "过去日期" in " ".join(resign.prerequisites)
+    dialog = FEATURES["post.resign_dialog"].generation_hints
+    assert "直接消费" in dialog.when_to_use
+    assert "pending" in " ".join(dialog.prerequisites)
+    for text in ("明确就绪", "unknown", "卡数", "不做模板"):
+        assert text in " ".join(dialog.avoid)
+    for text in ("fullmatch", "多个 year", "新出现", "稳定库存", "至少一项"):
+        assert text in " ".join(dialog.evidence_required)
+    for text in ("dialog_ready_selector", "可解析日期按钮", "合法空列表", "waiting_human",
+                 "不得忽略年份截取月日", "DOM 完整日期矛盾时拒绝",
+                 "baseline 在 prepare ACK + authorize 之后、实际点击之前"):
+        assert text in " ".join(dialog.evidence_required)
     result = FEATURES["flow.result"].generation_hints
     assert "最终有效结果为 false 表示任务失败并结束任务" in " ".join(result.avoid)
     assert "改为 true" in " ".join(result.avoid)

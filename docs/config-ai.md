@@ -23,7 +23,7 @@ available; removing the UI does not remove assistant capabilities.
 In this endpoint there is no persisted chat, existing-site or template editing,
 template inheritance, public standalone tool dispatcher, MCP server, saving,
 scheduling, browser interaction or workflow execution. Plugin features, aliases,
-`post.*` and `action.fill` are blocked even when explicitly selected. The generic
+`post.*` (including `post.resign_dialog`) and `action.fill` are blocked even when explicitly selected. The generic
 guide and schemas also describe inheritance and editing semantics for future
 integrations; those descriptions do not enable them in this endpoint.
 

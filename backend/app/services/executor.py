@@ -21,7 +21,7 @@ from app.services.execution import ExecutionService, FINAL_JOB_STATUSES, FINAL_R
 from app.services.integrations import IntegrationService
 from app.services.notifications import NotificationService
 from app.services.plugin_runtime import PluginRuntimeError, PluginRuntimeService
-from app.services.resign import ResignService
+from app.services.resign import CHECKPOINT_RESIGN_FEATURES, ResignService
 from app.services.secret_providers import SECRET_PURPOSES, SecretProviders, step_provider
 from app.services.workflows import WorkflowError, WorkflowService
 
@@ -217,12 +217,12 @@ class ExecutionManager:
 
     @staticmethod
     def _merge_resign_checkpoints(session, job: SiteJob, step_rows: list[Any]) -> list[Any]:
-        # Only the click feature carries checkpoints that must survive incomplete snapshots.
+        # Only checkpointed features preserve evidence across incomplete snapshots.
         rows = list(step_rows)
         for saved in session.scalars(
             select(JobStep).where(
                 JobStep.site_job_id == job.id,
-                JobStep.feature_type == "post.resign_click",
+                JobStep.feature_type.in_(CHECKPOINT_RESIGN_FEATURES),
             ).order_by(JobStep.id)
         ):
             data = json.loads(saved.data_json)
@@ -232,7 +232,7 @@ class ExecutionManager:
             index = next((
                 i for i, row in enumerate(rows)
                 if isinstance(row, dict) and row.get("step_key") == saved.step_key
-                and row.get("feature_type") == "post.resign_click"
+                and row.get("feature_type") == saved.feature_type
             ), None)
             if index is None:
                 rows.append({
@@ -254,7 +254,7 @@ class ExecutionManager:
             merged["submit_attempted"] = bool(
                 previous.get("submit_attempted") or current.get("submit_attempted")
             )
-            for key in ("success", "already_signed", "unconfirmed"):
+            for key in ("success", "already_signed", "unconfirmed", "inferred_signed"):
                 entries = []
                 for item in (previous.get(key) or []) + (current.get(key) or []):
                     if item not in entries:
@@ -263,7 +263,7 @@ class ExecutionManager:
                     merged[key] = entries
             rows[index] = {**rows[index], "data": {**data, **current_data, "resign": merged}}
         for index, row in enumerate(rows):
-            if not isinstance(row, dict) or row.get("feature_type") != "post.resign_click":
+            if not isinstance(row, dict) or row.get("feature_type") not in CHECKPOINT_RESIGN_FEATURES:
                 continue
             data = row.get("data")
             merged = data.get("resign") if isinstance(data, dict) else None
@@ -306,7 +306,7 @@ class ExecutionManager:
             )
             if (
                 not allow_running and raw_status == "running"
-                and item.get("feature_type") == "post.resign_click"
+                and item.get("feature_type") in CHECKPOINT_RESIGN_FEATURES
             ):
                 status = "waiting_human"
             session.add(
@@ -383,14 +383,14 @@ class ExecutionManager:
             self._save_steps(session, job, step_rows, allow_running=True)
             resign_service = ResignService(session, self.settings)
             for row in step_rows:
-                if not isinstance(row, dict) or row.get("feature_type") != "post.resign_click":
+                if not isinstance(row, dict) or row.get("feature_type") not in CHECKPOINT_RESIGN_FEATURES:
                     continue
                 data = row.get("data")
                 resign_result = data.get("resign") if isinstance(data, dict) else None
                 if isinstance(resign_result, dict):
                     resign_service.record_results(
                         job.site_id, job.run_id, job.id, resign_result,
-                        feature_type="post.resign_click",
+                        feature_type=row["feature_type"],
                     )
             if "artifacts" in event:
                 self._save_artifacts(session, job, event.get("artifacts"))
@@ -659,7 +659,7 @@ class ExecutionManager:
                 result = {**result, "status": "waiting_human",
                           "message": "本任务已发起购卡点击，禁止自动重跑以避免重复购买，请人工核验"}
             elif resign_reserved or any(
-                isinstance(row, dict) and row.get("feature_type") == "post.resign_click"
+                isinstance(row, dict) and row.get("feature_type") in CHECKPOINT_RESIGN_FEATURES
                 and isinstance(row.get("data"), dict)
                 and isinstance(row["data"].get("resign"), dict)
                 and (row["data"]["resign"].get("submit_attempted")
@@ -754,7 +754,7 @@ class ExecutionManager:
             resign_service = ResignService(session, self.settings)
             for row in step_rows:
                 if not isinstance(row, dict) or row.get("feature_type") not in {
-                    "post.resign", "post.resign_click",
+                    "post.resign", *CHECKPOINT_RESIGN_FEATURES,
                 }:
                     continue
                 data = row.get("data")

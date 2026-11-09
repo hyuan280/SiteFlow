@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Isolated Resign Dialog</title>
+<style>.dates { min-height: 1px; }</style>
+<main class="attendance-card">
+  <header><button title="补签卡">补签 x FIXTURE_CARDS</button></header>
+  <section class="attendance-calendar">FIXTURE_DONE</section>
+  <div id="dialog-host"></div>
+</main>
+<script>
+const opts = FIXTURE_OPTIONS;
+const buttons = FIXTURE_BUTTONS;
+const pageLoad = FIXTURE_LOAD;
+window.clicks = [];
+const host = document.querySelector('#dialog-host');
+const entry = document.querySelector('header button');
+if (opts.entryAction) entry.setAttribute('formaction', opts.entryAction);
+entry.onclick = async () => {
+  await fetch('/opened', {method: 'POST'});
+  if (opts.entryPopup || (opts.entryPopupOnReload && pageLoad === 2)) {
+    window.popupAttempted = true;
+    window.popupBlocked = window.open(opts.entryPopup || opts.entryPopupOnReload, '_blank') === null;
+    if (opts.entryPopup) return;
+  }
+  if (opts.noDialog) return;
+  setTimeout(() => {
+    host.innerHTML = '<section role="dialog" aria-label="补签日期"><p class="message"></p>' +
+      '<div class="dates"></div><button class="close">Close</button></section>';
+    const dialog = host.firstElementChild;
+    dialog.querySelector('.close').onclick = () => host.replaceChildren();
+    if (opts.staleToast) dialog.querySelector('.message').textContent = '补签成功';
+    if (opts.busy || opts.loadingForever) dialog.setAttribute('aria-busy', 'true');
+    if (opts.loadingForever) return;
+    if (opts.listError) {
+      dialog.querySelector('.dates').textContent = 'Date list failed to load';
+      dialog.removeAttribute('aria-busy');
+      return;
+    }
+    setTimeout(() => {
+      for (const spec of buttons) {
+        const button = document.createElement('button');
+        button.className = 'date';
+        if (spec.dataDate !== null) button.dataset.date = spec.dataDate ?? spec.date;
+        button.textContent = spec.label ?? `补签 ${spec.date.slice(5)}`;
+        button.disabled = !!spec.disabled;
+        button.hidden = !!spec.hidden;
+        if (spec.action) button.setAttribute('formaction', spec.action);
+        if (spec.target) button.setAttribute('formtarget', spec.target);
+        button.onclick = async () => {
+          window.clicks.push(spec.date);
+          if (opts.nativeConfirm && !confirm('Submit resign?')) return;
+          await fetch('/submit', {method: 'POST', body: spec.date});
+          if (opts.noResult) return;
+          if (opts.toast) dialog.querySelector('.message').textContent = '补签成功';
+          // Show a transient success message, then reload with server state.
+          setTimeout(() => location.reload(), opts.reloadDelay ?? 800);
+        };
+        dialog.querySelector('.dates').append(button);
+      }
+      dialog.querySelector('.dates').dataset.ready = 'true';
+      dialog.removeAttribute('aria-busy');
+    }, opts.buttonsDelay ?? 0);
+  }, opts.dialogDelay ?? 0);
+};
+</script>

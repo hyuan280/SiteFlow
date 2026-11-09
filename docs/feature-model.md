@@ -20,7 +20,7 @@ auth      表单登录
 challenge 两步验证 / Turnstile / ALTCHA / 滑块 / 图形验证码 / 问答 / 识图 / UNIT3D Claim
 sign      直接导航 / 按钮 / 链接 / iframe 图像验证码签到
 action    导航 / 点击 / 填表 / 等待（通用低代码块）
-post      补签 / 购买补签卡
+post      补签 / 页面点击补签 / 弹窗按钮补签 / 购买补签卡
 ```
 
 ## 3. 插件协议

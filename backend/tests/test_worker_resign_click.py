@@ -7,8 +7,8 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import httpx
@@ -339,7 +339,7 @@ def worker_run(monkeypatch, tmp_path):
     monkeypatch.setattr(executor.JobArtifacts, "capture_failure", AsyncMock())
     monkeypatch.setattr(executor, "_export_site_cookies", AsyncMock(return_value=[]))
 
-    async def execute(steps, run_step, cancel=None, disconnect=False, task_cancel=False):
+    async def execute(steps, run_step, cancel=None, disconnect=False, task_cancel=False, assistant=False):
         monkeypatch.setattr(executor, "_run_step", run_step)
         lane = _JumpLane(_JumpPage())
         lane.session = SimpleNamespace(disconnected=False, desktop=None)
@@ -357,7 +357,9 @@ def worker_run(monkeypatch, tmp_path):
                 canceled = True
                 task.cancel()
 
-        task = asyncio.create_task(executor.execute_job(manager, {"job_id": 1, "steps": steps}, cancel, progress))
+        task = asyncio.create_task(executor.execute_job(
+            manager, {"job_id": 1, "steps": steps, "assistant_run": assistant}, cancel, progress,
+        ))
         result = await task
         assert manager.released
         return result, snapshots
@@ -366,11 +368,14 @@ def worker_run(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("reason", ["cancel", "disconnect", "timeout", "task"])
-def test_executor_preserves_partial_checkpoint(worker_run, reason):
+@pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_executor_preserves_partial_checkpoint(worker_run, reason, feature, confirmed):
     async def check():
         cancel = asyncio.Event()
-        state = {"pending": [DATE], "success": [{"date": DATE, "message": "confirmed"}],
-                 "submit_attempted": True, "unconfirmed": []}
+        state = {"pending": [DATE],
+                 "success": [{"date": DATE, "message": "confirmed"}] if confirmed else [],
+                 "submit_attempted": True, "unconfirmed": [] if confirmed else [{"date": DATE}]}
 
         async def run_step(_page, _step, *_args, resign_progress=None, **_kwargs):
             await resign_progress({"resign": state})
@@ -379,7 +384,7 @@ def test_executor_preserves_partial_checkpoint(worker_run, reason):
             await asyncio.Event().wait()
 
         result, snapshots = await worker_run(
-            [step("resign", "post.resign_click", timeout_seconds=1, on_error="continue"), step("tail")],
+            [step("resign", feature, timeout_seconds=1, on_error="continue"), step("tail")],
             run_step, cancel, reason == "disconnect", reason == "task",
         )
         assert result["status"] == "waiting_human"
@@ -393,7 +398,8 @@ def test_executor_preserves_partial_checkpoint(worker_run, reason):
 
 @pytest.mark.parametrize("retry_request", ["restart", "fallback_interaction", "jump"])
 @pytest.mark.parametrize("evidence", [{"submit_attempted": True}, {"success": [{"date": DATE}]}])
-def test_replay_guard(worker_run, retry_request, evidence):
+@pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])
+def test_replay_guard(worker_run, retry_request, evidence, feature):
     async def run_step(_page, current, *_args, **_kwargs):
         if current["step_key"] == "resign":
             return "success", "confirmed", {"resign": evidence}
@@ -402,13 +408,105 @@ def test_replay_guard(worker_run, retry_request, evidence):
         return retry_request, "retry requested", {}
 
     async def check():
-        result, _ = await worker_run([step("resign", "post.resign_click"),
+        result, _ = await worker_run([step("resign", feature, timeout_seconds=30),
                                       step("after", "flow.jump", on_error="continue"), step("tail")], run_step)
         assert result["status"] == "waiting_human"
         assert len(result["steps"]) == 2
         assert result["steps"][0]["data"]["resign"] == evidence
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("assistant", [False, True])
+def test_executor_exception_keeps_partial_checkpoint(worker_run, feature, assistant):
+    state = {"pending": [DATE], "submit_attempted": True, "unconfirmed": [{"date": DATE}]}
+
+    async def run_step(_page, _step, *_args, resign_progress=None, **_kwargs):
+        await resign_progress({"resign": state})
+        raise RuntimeError("runner failed after prepare")
+
+    result, _ = asyncio.run(worker_run([
+        step("resign", feature, on_error="continue", timeout_seconds=30), step("tail"),
+    ], run_step, assistant=assistant))
+    assert result["status"] == ("unknown" if assistant else "waiting_human")
+    assert len(result["steps"]) == 1
+    assert result["steps"][0]["data"]["resign"] == state
+
+
+@pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("authorized", [False, True])
+def test_checkpointed_runner_dispatch_contract(monkeypatch, checkpoint_http, feature, authorized):
+    suffix = feature.removeprefix("post.")
+    module = ModuleType(f"worker.{suffix}")
+    runner = AsyncMock(return_value=("success", "runner result", {"resign": {}}))
+    setattr(module, f"run_{suffix}", runner)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    page = object()
+    config = {"success_wait_seconds": 1}
+    payload = runtime_payload()
+    payload["resign_unresolved_dates"] = ["2026-10-02"]
+    if not authorized:
+        payload.pop("secret_access")
+    progress = AsyncMock()
+
+    async def check():
+        result = await executor._run_step(
+            page, {"step_key": "dialog-step", "feature_type": feature, "config": config},
+            None, None, None, None, None, "general", resign_pending_dates=[DATE],
+            secret_payload=payload, resign_progress=progress,
+        )
+        assert result == runner.return_value
+        runner.assert_awaited_once()
+        args, kwargs = runner.call_args
+        assert args[:3] == (page, config, [DATE])
+        assert callable(args[3])
+        assert kwargs["today"] == TODAY
+        assert kwargs["unresolved"] == ["2026-10-02"]
+        assert kwargs["base_url"] == BASE
+        assert kwargs["progress"] is progress
+        if authorized:
+            state = {"pending": [DATE], "submit_attempted": True, "unconfirmed": [{"date": DATE}]}
+            await kwargs["durable_progress"](state, "prepare", DATE)
+            assert len(checkpoint_http) == 1
+            request = checkpoint_http[0]
+            assert request.headers["Authorization"] == "Bearer test-private-token"
+            body = json.loads(request.content)
+            assert body == {"job_id": 17, "site_id": 23, "step_key": "dialog-step",
+                            "phase": "prepare", "date": DATE, "result": {"resign": state}}
+        else:
+            assert kwargs["durable_progress"] is None
+            assert not checkpoint_http
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("override", [None, 7])
+def test_executor_uses_feature_timeout(worker_run, monkeypatch, feature, override):
+    suffix = feature.removeprefix("post.")
+    module = ModuleType(f"worker.{suffix}")
+    timeout = Mock(return_value=73)
+    setattr(module, f"{suffix}_timeout", timeout)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    original = asyncio.wait_for
+    budgets = []
+
+    async def wait_for(awaitable, timeout):
+        budgets.append(timeout)
+        return await original(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(executor.asyncio, "wait_for", wait_for)
+    config = {"success_wait_seconds": 2}
+    result, _ = asyncio.run(worker_run([
+        step("resign", feature, config=config, timeout_seconds=override),
+    ], AsyncMock(return_value=("success", "done", {}))))
+    assert result["status"] == "success"
+    assert budgets == [73 if override is None else override]
+    if override is None:
+        timeout.assert_called_once_with(config, [])
+    else:
+        timeout.assert_not_called()
 
 
 def test_timeout_budget_scales_with_dates_and_months():

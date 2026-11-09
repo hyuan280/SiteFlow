@@ -109,7 +109,7 @@ def test_request_and_site_forbid_privileged_metadata(key):
 
 
 @pytest.mark.parametrize("key", [
-    "post.buy_card", "post.resign", "post.resign_click", "plugin.private.wait",
+    "post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog", "plugin.private.wait",
     "sign.iframe_form", "action.fill", "unknown", PRIVATE,
 ])
 def test_host_cannot_authorize_unreviewed_or_excluded_features(tools, key):

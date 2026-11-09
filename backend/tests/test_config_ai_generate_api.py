@@ -161,7 +161,7 @@ def test_disabled_returns_503_without_resolving_runtime_or_generating(client, mo
 
 @pytest.mark.parametrize("features", [
     ["unknown-private-feature"], ["plugin.private.feature"], ["action.fill"],
-    ["post.buy_card"], ["sign.iframe_form"], ["action.wait", "post.buy_card"],
+    ["post.buy_card"], ["post.resign_dialog"], ["sign.iframe_form"], ["action.wait", "post.buy_card"],
 ])
 def test_invalid_feature_selection_precedes_runtime(client, mocked_generation, features):
     _post(client, _payload(allowed_features=features), 422, "invalid_selection")

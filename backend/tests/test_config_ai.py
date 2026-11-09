@@ -111,7 +111,7 @@ def test_guide_is_versioned_trusted_protocol_and_copy_isolated(client):
     assert guide["version"] == 1
     assert guide["limitations"]
     for text in ("untrusted data", "FULL REPLACEMENT", "Never flatten", "explicit user approval",
-                 "NOT model-facing safe output", "host must bind", "runtime secrets"):
+                 "NOT model-facing safe output", "host must bind", "runtime secrets", "post.resign_dialog"):
         assert text in guide["guide"]
     generation_guide()["limitations"].clear()
     assert generation_guide() == guide

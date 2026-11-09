@@ -12,6 +12,7 @@ from app.models.execution import SiteJob
 from app.models.workflow import Site, SiteResignRecord, utcnow
 
 TERMINAL_RESIGN_STATUSES = {"success", "already_signed"}
+CHECKPOINT_RESIGN_FEATURES = frozenset({"post.resign_click", "post.resign_dialog"})
 
 
 class ResignConflict(ValueError):
@@ -191,7 +192,8 @@ class ResignService:
             return
         now = utcnow()
         pending = result.get("pending")
-        scoped = feature_type == "post.resign_click" and isinstance(pending, list)
+        checkpointed = feature_type in CHECKPOINT_RESIGN_FEATURES
+        scoped = checkpointed and isinstance(pending, list)
         today = datetime.now(self.timezone).date()
         entries: list[tuple[str, str, str]] = []
         for item in result.get("unconfirmed") or []:
@@ -213,7 +215,11 @@ class ResignService:
             if isinstance(item, dict) and item.get("date"):
                 entries.append((str(item["date"]), "failed", str(item.get("message") or "")))
         for value, status, message in entries:
-            if feature_type == "post.resign_click" and status == "unknown":
+            inferred = (
+                feature_type == "post.resign_dialog"
+                and value in (result.get("inferred_signed") or [])
+            )
+            if checkpointed and status == "unknown":
                 message = "Resign submission reserved; confirmation pending"
             if scoped:
                 try:
@@ -242,21 +248,24 @@ class ResignService:
                 self.session.add(row)
                 self.session.flush()
             else:
-                if row.status in TERMINAL_RESIGN_STATUSES:
+                if row.status in TERMINAL_RESIGN_STATUSES or (inferred and row.status == "unknown"):
                     continue
                 owned = row.job_id == job_id and row.run_id == run_id
                 readonly_done = scoped and status == "already_signed"
                 if not readonly_done and (
                     (row.status == "unknown" and (status == "failed" or not owned))
-                    or (feature_type == "post.resign_click" and not owned)
+                    or (checkpointed and not owned)
                 ):
                     continue
                 values = {"status": status, "message": message[:4000], "updated_at": now}
-                if feature_type != "post.resign_click" and row.status != "unknown":
+                if not checkpointed and row.status != "unknown":
                     values.update(run_id=run_id, job_id=job_id)
                 # All writers compare the observed status and owner, including legacy results.
-                # Read-only done observations may close a reservation but never acquire it.
-                self.session.execute(update(SiteResignRecord).where(
+                # Only explicit done evidence may close an unknown reservation.
+                statement = update(SiteResignRecord).where(
                     SiteResignRecord.id == row.id, SiteResignRecord.status == row.status,
                     SiteResignRecord.job_id == row.job_id, SiteResignRecord.run_id == row.run_id,
-                ).values(**values))
+                )
+                if inferred:
+                    statement = statement.where(SiteResignRecord.status != "unknown")
+                self.session.execute(statement.values(**values))

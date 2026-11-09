@@ -279,6 +279,44 @@
 
 点击前服务端会预留该日期，收到持久化确认后才点击；结果未知的日期后续只读复核，不盲目再次补签。已发起补签后，任务不自动整项重启、换车道重跑或回跳重复执行。无需新建数据库表或迁移；更新时需同步 API 和 Worker，前端从功能目录自动显示新步骤。本功能仅适用于“选日期后再点击独立补签按钮”的页面，不适用于点击日期格立即消费的日历。
 
+### 弹窗按钮补签
+
+对于“点击补签卡入口打开弹窗，点击弹窗中的日期按钮立即补签”的页面，使用独立的「弹窗按钮补签」（`post.resign_dialog`），不要套用 `post.resign_click` 的“选日期再提交”流程。入口点击仅打开弹窗，**日期按钮点击直接消费一张补签卡**，不是预览操作。步骤使用当前页面，不包含导航地址；先用正常工作流进入已确认的签到页。站点需启用「支持补签」，仅处理 pending 中的过去日期，不自动购卡。
+
+配置示例（步骤 `config`，选择器均为候选数组，需根据实际页面结构拾取并调整，不能直接假定示例选择器适用）：
+
+```json
+{
+  "entry_selector": [".attendance-card header button[title*=\"补签卡\"]"],
+  "dialog_selector": ["[role=\"dialog\"][aria-label^=\"补签\"]"],
+  "dialog_ready_selector": [],
+  "button_selector": ["button"],
+  "date_regex": "(?<!\\d)(?P<month>\\d{2})-(?P<day>\\d{2})(?!\\d)",
+  "missing_button_as_signed": false,
+  "dialog_wait_seconds": 10,
+  "success_wait_seconds": 10,
+  "success_selector": ["[role=\"dialog\"][aria-label^=\"补签\"] p"],
+  "success_regex": "补签成功",
+  "done_selector": [".attendance-calendar__day.is-done[title^=\"{date}\"]"],
+  "card_count_selector": [".attendance-card header button[title*=\"补签卡\"]"],
+  "card_count_regex": "补签\\s*[×x]\\s*(\\d+)"
+}
+```
+
+`button_selector` 相对唯一可见且明确就绪的弹窗枚举按钮，仅点击可见、启用的目标，不在整个页面寻找同名日期。`date_regex` 必须有 `month/day` 命名组，或 `date` 命名组捕获 ISO 日期（例如 `(?P<date>\d{4}-\d{2}-\d{2})`）；若含 `year` 命名组，`month/day` 都必需。文本没有明确年份时才从待补签日期的对应月日推导；同一月日对应多个年份时停止，不猜年份。文本含明确 ISO 完整日期时，不得忽略年份而仅截取月日；命名 `date` 或完整 `year/month/day` 与 DOM 中的完整日期矛盾时拒绝。配置阶段校验正则编译和命名组，真实日期、ISO 格式和 DOM 日期一致性由 runner 校验。
+
+仅 `done_selector` 是日期模板，支持 `{date}/{year}/{month}/{day}`，每项必须包含 `{date}` 或 `{day}`，需明确绑定目标日期。其他选择器不做模板解析，因此 Playwright 文本正则中的 `\d{2}` 等花括号不会被误判。拾取 done 标记后须将具体日期改回占位符，不能使用其他日期的完成标记。
+
+模型要求 `done_selector` 或 `success_selector` 至少配置一项。schema 的 `success_selector` 默认为 `[]`，默认 done 为示例中的日历选择器以保证默认配置合法；只有真实页面匹配才能作为证据。若成功提示位于补签弹窗的段落元素中，可按实际结构配置 `success_selector`，例如 `[role="dialog"][aria-label^="补签"] p`。`success_regex` 默认 `补签成功`，`card_count_regex` 必须有捕获组，第一组为库存数量；两者均做编译校验。
+
+成功必须同时具备“目标日期 done，或本次新出现的成功提示”以及“补签卡数恰好减少 1”。成功提示 baseline 在 prepare ACK + authorize 之后、实际点击之前采集，不能使用准备或授权之前的旧快照判断提示是否为本次新出现。旧提示、仅点击完成、仅卡数变化均不足。提示可能瞬时出现，随后网站刷新；runner 捕获本次提示后仍等待刷新后的稳定库存，不要求提示与新卡数同时存在。弹窗等待和成功等待默认各 10 秒，范围各为 1-60 秒，步骤总超时需覆盖整个处理过程。
+
+「找不到日期按钮视为已签到」（`missing_button_as_signed`）默认关闭。开启后目标日期按钮缺失时，必须至少观察过一个可解析日期按钮，或 `dialog_ready_selector` 在唯一弹窗内唯一可见命中；两种证据皆无时返回 `waiting_human`，不视为已签到。单纯看见弹窗或没有按钮，无法区分合法空列表与日期加载错误，不能把加载失败当成已签到。此开关**不用于历史 unknown 自动消除**。历史未知结果必须先只读核验，不得为了消除未知记录重复消费。此功能不放开智能助手或 AI 生成的 `post.*` 禁止规则。
+
+「弹窗内容就绪选择器」（`dialog_ready_selector`）可选，默认 `[]`，最多 20 个候选，相对唯一弹窗查找明确加载完成或合法空列表证据，不做日期模板解析。弹窗有其他可解析日期按钮时无需此字段；整个列表为空且要启用缺失按钮判已签到时，需配置经实际 DOM 确认的明确就绪/空态证据，不要使用弹窗外元素或仅证明弹窗已打开的容器。该字段不替代成功核验所需的 `done_selector` / `success_selector`。
+
+部署需同步更新 API 和 Worker。配置前应确认入口只打开弹窗、日期按钮直接提交，以及成功标记和卡数的更新方式；不要为验证选择器反复运行真实补签。
+
 ### 车道选择
 
 通过「使用代理」和「优先交互」选择车道。普通通用、代理通用可并行执行；交互车道一次只执行一个任务，适合需要人工查看或桌面坐标操作的流程。
