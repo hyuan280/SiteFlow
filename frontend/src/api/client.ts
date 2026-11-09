@@ -18,11 +18,15 @@ export const testVisionSettings = () =>
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code?: string;
+  readonly reason?: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string, reason?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
+    this.reason = reason;
   }
 }
 
@@ -75,11 +79,18 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
   }
 
   if (!response.ok) {
-    const detail =
+    const detail: unknown =
       typeof data === "object" && data !== null && "detail" in data
-        ? String((data as { detail: unknown }).detail)
-        : `请求失败（HTTP ${response.status}）`;
-    throw new ApiError(response.status, detail);
+        ? (data as { detail: unknown }).detail
+        : undefined;
+    const rawCode = typeof detail === "object" && detail !== null && !Array.isArray(detail) && "code" in detail
+      ? (detail as { code: unknown }).code : undefined;
+    const code = typeof rawCode === "string" && rawCode.length <= 128 && /^[a-z]/.test(rawCode) && !/[^a-z_]/.test(rawCode)
+      ? rawCode : undefined;
+    const rawReason = typeof detail === "object" && detail !== null && !Array.isArray(detail) && "reason" in detail
+      ? (detail as { reason: unknown }).reason : undefined;
+    const reason = typeof rawReason === "string" && /^[a-z_]{1,128}$/.test(rawReason) ? rawReason : undefined;
+    throw new ApiError(response.status, typeof detail === "string" ? detail : `请求失败（HTTP ${response.status}）`, code, reason);
   }
 
   return data as T;

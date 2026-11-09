@@ -4,6 +4,7 @@ import re
 from typing import Annotated, Literal
 
 from pydantic import Field, StringConstraints, ValidationInfo, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from app.features.base import Feature, FeatureConfig
 from app.features.captcha import (
@@ -11,6 +12,7 @@ from app.features.captcha import (
     CAPTCHA_METHODS,
     DEFAULT_CAPTCHA_METHOD,
 )
+from app.features.generation import GENERATION_HINTS
 
 WaitUntil = Literal["domcontentloaded", "load", "networkidle"]
 SelectorValue = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -59,7 +61,15 @@ class AuthFormLoginConfig(FeatureConfig):
     username_field: str = Field(default="username", description="表单用户名字段名")
     password_field: str = Field(default="password", description="表单密码字段名")
     success_selector: SelectorCandidates = Field(
-        default_factory=list, description=f"登录成功后出现的元素；{SELECTOR_HINT}"
+        default_factory=list,
+        description="登录后可见的成功元素；检查主页面及可见同源 iframe，所有祖先 iframe 须可见且同源；同一选择器任一匹配可见即通过；留空仅提交，不证明登录成功",
+    )
+    success_wait_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        strict=True,
+        description="提交后等待可见登录成功元素的秒数；步骤总超时须覆盖凭据获取、填写、提交及此等待，不会自动延长步骤超时或重新提交",
     )
 
 
@@ -103,7 +113,9 @@ class AuthTotpLoginConfig(FeatureConfig):
     @model_validator(mode="after")
     def _validate_provider(self):
         if not self.service_hint.strip():
-            raise ValueError("service_hint is required for every 2FA provider")
+            raise PydanticCustomError(
+                "totp_service_hint_required", "Value error, service_hint is required for every 2FA provider",
+            )
         return self
 
 
@@ -348,11 +360,17 @@ class FlowJumpConfig(FeatureConfig):
     def _validate_jump(self) -> "FlowJumpConfig":
         self.target_step_key = self.target_step_key.strip()
         if not self.texts and not self.selectors:
-            raise ValueError("至少需要配置一项页面文字或选择器")
+            raise PydanticCustomError(
+                "flow_jump_evidence_required", "Value error, 至少需要配置一项页面文字或选择器",
+            )
         if self.action == "jump" and not self.target_step_key:
-            raise ValueError("跳转到指定步骤时需要填写目标步骤 key")
+            raise PydanticCustomError(
+                "flow_jump_target_required", "Value error, 跳转到指定步骤时需要填写目标步骤 key",
+            )
         if self.target_step_key and ":" in self.target_step_key:
-            raise ValueError("目标步骤 key 不能包含冒号")
+            raise PydanticCustomError(
+                "flow_jump_target_invalid", "Value error, 目标步骤 key 不能包含冒号",
+            )
         return self
 
 
@@ -706,9 +724,15 @@ class PostBuyCardConfig(FeatureConfig):
     @model_validator(mode="after")
     def _validate_layout(self) -> "PostBuyCardConfig":
         if self.layout == "custom" and not self.product_selectors:
-            raise ValueError("自定义布局必须提供商品选择器 product_selectors")
+            raise PydanticCustomError(
+                "buy_card_product_selectors_required",
+                "Value error, 自定义布局必须提供商品选择器 product_selectors",
+            )
         if self.layout != "table" and not self.price_selectors:
-            raise ValueError("网格卡片和自定义布局必须提供价格选择器 price_selectors")
+            raise PydanticCustomError(
+                "buy_card_price_selectors_required",
+                "Value error, 网格卡片和自定义布局必须提供价格选择器 price_selectors",
+            )
         return self
 
 
@@ -870,13 +894,16 @@ class PostResignClickConfig(FeatureConfig):
         for selector in value:
             literal = re.sub(r"\{(?:date|day|month|year)\}", "", selector)
             if "{" in literal or "}" in literal:
-                raise ValueError(
-                    "Playwright 选择器模板仅支持 {date}/{day}/{month}/{year}，不支持其他花括号语法"
+                raise PydanticCustomError(
+                    "resign_selector_template_invalid",
+                    "Value error, Playwright 选择器模板仅支持 {date}/{day}/{month}/{year}，不支持其他花括号语法",
                 )
             if info.field_name in {
                 "calendar_day_selector", "calendar_selected_selector", "done_selector",
             } and not any(token in selector for token in ("{date}", "{day}")):
-                raise ValueError("每个目标日期选择器模板必须包含 {date} 或 {day}")
+                raise PydanticCustomError(
+                    "resign_selector_date_required", "Value error, 每个目标日期选择器模板必须包含 {date} 或 {day}",
+                )
         return value
 
 
@@ -898,6 +925,7 @@ def _feature(
         requires=frozenset(requires),  # type: ignore[arg-type]
         config_model=config_model,
         description=description,
+        generation_hints=GENERATION_HINTS.get(key),
     )
 
 

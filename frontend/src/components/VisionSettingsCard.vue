@@ -7,20 +7,19 @@ import type { VisionUpdate, VisionView } from "@/types/integrations";
 const props = defineProps<{ vision: VisionView }>();
 const emit = defineEmits<{ updated: [value: VisionView] }>();
 const fields = ["base_url", "model", "api_key"] as const;
-const form = ref({ base_url: "", model: "", api_key: "", supports_vision: true });
+const allFields = [...fields, "supports_vision", "max_tokens"] as const;
+const form = ref({ base_url: "", model: "", api_key: "", supports_vision: true, max_tokens: "" });
+const tokenTouched = ref(false);
+let hydratedMaxTokens = "";
 const busy = ref(false);
 const result = ref<{ ok: boolean; message: string } | null>(null);
 const allLocked = computed(
-  () =>
-    !props.vision.supports_vision.editable ||
-    fields.every((key) => !props.vision[key].editable),
+  () => allFields.every((key) => !props.vision[key].editable),
 );
 const clearDisabled = computed(
   () =>
-    !props.vision.supports_vision.editable ||
-    fields.some((key) => !props.vision[key].editable) ||
-    !fields.some((key) => props.vision[key].source === "db") &&
-      props.vision.supports_vision.source !== "db",
+    allFields.some((key) => !props.vision[key].editable) ||
+    !allFields.some((key) => props.vision[key].source === "db"),
 );
 watch(() => props.vision, value => {
   form.value = {
@@ -28,7 +27,10 @@ watch(() => props.vision, value => {
     model: value.model.value ?? "",
     api_key: "",
     supports_vision: value.supports_vision.value,
+    max_tokens: value.max_tokens.value === null ? "" : String(value.max_tokens.value),
   };
+  hydratedMaxTokens = form.value.max_tokens;
+  tokenTouched.value = false;
   result.value = null;
 }, { immediate: true });
 
@@ -44,6 +46,15 @@ async function run(action: "save" | "clear" | "test") {
       emit("updated", (await clearVisionSettings()).vision);
     } else {
       const payload: VisionUpdate = {};
+      if (props.vision.max_tokens.editable &&
+        (tokenTouched.value || form.value.max_tokens !== hydratedMaxTokens)) {
+        const value = form.value.max_tokens;
+        if (typeof value !== "string" || !/^\d*$/.test(value.trim()) || !Number.isSafeInteger(Number(value))) {
+          throw new Error("max_tokens 必须为非负整数；留空或 0 使用服务端默认上限。");
+        }
+        // Send zero explicitly so clearing the input removes a previously saved cap.
+        payload.max_tokens = Number(value);
+      }
       for (const key of fields) {
         if (!props.vision[key].editable) continue;
         const value = form.value[key].trim();
@@ -88,12 +99,21 @@ async function run(action: "save" | "clear" | "test") {
         <span v-if="key === 'api_key'" class="muted">当前：{{ vision.api_key.configured ? vision.api_key.masked ?? '已配置（不显示原文）' : '未配置' }}</span>
         <span v-else-if="vision[key].error" class="error">{{ vision[key].error }}</span>
       </el-form-item>
+      <el-form-item>
+        <template #label>
+          输出 Token 上限（max_tokens）
+          <el-tag size="small" :type="vision.max_tokens.source === 'env' ? 'warning' : 'info'">{{ vision.max_tokens.source === 'env' ? '环境变量锁定' : vision.max_tokens.source === 'db' ? '数据库' : '未配置' }}</el-tag>
+        </template>
+        <el-input v-model="form.max_tokens" inputmode="numeric" clearable aria-label="max_tokens" :disabled="!vision.max_tokens.editable" placeholder="留空或 0 使用服务端默认上限" @input="tokenTouched = true" @clear="tokenTouched = true" />
+        <span class="muted">留空或0不发送max_tokens，使用服务端默认上限；思考模型请预留足够预算</span>
+        <span v-if="vision.max_tokens.error" class="error">{{ vision.max_tokens.error }}</span>
+      </el-form-item>
     </el-form>
     <div class="vision-switch">
       <strong>支持视觉（可用于识别图片）</strong>
       <el-switch
         v-model="form.supports_vision"
-        :disabled="!vision.supports_vision.editable"
+        :disabled="busy || !vision.supports_vision.editable"
       />
       <span :class="['switch-state', { 'is-on': form.supports_vision }]">
         {{ form.supports_vision ? "支持视觉识别" : "不支持视觉识别" }}

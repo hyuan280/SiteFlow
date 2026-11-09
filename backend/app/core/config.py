@@ -4,7 +4,7 @@ import base64
 import binascii
 import json
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,7 +35,11 @@ class Settings(BaseSettings):
     vision_base_url: str | None = Field(default=None, validation_alias="SITEFLOW_VISION_BASE_URL")
     vision_api_key: SecretStr | None = Field(default=None, validation_alias="SITEFLOW_VISION_API_KEY")
     vision_model: str | None = Field(default=None, validation_alias="SITEFLOW_VISION_MODEL")
+    vision_max_tokens: int | None = Field(
+        default=None, ge=0, validation_alias="SITEFLOW_VISION_MAX_TOKENS"
+    )
     vision_timeout: float = Field(default=30, gt=0, le=300, validation_alias="SITEFLOW_VISION_TIMEOUT")
+    config_ai_enabled: bool = Field(default=False, validation_alias="SITEFLOW_CONFIG_AI_ENABLED")
     vision_supports_vision: bool | None = Field(
         default=None, validation_alias="SITEFLOW_VISION_SUPPORTS_VISION"
     )
@@ -165,6 +169,20 @@ class Settings(BaseSettings):
     cookie_secure: bool = Field(default=False, validation_alias="SITEFLOW_COOKIE_SECURE")
     login_max_attempts: int = Field(default=5, validation_alias="SITEFLOW_LOGIN_MAX_ATTEMPTS")
     login_lockout_seconds: int = Field(default=300, validation_alias="SITEFLOW_LOGIN_LOCKOUT_SECONDS")
+
+    @field_validator("vision_max_tokens", mode="before")
+    @classmethod
+    def validate_vision_max_tokens(cls, value):
+        # Settings must accept integer environment strings, but not bools or floats.
+        if value is None or type(value) is int:
+            return value
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return 0
+            if value.isascii() and value.isdecimal():
+                return int(value)
+        raise ValueError("Vision max_tokens must be a nonnegative integer")
 
     def master_key_bytes(self) -> bytes:
         if self.master_key is None:

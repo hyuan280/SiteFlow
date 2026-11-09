@@ -72,6 +72,10 @@ const props = defineProps<{
       />
     </div>
 
+    <p class="signal-info">
+      信号选择器默认检查元素是否存在，隐藏元素也可能命中；需要可见证据可在 Playwright 选择器中显式使用 :visible。表单登录成功元素要求可见。
+    </p>
+
     <p v-if="used" class="signal-used">
       该信号已被步骤条件使用，不能删除，但可以继续修改判断规则。
     </p>
@@ -106,10 +110,18 @@ const props = defineProps<{
   font-size: 13px;
 }
 
+.signal-info,
 .signal-used {
   margin: 0;
-  color: #b88230;
   font-size: 11px;
+}
+
+.signal-info {
+  color: #606266;
+}
+
+.signal-used {
+  color: #b88230;
 }
 
 @media (max-width: 760px) {

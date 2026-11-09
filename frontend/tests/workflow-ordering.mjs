@@ -66,6 +66,17 @@ try {
     editor.moveStep(props.modelValue[0], -1);
     assert.deepEqual(editor.groupSections.value.flatMap(s => s.items.map(i =>
       i.kind === "group" ? i.group.key : i.step.step_key)), ["z", "base", "a", "m"]);
+    props.chain = [];
+    props.groups = [
+      { uid: "group-z", group_key: "z", name: "Z", position: 1000000, step_anchor: 1000 },
+      { uid: "group-a", group_key: "a", name: "A", position: 2000000, step_anchor: 1000 },
+    ];
+    props.modelValue = [
+      { ...step("z-step", 1000), group_key: "z" },
+      { ...step("a-step", 2000), group_key: "a" },
+    ];
+    assert.deepEqual(editor.groupSections.value.map(section => section.group.key), ["a", "z"],
+      "equal-anchor group blocks match backend group-key tie ordering");
   }
 } finally {
   await server.close();

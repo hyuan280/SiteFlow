@@ -27,6 +27,7 @@ from app.schemas.credential import SiteCredentialView
 from app.services.credentials import CredentialService
 from app.services.integrations import IntegrationService
 from app.services.workflow_history import WorkflowHistoryMixin, atomic_workflow_write
+from app.services.workflow_diagnostics import WorkflowDiagnostic, feature_diagnostics
 from app.models.auth import AuthSession
 from app.schemas.workflow import (
     SiteOptionView,
@@ -40,6 +41,7 @@ from app.schemas.workflow import (
     SignalInput,
     SignalView,
     SiteDetail,
+    SiteSettingsPatch,
     SiteSummary,
     SiteWrite,
     StepInput,
@@ -60,7 +62,12 @@ SYSTEM_RESIGN_SIGNAL_LABEL = "断签"
 
 
 class WorkflowError(ValueError):
-    pass
+    def __init__(
+        self, message: str, *, diagnostic: WorkflowDiagnostic | None = None,
+        diagnostics: list[WorkflowDiagnostic] | None = None,
+    ):
+        super().__init__(message)
+        self.diagnostics = ([diagnostic] if diagnostic else diagnostics or [])[:10]
 
 
 class WorkflowValidationError(WorkflowError):
@@ -275,7 +282,9 @@ class WorkflowService(WorkflowHistoryMixin):
             else self.session.get(Template, template_id)
         )
         if row is None:
-            raise WorkflowNotFoundError(f"模板 {template_id} 不存在")
+            raise WorkflowNotFoundError(
+                f"模板 {template_id} 不存在", diagnostic=WorkflowDiagnostic("template_missing"),
+            )
         return row
 
     def _get_site(self, site_id: int) -> Site:
@@ -290,15 +299,20 @@ class WorkflowService(WorkflowHistoryMixin):
         current = self._get_template(template_id)
         while True:
             if current.id in seen:
-                raise WorkflowValidationError("模板继承存在循环")
+                raise WorkflowValidationError(
+                    "模板继承存在循环", diagnostic=WorkflowDiagnostic("template_cycle"),
+                )
             seen.add(current.id)
             chain.append(current)
             if current.parent_id is None:
                 break
-            parent = self.session.get(Template, current.parent_id)
-            if parent is None:
-                raise WorkflowValidationError(f"父模板 {current.parent_id} 不存在")
-            current = parent
+            try:
+                current = self._get_template(current.parent_id)
+            except WorkflowNotFoundError:
+                raise WorkflowValidationError(
+                    f"父模板 {current.parent_id} 不存在",
+                    diagnostic=WorkflowDiagnostic("template_missing", ("parent_id",)),
+                ) from None
         chain.reverse()
         return chain
 
@@ -423,12 +437,16 @@ class WorkflowService(WorkflowHistoryMixin):
     @staticmethod
     def _validate_signal_inputs(signals: list[SignalInput]) -> None:
         seen: set[str] = set()
-        for signal in signals:
+        for index, signal in enumerate(signals):
             if signal.signal_key in seen:
-                raise WorkflowValidationError(f"信号 key 重复: {signal.signal_key}")
+                raise WorkflowValidationError(
+                    f"信号 key 重复: {signal.signal_key}",
+                    diagnostic=WorkflowDiagnostic("duplicate_signal", ("signals", index, "signal_key")),
+                )
             if signal.signal_key == SYSTEM_RESIGN_SIGNAL_KEY:
                 raise WorkflowValidationError(
-                    f"信号 key {SYSTEM_RESIGN_SIGNAL_KEY} 为系统保留"
+                    f"信号 key {SYSTEM_RESIGN_SIGNAL_KEY} 为系统保留",
+                    diagnostic=WorkflowDiagnostic("signal_reserved", ("signals", index, "signal_key")),
                 )
             seen.add(signal.signal_key)
             includes = [
@@ -436,20 +454,31 @@ class WorkflowService(WorkflowHistoryMixin):
             ]
             if not any(includes):
                 raise WorkflowValidationError(
-                    f"信号 {signal.label or signal.signal_key} 至少需要一个包含文本或选择器"
+                    f"信号 {signal.label or signal.signal_key} 至少需要一个包含文本或选择器",
+                    diagnostic=WorkflowDiagnostic(
+                        "signal_evidence_required", ("signals", index, "include_texts"),
+                    ),
                 )
 
     def _replace_signals(
         self, owner_type: str, owner_id: int, signals: list[SignalInput]
     ) -> None:
-        self._validate_signal_inputs(signals)
+        rows = self._signal_rows(owner_type, owner_id, signals)
         self.session.query(WorkflowSignal).filter(
             WorkflowSignal.owner_type == owner_type,
             WorkflowSignal.owner_id == owner_id,
         ).delete(synchronize_session=False)
+        for row in rows:
+            self.session.add(row)
+
+    def _signal_rows(
+        self, owner_type: str, owner_id: int, signals: list[SignalInput]
+    ) -> list[WorkflowSignal]:
+        self._validate_signal_inputs(signals)
         now = _utcnow()
+        rows = []
         for signal in signals:
-            self.session.add(
+            rows.append(
                 WorkflowSignal(
                     owner_type=owner_type,
                     owner_id=owner_id,
@@ -478,6 +507,7 @@ class WorkflowService(WorkflowHistoryMixin):
                     updated_at=now,
                 )
             )
+        return rows
 
     def _descendant_template_ids(self, template_id: int) -> list[int]:
         result: list[int] = []
@@ -500,26 +530,30 @@ class WorkflowService(WorkflowHistoryMixin):
             steps = self._steps(OWNER_SITE, owner_id)
         else:
             template_ids = self._descendant_template_ids(owner_id)
-            steps = list(
-                self.session.scalars(
-                    select(WorkflowStep).where(
-                        WorkflowStep.owner_type == OWNER_TEMPLATE,
-                        WorkflowStep.owner_id.in_(template_ids),
-                    )
-                )
-            )
+            if self._steps_by_owner is not None:
+                steps = [
+                    step for template_id in template_ids
+                    for step in self._steps(OWNER_TEMPLATE, template_id)
+                ]
+            else:
+                steps = list(self.session.scalars(select(WorkflowStep).where(
+                    WorkflowStep.owner_type == OWNER_TEMPLATE,
+                    WorkflowStep.owner_id.in_(template_ids),
+                )))
             site_ids = self.session.scalars(
                 select(Site.id).where(Site.template_id.in_(template_ids))
             ).all()
             if site_ids:
-                steps.extend(
-                    self.session.scalars(
-                        select(WorkflowStep).where(
-                            WorkflowStep.owner_type == OWNER_SITE,
-                            WorkflowStep.owner_id.in_(site_ids),
-                        )
+                if self._steps_by_owner is not None:
+                    steps.extend(
+                        step for site_id in site_ids
+                        for step in self._steps(OWNER_SITE, site_id)
                     )
-                )
+                else:
+                    steps.extend(self.session.scalars(select(WorkflowStep).where(
+                        WorkflowStep.owner_type == OWNER_SITE,
+                        WorkflowStep.owner_id.in_(site_ids),
+                    )))
         referenced: set[str] = set()
         for step in steps:
             if not step.condition:
@@ -557,7 +591,8 @@ class WorkflowService(WorkflowHistoryMixin):
         used = self._referenced_signal_keys(owner_type, owner_id, removed)
         if used:
             raise WorkflowConflictError(
-                f"信号仍被步骤条件引用，不能删除: {', '.join(sorted(used))}"
+                f"信号仍被步骤条件引用，不能删除: {', '.join(sorted(used))}",
+                diagnostic=WorkflowDiagnostic("signal_in_use", ("signals",)),
             )
 
     # ── groups ──────────────────────────────────────────────────────────
@@ -588,17 +623,25 @@ class WorkflowService(WorkflowHistoryMixin):
     def _replace_groups(
         self, owner_type: str, owner_id: int, groups: list[GroupInput], *, preserve_null=False
     ) -> None:
-        existing = {row.group_key: row for row in self._groups(owner_type, owner_id)}
-        for group in groups:
-            if not preserve_null and group.step_anchor is None and group.group_key in existing:
-                group.step_anchor = existing[group.group_key].step_anchor
+        rows = self._group_rows(owner_type, owner_id, groups, preserve_null=preserve_null)
         self.session.query(WorkflowGroup).filter(
             WorkflowGroup.owner_type == owner_type,
             WorkflowGroup.owner_id == owner_id,
         ).delete(synchronize_session=False)
-        now = _utcnow()
+        for row in rows:
+            self.session.add(row)
+
+    def _group_rows(
+        self, owner_type: str, owner_id: int, groups: list[GroupInput], *, preserve_null=False
+    ) -> list[WorkflowGroup]:
+        existing = {row.group_key: row for row in self._groups(owner_type, owner_id)}
         for group in groups:
-            self.session.add(
+            if not preserve_null and group.step_anchor is None and group.group_key in existing:
+                group.step_anchor = existing[group.group_key].step_anchor
+        now = _utcnow()
+        rows = []
+        for group in groups:
+            rows.append(
                 WorkflowGroup(
                     owner_type=owner_type,
                     owner_id=owner_id,
@@ -610,6 +653,7 @@ class WorkflowService(WorkflowHistoryMixin):
                     updated_at=now,
                 )
             )
+        return rows
 
     def _resolved_template_groups(self, template: Template) -> list[ResolvedGroupView]:
         if self._steps_by_owner is not None and template.id in self._resolved_template_groups_cache:
@@ -666,16 +710,23 @@ class WorkflowService(WorkflowHistoryMixin):
     ) -> None:
         seen: set[str] = set()
         inherited_keys = {group.group_key for group in inherited or []}
-        for group in groups:
+        for index, group in enumerate(groups):
             if group.group_key in seen:
-                raise WorkflowValidationError(f"分组 key 重复: {group.group_key}")
+                raise WorkflowValidationError(
+                    f"分组 key 重复: {group.group_key}",
+                    diagnostic=WorkflowDiagnostic("duplicate_group", ("groups", index, "group_key")),
+                )
             if group.group_key in inherited_keys:
                 raise WorkflowValidationError(
-                    f"不能覆盖模板分组: {group.group_key}"
+                    f"不能覆盖模板分组: {group.group_key}",
+                    diagnostic=WorkflowDiagnostic("group_inherited", ("groups", index, "group_key")),
                 )
             seen.add(group.group_key)
             if not group.name.strip():
-                raise WorkflowValidationError("分组名称不能为空")
+                raise WorkflowValidationError(
+                    "分组名称不能为空",
+                    diagnostic=WorkflowDiagnostic("group_name_required", ("groups", index, "name")),
+                )
 
     def _step_group_map(self, owner_type: str, owner_id: int) -> dict[str, str | None]:
         return {
@@ -690,20 +741,23 @@ class WorkflowService(WorkflowHistoryMixin):
         own_group_keys: set[str],
         inherited_group_keys: set[str] | None = None,
     ) -> None:
-        for step in steps:
+        for index, step in enumerate(steps):
             if step.step_key in inherited_steps:
                 expected = inherited_steps[step.step_key]
                 if step.group_key is not None and step.group_key != expected:
                     raise WorkflowValidationError(
-                        f"步骤 {step.step_key} 不能改变模板分组"
+                        f"步骤 {step.step_key} 不能改变模板分组",
+                        diagnostic=WorkflowDiagnostic("group_inherited", ("steps", index, "group_key")),
                     )
             elif step.group_key is not None and step.group_key not in own_group_keys:
                 if step.group_key in (inherited_group_keys or set()):
                     raise WorkflowValidationError(
-                        f"步骤 {step.step_key} 不能使用模板分组 {step.group_key}"
+                        f"步骤 {step.step_key} 不能使用模板分组 {step.group_key}",
+                        diagnostic=WorkflowDiagnostic("group_inherited", ("steps", index, "group_key")),
                     )
                 raise WorkflowValidationError(
-                    f"步骤 {step.step_key} 引用了不存在的本地分组 {step.group_key}"
+                    f"步骤 {step.step_key} 引用了不存在的本地分组 {step.group_key}",
+                    diagnostic=WorkflowDiagnostic("group_missing", ("steps", index, "group_key")),
                 )
 
     def _descendant_has_override(self, template_id: int, step_key: str) -> bool:
@@ -752,14 +806,18 @@ class WorkflowService(WorkflowHistoryMixin):
         if not site_count and not child_count:
             return
         if new_parent_id != template.parent_id:
-            raise WorkflowConflictError("模板已被使用，不能修改父模板")
+            raise WorkflowConflictError(
+                "模板已被使用，不能修改父模板",
+                diagnostic=WorkflowDiagnostic("template_in_use", ("parent_id",)),
+            )
         old_steps = self._step_group_map(OWNER_TEMPLATE, template.id)
         new_steps = {step.step_key: step.group_key for step in steps}
         for step_key in old_steps:
             if step_key not in new_steps:
                 if self._descendant_has_override(template.id, step_key):
                     raise WorkflowConflictError(
-                        f"步骤 {step_key} 被子模板或站点覆盖，不能删除"
+                        f"步骤 {step_key} 被子模板或站点覆盖，不能删除",
+                        diagnostic=WorkflowDiagnostic("template_in_use", ("steps",)),
                     )
         existing_groups = self._groups(OWNER_TEMPLATE, template.id)
         if not existing_groups:
@@ -775,16 +833,21 @@ class WorkflowService(WorkflowHistoryMixin):
         for group_key, name in old_groups.items():
             if group_key not in new_groups:
                 raise WorkflowConflictError(
-                    f"模板已被使用，不能删除分组 {group_key}"
+                    f"模板已被使用，不能删除分组 {group_key}",
+                    diagnostic=WorkflowDiagnostic("template_in_use", ("groups",)),
                 )
             if new_groups[group_key] != name:
                 raise WorkflowConflictError(
-                    f"模板已被使用，不能重命名分组 {group_key}"
+                    f"模板已被使用，不能重命名分组 {group_key}",
+                    diagnostic=WorkflowDiagnostic("template_in_use", ("groups",)),
                 )
         old_order = list(old_groups)
         new_order = [key for key in new_groups if key in old_groups]
         if old_order != new_order:
-            raise WorkflowConflictError("模板已被使用，不能重排已有分组")
+            raise WorkflowConflictError(
+                "模板已被使用，不能重排已有分组",
+                diagnostic=WorkflowDiagnostic("template_in_use", ("groups",)),
+            )
         for step_key, old_group in old_steps.items():
             if step_key not in new_steps:
                 continue
@@ -792,7 +855,8 @@ class WorkflowService(WorkflowHistoryMixin):
             if new_group == old_group or old_group is None:
                 continue
             raise WorkflowConflictError(
-                f"模板已被使用，步骤 {step_key} 不能改变分组"
+                f"模板已被使用，步骤 {step_key} 不能改变分组",
+                diagnostic=WorkflowDiagnostic("template_in_use", ("steps", "group_key"), step_key),
             )
 
     # ── template resolution ─────────────────────────────────────────────
@@ -807,20 +871,32 @@ class WorkflowService(WorkflowHistoryMixin):
         feature = get_feature(row.feature_type)
         if feature is None:
             if row.feature_type.startswith("plugin."):
-                raise WorkflowValidationError(f"步骤 {row.step_key}: 插件不可用、已移除或功能不兼容；已保存配置保持不变")
+                raise WorkflowValidationError(
+                    f"步骤 {row.step_key}: 插件不可用、已移除或功能不兼容；已保存配置保持不变",
+                    diagnostic=WorkflowDiagnostic(
+                        "feature_unavailable", ("steps", "feature_type"), row.step_key,
+                    ),
+                )
             raise WorkflowValidationError(
-                f"步骤 {row.step_key} 引用了未知功能类型 {row.feature_type}"
+                f"步骤 {row.step_key} 引用了未知功能类型 {row.feature_type}",
+                diagnostic=WorkflowDiagnostic("feature_unavailable", ("steps", "feature_type"), row.step_key),
             )
         if row.feature_version != feature.version:
             raise WorkflowValidationError(
-                f"步骤 {row.step_key} 的功能版本 {row.feature_version} 不受支持"
+                f"步骤 {row.step_key} 的功能版本 {row.feature_version} 不受支持",
+                diagnostic=WorkflowDiagnostic(
+                    "feature_version_unsupported", ("steps", "feature_type"), row.step_key, feature.key,
+                ),
             )
         config = _parse_config(row.config_json, row.step_key)
         existing = steps.get(row.step_key)
         if existing is not None and existing.feature.key != feature.key:
             raise WorkflowValidationError(
                 f"步骤 {row.step_key} 覆盖时不能改变功能类型 "
-                f"({existing.feature.key} -> {feature.key})"
+                f"({existing.feature.key} -> {feature.key})",
+                diagnostic=WorkflowDiagnostic(
+                    "feature_inheritance_mismatch", ("steps", "feature_type"), row.step_key, feature.key,
+                ),
             )
 
         if existing is None:
@@ -898,7 +974,11 @@ class WorkflowService(WorkflowHistoryMixin):
         for position, keys in positions.items():
             if len(keys) > 1 and local_keys.intersection(keys):
                 raise WorkflowValidationError(
-                    f"Ambiguous ungrouped step position {position}: {', '.join(keys)}"
+                    f"Ambiguous ungrouped step position {position}: {', '.join(keys)}",
+                    diagnostic=WorkflowDiagnostic(
+                        "order_collision", ("steps", "position"),
+                        next(step.step_key for step in steps if step.step_key in keys),
+                    ),
                 )
 
     def _resolved_template_steps(self, template: Template) -> list[_EffectiveStep]:
@@ -983,28 +1063,44 @@ class WorkflowService(WorkflowHistoryMixin):
         signal_map = {signal.signal_key: signal for signal in (signals or [])}
 
         for step in steps:
-            for condition_key in _condition_signal_keys(step.condition):
+            try:
+                condition_keys = _condition_signal_keys(step.condition)
+            except WorkflowValidationError as exc:
+                exc.diagnostics = [WorkflowDiagnostic(
+                    "condition_invalid", ("steps", "condition"), step.step_key, step.feature.key,
+                )]
+                raise
+            for condition_key in condition_keys:
                 signal = signal_map.get(condition_key)
                 if signal is None:
                     raise WorkflowValidationError(
-                        f"步骤 {step.step_key} 引用了不存在的信号 {condition_key}"
+                        f"步骤 {step.step_key} 引用了不存在的信号 {condition_key}",
+                        diagnostic=WorkflowDiagnostic("signal_missing", ("steps", "condition"), step.step_key, step.feature.key),
                     )
                 if not signal.enabled:
                     raise WorkflowValidationError(
-                        f"步骤 {step.step_key} 引用了已禁用的信号 {signal.label}"
+                        f"步骤 {step.step_key} 引用了已禁用的信号 {signal.label}",
+                        diagnostic=WorkflowDiagnostic("signal_disabled", ("steps", "condition"), step.step_key, step.feature.key),
                     )
             if step.enabled and "cfbox" in step.feature.requires and not self._cfbox_enabled():
                 raise WorkflowValidationError(
-                    f"步骤 {step.step_key} 需要 CFbox，请先在系统设置中配置服务地址和 API Key"
+                    f"步骤 {step.step_key} 需要 CFbox，请先在系统设置中配置服务地址和 API Key",
+                    diagnostic=WorkflowDiagnostic("cfbox_required", ("steps", "feature_type"), step.step_key, step.feature.key),
                 )
             if step.on_error not in ERROR_POLICIES:
-                raise WorkflowValidationError(f"步骤 {step.step_key} 的错误策略 {step.on_error} 无效")
+                raise WorkflowValidationError(
+                    f"步骤 {step.step_key} 的错误策略 {step.on_error} 无效",
+                    diagnostic=WorkflowDiagnostic(
+                        "error_policy_invalid", ("steps", "on_error"), step.step_key, step.feature.key,
+                    ),
+                )
             config = _substitute(step.config, base_url) if base_url else step.config
             try:
                 normalized = self._feature_settings_service().validate(step.feature, config)
             except FeatureConfigError as exc:
                 raise WorkflowValidationError(
-                    f"步骤 {step.step_key} ({step.feature.key}) 配置无效: {exc}"
+                    f"步骤 {step.step_key} ({step.feature.key}) 配置无效: {exc}",
+                    diagnostics=feature_diagnostics(exc, step.step_key, step.feature.key),
                 ) from exc
             if base_url:
                 # Defaults such as flow.open.url are inserted by validation.
@@ -1038,7 +1134,15 @@ class WorkflowService(WorkflowHistoryMixin):
 
         duplicates = [key for key, count in singleton_counts.items() if count > 1]
         if duplicates:
-            raise WorkflowValidationError(f"单例功能被启用多次: {', '.join(sorted(duplicates))}")
+            duplicate = next(
+                step for step in reversed(steps) if step.enabled and step.feature.key in duplicates
+            )
+            raise WorkflowValidationError(
+                f"单例功能被启用多次: {', '.join(sorted(duplicates))}",
+                diagnostic=WorkflowDiagnostic(
+                    "singleton_duplicate", ("steps", "enabled"), duplicate.step_key, duplicate.feature.key,
+                ),
+            )
 
         enabled_steps = [step for step in resolved_steps if step.enabled]
         if enabled_steps and not any(
@@ -1303,32 +1407,52 @@ class WorkflowService(WorkflowHistoryMixin):
     @staticmethod
     def _validate_step_inputs(steps: list[StepInput]) -> None:
         seen: set[str] = set()
-        for step in steps:
+        for index, step in enumerate(steps):
             if step.step_key in seen:
-                raise WorkflowValidationError(f"step_key 重复: {step.step_key}")
+                raise WorkflowValidationError(
+                    f"step_key 重复: {step.step_key}",
+                    diagnostic=WorkflowDiagnostic("duplicate_step", ("steps", index, "step_key")),
+                )
             seen.add(step.step_key)
             feature = get_feature(step.feature_type)
             if feature is None:
                 raise WorkflowValidationError(
-                    f"步骤 {step.step_key} 引用了未知功能类型 {step.feature_type}"
+                    f"步骤 {step.step_key} 引用了未知功能类型 {step.feature_type}",
+                    diagnostic=WorkflowDiagnostic("feature_unavailable", ("steps", index, "feature_type")),
                 )
-            _parse_condition_expression(step.condition)
+            try:
+                _parse_condition_expression(step.condition)
+            except WorkflowValidationError as exc:
+                exc.diagnostics = [WorkflowDiagnostic("condition_invalid", ("steps", index, "condition"))]
+                raise
             if step.on_error is not None and step.on_error not in ERROR_POLICIES:
-                raise WorkflowValidationError(f"步骤 {step.step_key} 的错误策略无效")
+                raise WorkflowValidationError(
+                    f"步骤 {step.step_key} 的错误策略无效",
+                    diagnostic=WorkflowDiagnostic("error_policy_invalid", ("steps", index, "on_error")),
+                )
             try:
                 step.config = feature.validate_override(step.config)
             except FeatureConfigError as exc:
                 raise WorkflowValidationError(
-                    f"步骤 {step.step_key} ({feature.key}) 配置无效: {exc}"
+                    f"步骤 {step.step_key} ({feature.key}) 配置无效: {exc}",
+                    diagnostics=feature_diagnostics(exc, step.step_key, feature.key),
                 ) from exc
 
     def _replace_steps(self, owner_type: str, owner_id: int, steps: list[StepInput]) -> None:
-        self._validate_step_inputs(steps)
+        rows = self._step_rows(owner_type, owner_id, steps)
         self.session.query(WorkflowStep).filter(
             WorkflowStep.owner_type == owner_type,
             WorkflowStep.owner_id == owner_id,
         ).delete(synchronize_session=False)
+        for row in rows:
+            self.session.add(row)
+
+    def _step_rows(
+        self, owner_type: str, owner_id: int, steps: list[StepInput]
+    ) -> list[WorkflowStep]:
+        self._validate_step_inputs(steps)
         now = _utcnow()
+        rows = []
         for step in steps:
             feature = get_feature(step.feature_type)
             assert feature is not None
@@ -1352,7 +1476,64 @@ class WorkflowService(WorkflowHistoryMixin):
                 created_at=now,
                 updated_at=now,
             )
-            self.session.add(row)
+            rows.append(row)
+        return rows
+
+    def _prepare_local_inputs(
+        self,
+        owner_type: str,
+        payload: SiteWrite | TemplateWrite,
+        parent_id: int | None,
+        existing: Site | Template | None = None,
+        *,
+        preserve_positions: bool = False,
+    ) -> None:
+        if owner_type == OWNER_TEMPLATE and existing is not None and parent_id is not None:
+            if parent_id == existing.id:
+                raise WorkflowValidationError(
+                    "模板不能继承自身", diagnostic=WorkflowDiagnostic("template_cycle", ("parent_id",)),
+                )
+            if any(item.id == existing.id for item in self._template_chain(parent_id)):
+                raise WorkflowValidationError(
+                    "模板继承存在循环", diagnostic=WorkflowDiagnostic("template_cycle", ("parent_id",)),
+                )
+        inherited_groups: list[ResolvedGroupView] = []
+        inherited_steps: list[_EffectiveStep] = []
+        if parent_id is not None:
+            try:
+                parent = self._get_template(parent_id)
+            except WorkflowNotFoundError as exc:
+                exc.diagnostics = [WorkflowDiagnostic(
+                    "template_missing", ("template_id" if owner_type == OWNER_SITE else "parent_id",),
+                )]
+                raise
+            inherited_groups = self._resolved_template_groups(parent)
+            inherited_steps = self._resolved_template_steps(parent)
+        if owner_type == OWNER_TEMPLATE and existing is not None:
+            self._validate_template_structure(existing, payload.groups, payload.steps, parent_id)
+        self._validate_group_inputs(payload.groups, inherited_groups)
+        self._validate_step_groups(
+            payload.steps,
+            {step.step_key: step.group_key for step in inherited_steps},
+            {group.group_key for group in payload.groups},
+            {group.group_key for group in inherited_groups},
+        )
+        self._apply_override_positions(
+            payload.steps, inherited_steps, preserve_positions=preserve_positions,
+        )
+
+    def validate_draft(
+        self, owner_type: str, payload: SiteWrite | TemplateWrite, owner_id: int | None = None
+    ) -> dict:
+        from app.services.workflow_drafts import validate_draft
+
+        with self.session.no_autoflush:
+            try:
+                return validate_draft(self, owner_type, payload, owner_id)
+            except WorkflowError:
+                raise
+            except (ValueError, KeyError, TypeError) as exc:
+                raise WorkflowValidationError("工作流配置无法解析") from exc
 
     def _ensure_name_available(
         self,
@@ -1364,7 +1545,9 @@ class WorkflowService(WorkflowHistoryMixin):
         if exclude_id is not None:
             query = query.where(model.id != exclude_id)
         if self.session.scalar(query) is not None:
-            raise WorkflowConflictError(f"名称已存在: {name}")
+            raise WorkflowConflictError(
+                f"名称已存在: {name}", diagnostic=WorkflowDiagnostic("name_conflict", ("name",)),
+            )
 
     @atomic_workflow_write
     def create_template(self, payload: TemplateWrite) -> TemplateDetail:
@@ -1381,23 +1564,7 @@ class WorkflowService(WorkflowHistoryMixin):
         self.session.add(template)
         try:
             self.session.flush()
-            inherited_groups: list[ResolvedGroupView] = []
-            inherited_effective: list[_EffectiveStep] = []
-            if payload.parent_id is not None:
-                parent = self._get_template(payload.parent_id)
-                inherited_groups = self._resolved_template_groups(parent)
-                inherited_effective = self._resolved_template_steps(parent)
-            inherited_steps = {
-                step.step_key: step.group_key for step in inherited_effective
-            }
-            self._validate_group_inputs(payload.groups, inherited_groups)
-            self._validate_step_groups(
-                payload.steps,
-                inherited_steps,
-                {group.group_key for group in payload.groups},
-                {group.group_key for group in inherited_groups},
-            )
-            self._apply_override_positions(payload.steps, inherited_effective)
+            self._prepare_local_inputs(OWNER_TEMPLATE, payload, payload.parent_id)
             self._replace_signals(OWNER_TEMPLATE, template.id, payload.signals)
             self._replace_groups(OWNER_TEMPLATE, template.id, payload.groups)
             self._replace_steps(OWNER_TEMPLATE, template.id, payload.steps)
@@ -1420,32 +1587,10 @@ class WorkflowService(WorkflowHistoryMixin):
         if not _revision_claimed:
             self._cas_revision(template, payload.expected_revision, payload.expected_history_key)
         self._ensure_name_available(Template, payload.name, exclude_id=template_id)
-        if payload.parent_id is not None:
-            if payload.parent_id == template_id:
-                raise WorkflowValidationError("模板不能继承自身")
-            parent_chain = self._template_chain(payload.parent_id)
-            if any(item.id == template_id for item in parent_chain):
-                raise WorkflowValidationError("模板继承存在循环")
-        inherited_groups: list[ResolvedGroupView] = []
-        inherited_effective: list[_EffectiveStep] = []
-        if payload.parent_id is not None:
-            parent = self._get_template(payload.parent_id)
-            inherited_groups = self._resolved_template_groups(parent)
-            inherited_effective = self._resolved_template_steps(parent)
-        inherited_steps = {
-            step.step_key: step.group_key for step in inherited_effective
-        }
-        self._validate_template_structure(
-            template, payload.groups, payload.steps, payload.parent_id
+        self._prepare_local_inputs(
+            OWNER_TEMPLATE, payload, payload.parent_id, template,
+            preserve_positions=_restored_from is not None,
         )
-        self._validate_group_inputs(payload.groups, inherited_groups)
-        self._validate_step_groups(
-            payload.steps,
-            inherited_steps,
-            {group.group_key for group in payload.groups},
-            {group.group_key for group in inherited_groups},
-        )
-        self._apply_override_positions(payload.steps, inherited_effective, preserve_positions=_restored_from is not None)
         template.name = payload.name
         template.description = payload.description
         template.parent_id = payload.parent_id
@@ -1498,6 +1643,7 @@ class WorkflowService(WorkflowHistoryMixin):
             )
             self.resolve_template(descendant_id)
         for site in self.session.scalars(select(Site).where(Site.template_id.in_(template_ids))):
+            site = self._get_site(site.id)
             self._validate_group_inputs(
                 [GroupInput.model_validate(self._group_view(row).model_dump())
                  for row in self._groups(OWNER_SITE, site.id)],
@@ -1546,7 +1692,7 @@ class WorkflowService(WorkflowHistoryMixin):
         self.session.commit()
 
     @atomic_workflow_write
-    def create_site(self, payload: SiteWrite) -> SiteDetail:
+    def create_site(self, payload: SiteWrite, *, _commit: bool = True) -> SiteDetail:
         self._ensure_name_available(Site, payload.name)
         if payload.template_id is not None:
             self._get_template(payload.template_id)
@@ -1572,20 +1718,7 @@ class WorkflowService(WorkflowHistoryMixin):
         self.session.add(site)
         try:
             self.session.flush()
-            inherited_groups: list[ResolvedGroupView] = []
-            inherited_steps: list[_EffectiveStep] = []
-            if payload.template_id is not None:
-                template = self._get_template(payload.template_id)
-                inherited_groups = self._resolved_template_groups(template)
-                inherited_steps = self._resolved_template_steps(template)
-            self._validate_group_inputs(payload.groups, inherited_groups)
-            self._validate_step_groups(
-                payload.steps,
-                {step.step_key: step.group_key for step in inherited_steps},
-                {group.group_key for group in payload.groups},
-                {group.group_key for group in inherited_groups},
-            )
-            self._apply_override_positions(payload.steps, inherited_steps)
+            self._prepare_local_inputs(OWNER_SITE, payload, payload.template_id)
             self._replace_groups(OWNER_SITE, site.id, payload.groups)
             self._replace_signals(OWNER_SITE, site.id, payload.signals)
             self._replace_steps(OWNER_SITE, site.id, payload.steps)
@@ -1593,7 +1726,8 @@ class WorkflowService(WorkflowHistoryMixin):
             self.resolve_site(site.id)
             self._record_history(site, "create")
             result = self.get_site(site.id)
-            self.session.commit()
+            if _commit:
+                self.session.commit()
         except WorkflowError:
             self.session.rollback()
             raise
@@ -1603,27 +1737,17 @@ class WorkflowService(WorkflowHistoryMixin):
         return result
 
     @atomic_workflow_write
-    def update_site(self, site_id: int, payload: SiteWrite, *, _restored_from=None, _revision_claimed=False) -> SiteDetail:
+    def update_site(self, site_id: int, payload: SiteWrite, *, _restored_from=None, _revision_claimed=False, _commit: bool = True) -> SiteDetail:
         site = self._get_site(site_id)
         if not _revision_claimed:
             self._cas_revision(site, payload.expected_revision, payload.expected_history_key)
         self._ensure_name_available(Site, payload.name, exclude_id=site_id)
         if payload.template_id is not None:
             self._get_template(payload.template_id)
-        inherited_groups: list[ResolvedGroupView] = []
-        inherited_steps: list[_EffectiveStep] = []
-        if payload.template_id is not None:
-            template = self._get_template(payload.template_id)
-            inherited_groups = self._resolved_template_groups(template)
-            inherited_steps = self._resolved_template_steps(template)
-        self._validate_group_inputs(payload.groups, inherited_groups)
-        self._validate_step_groups(
-            payload.steps,
-            {step.step_key: step.group_key for step in inherited_steps},
-            {group.group_key for group in payload.groups},
-            {group.group_key for group in inherited_groups},
+        self._prepare_local_inputs(
+            OWNER_SITE, payload, payload.template_id, site,
+            preserve_positions=_restored_from is not None,
         )
-        self._apply_override_positions(payload.steps, inherited_steps, preserve_positions=_restored_from is not None)
         site.name = payload.name
         site.base_url = payload.base_url
         if "trusted_urls" in payload.model_fields_set:
@@ -1653,13 +1777,52 @@ class WorkflowService(WorkflowHistoryMixin):
             self._record_history(site, "restore" if _restored_from is not None else "update",
                                  restored_from_revision=_restored_from)
             result = self.get_site(site.id)
-            self.session.commit()
+            if _commit:
+                self.session.commit()
         except WorkflowError:
             self.session.rollback()
             raise
         except IntegrityError as exc:
             self.session.rollback()
             raise WorkflowConflictError("站点名称冲突") from exc
+        return result
+
+    @atomic_workflow_write
+    def patch_site_settings(
+        self, site_id: int, patch: dict, *, expected_revision: int,
+        expected_history_key: str, _commit: bool = True,
+    ) -> SiteDetail:
+        if (type(expected_revision) is not int or expected_revision < 1
+                or not isinstance(expected_history_key, str) or not expected_history_key):
+            raise WorkflowValidationError("Expected revision and history key are required")
+        if not isinstance(patch, dict):
+            raise WorkflowValidationError("Settings patch must be an object")
+        # Validate raw input again even when a caller already previewed the patch.
+        values = SiteSettingsPatch.model_validate(patch).model_dump(exclude_unset=True)
+        site = self._get_site(site_id)
+        self.session.refresh(site)
+        self._check_revision(site, expected_revision, expected_history_key)
+        changes = {}
+        for key, value in values.items():
+            if key in {"trusted_urls", "tags"}:
+                column = f"{key}_json"
+                if _json_list(getattr(site, column)) != value:
+                    changes[column] = json.dumps(value, ensure_ascii=False)
+            elif getattr(site, key) != value:
+                changes[key] = value
+        if changes:
+            self._cas_revision(site, expected_revision, expected_history_key)
+            if "name" in changes:
+                self._ensure_name_available(Site, changes["name"], exclude_id=site_id)
+            for key, value in changes.items():
+                setattr(site, key, value)
+            site.updated_at = _utcnow()
+            self.session.flush()
+            self.resolve_site(site.id)
+            self._record_history(site, "update")
+        result = self.get_site(site.id)
+        if _commit:
+            self.session.commit()
         return result
 
     @atomic_workflow_write

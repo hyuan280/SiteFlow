@@ -93,8 +93,9 @@ class WorkflowHistoryMixin:
             if parent_id in seen:
                 break
             seen.add(parent_id)
-            parent = self.session.get(Template, parent_id)
-            if parent is None:
+            try:
+                parent = self._get_template(parent_id)
+            except ValueError:
                 break
             dependencies.append({
                 "owner_type": "template", "owner_id": parent.id,
@@ -193,7 +194,7 @@ class WorkflowHistoryMixin:
                     self._record_history(row, "baseline")
         self.session.commit()
 
-    def _cas_revision(self, row, expected_revision, expected_history_key=None):
+    def _require_current_history(self, row):
         from app.services.workflows import WorkflowConflictError
 
         revision = self._revision(row)
@@ -203,6 +204,26 @@ class WorkflowHistoryMixin:
         ))
         if exists is None:
             raise WorkflowConflictError("配置缺少当前版本历史，请完成启动迁移后重试")
+        return revision
+
+    def _check_revision(self, row, expected_revision, expected_history_key=None):
+        from app.services.workflows import WorkflowConflictError
+
+        revision = self._require_current_history(row)
+        expected = revision if expected_revision is None else expected_revision
+        identity = row.history_key if expected_history_key is None else str(expected_history_key)
+        model = type(row)
+        column = model.version if isinstance(row, Template) else model.config_revision
+        exists = self.session.scalar(select(model.id).where(
+            model.id == row.id, model.history_key == identity, column == expected,
+        ))
+        if exists is None:
+            raise WorkflowConflictError("配置版本已变化，请刷新后重试")
+
+    def _cas_revision(self, row, expected_revision, expected_history_key=None):
+        from app.services.workflows import WorkflowConflictError
+
+        revision = self._require_current_history(row)
         model = type(row)
         column = model.version if isinstance(row, Template) else model.config_revision
         expected = revision if expected_revision is None else expected_revision

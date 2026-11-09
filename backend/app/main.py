@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from threading import BoundedSemaphore
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +10,8 @@ from app.api.v1 import auth as auth_api
 from app.api.v1 import (
     analytics,
     artifacts as artifacts_api,
+    assistant,
+    config_ai,
     features,
     health,
     integrations,
@@ -23,6 +26,7 @@ from app.api.v1 import (
     secrets,
     templates,
     workflow_history,
+    workflow_drafts,
 )
 from app.core.auth import LoginRateLimiter
 from app.core.config import Settings
@@ -36,6 +40,9 @@ from app.services.executor import ExecutionManager
 from app.services.scheduler import Scheduler
 from app.services.scheduler_settings import reset_next_run_for_timezone
 from app.models.auth import AuthSession, User  # noqa: F401  (register tables)
+from app.models.assistant import AssistantMessage, AssistantSession  # noqa: F401
+from app.models.assistant_workflow import AssistantWorkflowAction  # noqa: F401
+from app.models.assistant_run import AssistantRunGuard  # noqa: F401
 from app.models.execution import JobStep, Run, SiteJob  # noqa: F401  (register tables)
 from app.models.integration import IntegrationConfig  # noqa: F401  (register table)
 from app.models.plugin import PluginRegistration  # noqa: F401  (register table)
@@ -51,6 +58,7 @@ from app.models.workflow import (  # noqa: F401  (register tables)
 )
 from app.services.auth import bootstrap_admin
 from app.services.workflows import WorkflowService
+from app.services.assistant import AssistantManager
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -70,6 +78,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     executor = ExecutionManager(session_factory, settings, crypto)
     scheduler = Scheduler(session_factory, settings, crypto, executor)
     artifact_cleanup = ArtifactCleanupRunner(session_factory, settings)
+    assistant_manager = AssistantManager(session_factory, settings, crypto, executor=executor)
+    assistant_manager.recover()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -80,6 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await artifact_cleanup.start()
         yield
         await artifact_cleanup.stop()
+        await assistant_manager.shutdown()
         await scheduler.stop()
         await executor.shutdown()
 
@@ -96,9 +107,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = session_factory
     app.state.bootstrap = bootstrap
     app.state.rate_limiter = LoginRateLimiter()
+    app.state.config_ai_slot = BoundedSemaphore(1)
     app.state.executor = executor
     app.state.scheduler = scheduler
     app.state.artifact_cleanup = artifact_cleanup
+    app.state.assistant_manager = assistant_manager
 
     app.add_middleware(
         CORSMiddleware,
@@ -117,6 +130,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(lanes.router)
     app.include_router(lane_settings.router)
     app.include_router(features.router)
+    app.include_router(assistant.router)
+    app.include_router(config_ai.router)
+    app.include_router(workflow_drafts.router)
     app.include_router(templates.router)
     app.include_router(sites.router)
     app.include_router(workflow_history.router)

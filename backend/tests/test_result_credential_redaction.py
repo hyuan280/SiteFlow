@@ -155,7 +155,7 @@ def test_execute_job_redacts_consumed_credentials(
     assert vision.sanitize_judgment_reason(reason, {FINGERPRINTS: payload[FINGERPRINTS]}) == reason
     request_text = requests[-1].content.decode()
     assert set(json.loads(request_text)) == {
-        "model", "max_tokens", "temperature", "messages", "tools", "tool_choice",
+        "model", "temperature", "messages", "tools", "tool_choice",
     }
     log = (tmp_path / "run-1" / "job-1" / "job.log").read_text()
     assert reason in log

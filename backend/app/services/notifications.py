@@ -720,7 +720,7 @@ class NotificationService:
         for job in jobs:
             counts[job.status] = counts.get(job.status, 0) + 1
         status_label = STATUS_LABELS.get(run.status, run.status)
-        trigger_label = {"schedule": "定时调度", "manual": "手动执行"}.get(
+        trigger_label = {"schedule": "定时调度", "manual": "手动执行", "assistant": "assistant"}.get(
             run.trigger, run.trigger
         )
         site_rows = [

@@ -20,6 +20,7 @@ from app.schemas.execution import (
     RunSummary,
     SiteJobView,
 )
+from app.services.assistant_run_guard import unresolved_assistant_runs
 from app.services.workflows import WorkflowError, WorkflowService
 
 FINAL_RUN_STATUSES = {
@@ -201,7 +202,7 @@ class ExecutionService:
         return start, end
 
     def today_excluded_site_ids(self, now: datetime | None = None) -> set[int]:
-        """Sites successful in the scheduler's calendar day, or currently active."""
+        """Sites successful today, active, or awaiting assistant outcome resolution."""
         start, end = self._today_bounds_utc(now)
         successful = set(
             self.session.scalars(
@@ -222,7 +223,16 @@ class ExecutionService:
                 )
             ).all()
         )
-        return {site_id for site_id in successful | active if site_id is not None}
+        assistant_sites = self.session.scalars(
+            select(SiteJob.site_id).join(Run).where(
+                Run.trigger == "assistant", SiteJob.site_id.is_not(None),
+            ).distinct()
+        ).all()
+        unresolved = {
+            site_id for site_id in assistant_sites
+            if unresolved_assistant_runs(self.session, site_id)
+        }
+        return {site_id for site_id in successful | active | unresolved if site_id is not None}
 
     def create_run(
         self,
@@ -231,6 +241,8 @@ class ExecutionService:
         *,
         mode: str = "manual",
         trigger: str = "manual",
+        _commit: bool = True,
+        _allow_disabled: bool = False,
     ) -> RunDetail:
         if payload.today_unsuccessful and payload.site_ids is not None:
             raise ExecutionValidationError("不能同时指定站点和今日未成功模式")
@@ -266,7 +278,7 @@ class ExecutionService:
         workflow = WorkflowService(self.session, self.settings, self.crypto)
         resolved_by_site: dict[int, Any] = {}
         for site in sites:
-            if not site.enabled:
+            if not site.enabled and not (trigger == "assistant" and _allow_disabled):
                 raise ExecutionValidationError(f"站点未启用: {site.name}")
             try:
                 resolved = workflow.resolve_site(site.id)
@@ -306,7 +318,10 @@ class ExecutionService:
                     message="等待执行",
                 )
             )
-        self.session.commit()
+        if _commit:
+            self.session.commit()
+        else:
+            self.session.flush()
         return self.get_run(run.id)
 
     def cancel_run(self, run_id: int) -> RunDetail:

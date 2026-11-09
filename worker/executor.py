@@ -148,6 +148,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class _StepInputValidationError(RuntimeError):
+    def __init__(self, message: str, field: str) -> None:
+        super().__init__(message)
+        self.field = field
+
+
 def _step_result(
     step: dict[str, Any],
     status: str,
@@ -322,6 +328,7 @@ async def _find_locator(
     *,
     wait_ms: int = 0,
     on_match: Callable[[str], None] | None = None,
+    visible_any: bool = False,
 ):
     deadline = time.monotonic() + max(0, wait_ms) / 1000
     while True:
@@ -329,11 +336,16 @@ async def _find_locator(
             if not selector:
                 continue
             try:
-                locator = page.locator(selector).first
-                if await locator.count() and await locator.is_visible():
-                    if on_match is not None:
-                        on_match(selector)
-                    return locator
+                matches = page.locator(selector)
+                if visible_any:
+                    candidates = [matches.nth(index) for index in range(min(await matches.count(), 100))]
+                else:
+                    candidates = [matches.first] if await matches.first.count() else []
+                for locator in candidates:
+                    if await locator.is_visible():
+                        if on_match is not None:
+                            on_match(selector)
+                        return locator
             except Exception:
                 continue
         if time.monotonic() >= deadline:
@@ -346,6 +358,217 @@ def _page_frames(page: Any) -> list[Any]:
         return list(page.frames)
     except Exception:
         return [page]
+
+
+async def _success_frame_scope(page: Any, frame: Any, deadline: float) -> str:
+    """Classify without reading an excluded frame's document."""
+    def origin(url: str):
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                return None
+            port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            return None
+        return (parsed.scheme, parsed.hostname.lower(), port)
+
+    async with asyncio.timeout(max(0, deadline - time.monotonic())):
+        main = getattr(page, "main_frame", page)
+        if frame is main:
+            return "main"
+        page_origin = origin(page.url)
+        if page_origin is None:
+            return "unreadable_frame"
+        chain = []
+        current = frame
+        for _ in range(100):
+            if current is main:
+                break
+            try:
+                parsed = urlsplit(current.url)
+            except ValueError:
+                return "unreadable_frame"
+            inherited = parsed.scheme == "about" and parsed.path in {"blank", "srcdoc"}
+            if not inherited and origin(current.url) != page_origin:
+                return "cross_origin"
+            chain.append(current)
+            current = current.parent_frame
+            if current is None:
+                return "unreadable_frame"
+        else:
+            return "unreadable_frame"
+        # Child locators can report visible inside a hidden iframe. Every
+        # embedding element must also be visible, including inherited origins.
+        for child in chain:
+            handle = await child.frame_element()
+            try:
+                if not await handle.is_visible():
+                    return "hidden_frame"
+            finally:
+                # Cleanup must not turn a stalled frame read into an unbounded wait.
+                await asyncio.wait_for(
+                    handle.dispose(),
+                    timeout=max(0.001, min(FRAME_OP_TIMEOUT_SECONDS, deadline - time.monotonic())),
+                )
+        return "same_origin"
+
+
+async def _find_success_locator(
+    page: Any,
+    selectors: list[str],
+    *,
+    wait_ms: int,
+    on_match: Callable[[str], None] | None = None,
+):
+    """Read evidence only in the main document or visible same-origin frame chains."""
+    deadline = time.monotonic() + max(0, wait_ms) / 1000
+
+    async def success_match(frame: Any, selector: str):
+        if await _success_frame_scope(page, frame, deadline) not in {"main", "same_origin"}:
+            return None
+        locator = await _find_locator(frame, [selector], visible_any=True)
+        if locator is not None and await _success_frame_scope(page, frame, deadline) in {"main", "same_origin"}:
+            return locator
+        return None
+
+    while True:
+        # Re-read frames and locators as SPA rendering and redirects settle.
+        for frame in _page_frames(page)[:100]:
+            for selector in selectors:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                if not selector:
+                    continue
+                try:
+                    locator = await asyncio.wait_for(
+                        success_match(frame, selector),
+                        timeout=min(FRAME_OP_TIMEOUT_SECONDS, remaining),
+                    )
+                except Exception:
+                    continue
+                if locator is not None:
+                    if on_match is not None:
+                        on_match(selector)
+                    return locator
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(0.2, remaining))
+
+
+async def _login_success_evidence(
+    page: Any, selectors: list[str], *, waited_ms: int,
+    log: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    """A bounded, non-atomic snapshot, never a second login success decision."""
+    from playwright.async_api import Error as PlaywrightError
+
+    started = time.monotonic()
+    deadline = started + 3.0
+    frames = _page_frames(page)
+    evidence: dict[str, Any] = {
+        "selector_mode": "visible", "frame_scope": "main_and_visible_same_origin",
+        "snapshot_consistency": "sampled_after_timeout", "captured_after_timeout": True,
+        "waited_ms": waited_ms, "elapsed_ms": 0, "configured_count": len(selectors),
+        "selectors": [], "evidence_truncated": len(selectors) > 10 or len(frames) > 10,
+    }
+    for selector_index, selector in enumerate(selectors[:10]):
+        summary: dict[str, Any] = {
+            "selector_index": selector_index, "match_count": 0, "visible_count": 0,
+            "checked_count": 0, "truncated": len(frames) > 10,
+            "read_errors": 0, "frames": [],
+        }
+        evidence["selectors"].append(summary)
+        if not frames:
+            summary["read_errors"] = 1
+            summary["truncated"] = True
+        for frame_index, frame in enumerate(frames[:10]):
+            sample: dict[str, Any] = {
+                "frame_index": frame_index, "scope": "unreadable_frame",
+                "match_count": None, "visible_count": None,
+                "checked_count": 0, "truncated": False,
+            }
+            summary["frames"].append(sample)
+            reading_selector = False
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                async with asyncio.timeout(min(FRAME_OP_TIMEOUT_SECONDS, remaining)):
+                    sample["scope"] = await _success_frame_scope(page, frame, deadline)
+                    if sample["scope"] not in {"main", "same_origin"}:
+                        sample["error"] = "frame_not_eligible"
+                        if sample["scope"] == "unreadable_frame":
+                            summary["read_errors"] += 1
+                            sample["truncated"] = True
+                        continue
+                    reading_selector = True
+                    matches = frame.locator(selector)
+                    count = await matches.count()
+                    if type(count) is not int or not 0 <= count <= 2**53 - 1:
+                        raise RuntimeError()
+                    sample["match_count"] = count
+                    sample["visible_count"] = 0
+                    for index in range(min(count, 100 - summary["checked_count"])):
+                        visible = await matches.nth(index).is_visible()
+                        if type(visible) is not bool:
+                            raise RuntimeError()
+                        sample["checked_count"] += 1
+                        summary["checked_count"] += 1
+                        sample["visible_count"] += int(visible)
+                    sample["truncated"] = sample["checked_count"] < count
+            except Exception as exc:
+                # Only static codes leave this boundary; provider messages may contain secrets.
+                code = "read_timeout"
+                try:
+                    if frame.is_detached() is True:
+                        code = "frame_detached"
+                except Exception:
+                    pass
+                if code != "frame_detached" and reading_selector:
+                    if isinstance(exc, ValueError) or (isinstance(exc, PlaywrightError) and re.search(
+                        r"invalid selector|not a valid selector|while parsing.*selector|"
+                        r"unknown engine|unexpected token|unsupported token",
+                        exc.message, re.IGNORECASE,
+                    )):
+                        code = "invalid_selector"
+                sample["error"] = code
+                sample["truncated"] = True
+                summary["read_errors"] += 1
+            finally:
+                summary["match_count"] += sample["match_count"] or 0
+                summary["visible_count"] += sample["visible_count"] or 0
+                summary["truncated"] |= sample["truncated"]
+        evidence["evidence_truncated"] |= summary["truncated"]
+
+    visible = any(item["visible_count"] for item in evidence["selectors"])
+    excluded = any(frame["error"] == "frame_not_eligible"
+                   for item in evidence["selectors"] for frame in item["frames"] if "error" in frame)
+    evidence["visible_after_timeout"] = visible
+    evidence["reason"] = (
+        "visible_after_timeout" if visible else
+        "read_incomplete" if evidence["evidence_truncated"] else
+        "matches_hidden" if any(item["match_count"] for item in evidence["selectors"]) else
+        "frame_scope_excluded" if excluded else "selector_missing"
+    )
+    evidence["elapsed_ms"] = max(0, int((time.monotonic() - started) * 1000))
+    # Trim detail, not aggregate counts, to fit the entire serialized snapshot.
+    while len(json.dumps(evidence).encode("utf-8")) > 16000:
+        summary = next(item for item in reversed(evidence["selectors"]) if item["frames"])
+        summary["frames"].pop()
+        summary["truncated"] = evidence["evidence_truncated"] = True
+        if not visible:
+            evidence["reason"] = "read_incomplete"
+    if log is not None:
+        for item in evidence["selectors"]:
+            scopes = {scope: sum(frame["scope"] == scope for frame in item["frames"])
+                      for scope in ("main", "same_origin", "cross_origin", "hidden_frame", "unreadable_frame")}
+            log("INFO", f"login success evidence #{item['selector_index']} "
+                f"matches={item['match_count']} visible={item['visible_count']} "
+                f"checked={item['checked_count']} read_errors={item['read_errors']} "
+                f"truncated={item['truncated']} frames={json.dumps(scopes)}")
+    return evidence
 
 
 async def _selector_exists(page: Any, selector: str) -> bool:
@@ -3756,7 +3979,7 @@ async def _run_step(
     feature = str(step.get("feature_type") or "")
     config = step.get("config") or {}
     if not isinstance(config, dict):
-        return "fail", "步骤配置不是对象", {}
+        return "fail", "步骤配置不是对象", {"reason": "input_validation_failed", "field": "config"}
     note = log or (lambda _level, _message: None)
 
     def record_secret(*values: Any) -> None:
@@ -3935,7 +4158,7 @@ async def _run_step(
             on_match=matched_note("点击目标"),
         )
         if locator is None:
-            return "fail", "未找到点击目标", {}
+            return "fail", "未找到点击目标", {"reason": "selector_not_found", "field": "selector"}
         await locator.click(
             button=str(config.get("button") or "left"),
             click_count=int(config.get("click_count") or 1),
@@ -3953,7 +4176,7 @@ async def _run_step(
             on_match=matched_note("输入框"),
         )
         if locator is None:
-            return "fail", "未找到输入框", {}
+            return "fail", "未找到输入框", {"reason": "selector_not_found", "field": "selector"}
         if bool(config.get("clear", True)):
             await locator.fill("", timeout=PAGE_TIMEOUT_MS)
         await locator.fill(str(config.get("value") or ""), timeout=PAGE_TIMEOUT_MS)
@@ -3976,9 +4199,9 @@ async def _run_step(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return "fail", f"Bitwarden 凭据获取失败: {str(exc)[:500]}", {}
+                return "fail", f"Bitwarden 凭据获取失败: {str(exc)[:500]}", {"reason": "credentials_unavailable"}
         if not credentials:
-            return "fail", "未配置站点登录凭据", {}
+            return "fail", "未配置站点登录凭据", {"reason": "credentials_unavailable"}
         username_selectors = list(config.get("username_selector") or [])
         password_selectors = list(config.get("password_selector") or [])
         submit_selectors = list(config.get("submit_selector") or [])
@@ -3990,7 +4213,7 @@ async def _run_step(
             on_match=matched_note("用户名输入框"),
         )
         if username is None:
-            return "fail", "未找到用户名输入框", {}
+            return "fail", "未找到用户名输入框", {"reason": "selector_not_found", "field": "username_selector"}
         selectors_note("密码输入框", password_selectors)
         password = await _find_locator(
             page,
@@ -3999,7 +4222,7 @@ async def _run_step(
             on_match=matched_note("密码输入框"),
         )
         if password is None:
-            return "fail", "未找到密码输入框", {}
+            return "fail", "未找到密码输入框", {"reason": "selector_not_found", "field": "password_selector"}
         selectors_note("登录按钮", submit_selectors)
         submit = await _find_locator(
             page,
@@ -4008,21 +4231,26 @@ async def _run_step(
             on_match=matched_note("登录按钮"),
         )
         if submit is None:
-            return "fail", "未找到登录按钮", {}
+            return "fail", "未找到登录按钮", {"reason": "selector_not_found", "field": "submit_selector"}
         if secret_payload is not None:
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         try:
+            from worker.secret_client import validate_assistant_submission
+            await validate_assistant_submission(secret_payload, page, step)
             note("INFO", "开始填写登录用户名")
             await username.fill(credentials["username"], timeout=PAGE_TIMEOUT_MS)
             if await username.input_value(timeout=PAGE_TIMEOUT_MS) != credentials["username"]:
-                raise RuntimeError("Username input verification failed")
+                raise _StepInputValidationError("Sensitive login fill failed", "username_selector")
             if secret_payload is not None:
                 require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
+            await validate_assistant_submission(secret_payload, page, step, ("username",))
             note("INFO", "用户名填写完成并校验，开始填写密码")
             await password.fill(credentials["password"], timeout=PAGE_TIMEOUT_MS)
             if await password.input_value(timeout=PAGE_TIMEOUT_MS) != credentials["password"]:
-                raise RuntimeError("Password input verification failed")
+                raise _StepInputValidationError("Sensitive login fill failed", "password_selector")
             note("INFO", "密码填写完成并校验")
+        except _StepInputValidationError:
+            raise
         except Exception:
             raise RuntimeError("Sensitive login fill failed") from None
         finally:
@@ -4030,25 +4258,35 @@ async def _run_step(
         note("INFO", "开始点击登录按钮")
         if secret_payload is not None:
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
+        await validate_assistant_submission(secret_payload, page, step, ("username", "password"))
         await submit.click(timeout=PAGE_TIMEOUT_MS)
         note("INFO", "已填写登录凭据并提交")
         success = list(config.get("success_selector") or [])
         if success:
-            if await _find_locator(
+            wait_seconds = max(1, min(int(config.get("success_wait_seconds", 10)), 120))
+            note("INFO", f"等待可见登录成功元素（最多 {wait_seconds} 秒，检查主页面及可见同源 iframe）")
+            success_started = time.monotonic()
+            if await _find_success_locator(
                 page,
                 success,
-                wait_ms=SELECTOR_WAIT_MS,
+                wait_ms=wait_seconds * 1000,
                 on_match=matched_note("登录成功元素"),
             ) is None:
-                return "fail", "登录成功元素未出现", {"url": page.url}
+                waited_ms = max(0, int((time.monotonic() - success_started) * 1000))
+                evidence = await _login_success_evidence(page, success, waited_ms=waited_ms, log=note)
+                return "fail", "登录成功元素未出现", {
+                    "url": page.url, "reason": "success_evidence_missing", "field": "success_selector",
+                    "submitted": True, "verified": False,
+                    "success_evidence": evidence,
+                }
         else:
             await asyncio.sleep(1)
-        return "success", "登录完成", {"url": page.url}
+        return "success", "登录完成", {"url": page.url, "submitted": True, "verified": bool(success)}
 
     if feature == "auth.password_verify":
         if secret_payload is None:
-            return "fail", "密码验证需要受控的站点凭据访问", {}
-        from worker.secret_client import resolve_secret, require_site_origin
+            return "fail", "密码验证需要受控的站点凭据访问", {"reason": "credentials_unavailable"}
+        from worker.secret_client import resolve_secret, require_site_origin, validate_assistant_submission
         from worker.browser_input import hold_page_input
 
         require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
@@ -4057,7 +4295,7 @@ async def _run_step(
         password_value = secret.pop("password", None)
         secret.clear()
         if not isinstance(password_value, str) or not password_value:
-            return "fail", "未获取到站点账户密码", {}
+            return "fail", "未获取到站点账户密码", {"reason": "credentials_unavailable"}
         try:
             selectors_note("密码输入框", config.get("password_selector"))
             password_input = await _find_locator(
@@ -4065,20 +4303,23 @@ async def _run_step(
                 wait_ms=SELECTOR_WAIT_MS, on_match=matched_note("密码输入框"),
             )
             if password_input is None:
-                return "fail", "未找到密码输入框", {}
+                return "fail", "未找到密码输入框", {"reason": "selector_not_found", "field": "password_selector"}
             selectors_note("密码验证按钮", config.get("submit_selector"))
             submit = await _find_locator(
                 page, list(config.get("submit_selector") or []),
                 wait_ms=SELECTOR_WAIT_MS, on_match=matched_note("密码验证按钮"),
             )
             if submit is None:
-                return "fail", "未找到密码验证按钮", {}
+                return "fail", "未找到密码验证按钮", {"reason": "selector_not_found", "field": "submit_selector"}
             async with hold_page_input(page):
                 require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
+                await validate_assistant_submission(secret_payload, page, step)
                 try:
                     await password_input.fill(password_value, timeout=PAGE_TIMEOUT_MS)
                     if await password_input.input_value(timeout=PAGE_TIMEOUT_MS) != password_value:
-                        raise RuntimeError("Password input verification failed")
+                        raise _StepInputValidationError("Sensitive password verification fill failed", "password_selector")
+                except _StepInputValidationError:
+                    raise
                 except Exception:
                     raise RuntimeError("Sensitive password verification fill failed") from None
         finally:
@@ -4086,6 +4327,7 @@ async def _run_step(
         note("INFO", "验证密码已填写并校验")
         async with hold_page_input(page):
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
+            await validate_assistant_submission(secret_payload, page, step, ("password",))
             try:
                 await submit.click(timeout=PAGE_TIMEOUT_MS)
             except Exception:
@@ -4097,7 +4339,10 @@ async def _run_step(
                 page, success, wait_ms=SELECTOR_WAIT_MS,
                 on_match=matched_note("密码验证成功元素"),
             ) is None:
-                return "fail", "密码验证成功元素未出现", {"url": page.url, "submitted": True, "verified": False}
+                return "fail", "密码验证成功元素未出现", {
+                    "url": page.url, "submitted": True, "verified": False,
+                    "reason": "success_evidence_missing", "field": "success_selector",
+                }
             return "success", "密码验证通过", {"url": page.url, "submitted": True, "verified": True}
         await asyncio.sleep(1)
         return "success", "密码验证已提交，未配置成功元素检查", {"url": page.url, "submitted": True, "verified": False}
@@ -4126,7 +4371,7 @@ async def _run_step(
             on_match=matched_note("动态验证码输入框"),
         )
         if code_input is None:
-            return "fail", "未找到动态验证码输入框", {}
+            return "fail", "未找到动态验证码输入框", {"reason": "selector_not_found", "field": "code_selector"}
         if secret_payload is not None:
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         try:
@@ -4148,7 +4393,7 @@ async def _run_step(
             on_match=matched_note("动态验证码提交按钮"),
         )
         if submit is None:
-            return "fail", "未找到动态验证码提交按钮", {}
+            return "fail", "未找到动态验证码提交按钮", {"reason": "selector_not_found", "field": "submit_selector"}
         if secret_payload is not None:
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         await submit.click(timeout=PAGE_TIMEOUT_MS)
@@ -4160,7 +4405,10 @@ async def _run_step(
             wait_ms=SELECTOR_WAIT_MS,
             on_match=matched_note("两步验证成功元素"),
         ) is None:
-            return "fail", "两步验证成功元素未出现", {"url": page.url}
+            return "fail", "两步验证成功元素未出现", {
+                "url": page.url, "reason": "success_evidence_missing", "field": "success_selector",
+                "submitted": True, "verified": False,
+            }
         if not success:
             await asyncio.sleep(1)
         return "success", "两步验证完成", {"url": page.url}
@@ -4189,7 +4437,7 @@ async def _run_step(
             on_match=matched_note("签到按钮"),
         )
         if button is None:
-            return "fail", "未找到签到按钮", {}
+            return "fail", "未找到签到按钮", {"reason": "selector_not_found", "field": "button_selector"}
         await button.click(timeout=PAGE_TIMEOUT_MS)
         note("INFO", "签到按钮已点击")
         confirm = list(config.get("confirm_selector") or [])
@@ -4207,7 +4455,9 @@ async def _run_step(
         await asyncio.sleep(1)
         signals = list(config.get("success_signals") or [])
         if not await _check_success_text(page, signals, note):
-            return "unknown", "未识别到签到成功信号", {"url": page.url}
+            return "unknown", "未识别到签到成功信号", {
+                "url": page.url, "reason": "success_evidence_missing", "field": "success_signals",
+            }
         return "success", "签到按钮已点击", {"url": page.url}
 
     if feature in {"sign.iframe_form", "sign.iframe.image_captcha"}:
@@ -4233,7 +4483,7 @@ async def _run_step(
             on_match=matched_note("Claim 按钮"),
         )
         if claim is None:
-            return "fail", "未找到 Claim 按钮", {}
+            return "fail", "未找到 Claim 按钮", {"reason": "selector_not_found", "field": "claim_selector"}
         await claim.click(timeout=PAGE_TIMEOUT_MS)
         note("INFO", "Claim 按钮已点击")
         try:
@@ -4247,7 +4497,7 @@ async def _run_step(
                 "WARN",
                 f"成功条件未命中，文本候选：{_short(', '.join(map(str, candidates)))}",
             )
-            return "unknown", "未识别到领取成功信号", {"url": page.url}
+            return "unknown", "未识别到领取成功信号", {"url": page.url, "reason": "success_evidence_missing"}
         return "success", "Claim 已完成", {
             "url": page.url,
             "success_by": success_by,
@@ -4624,6 +4874,15 @@ async def _execute_admitted_job(
                     )
                     await emit_progress()
 
+                feature = str(step.get("feature_type") or "")
+                # Opt in only for host-tagged assistant runs. A raised error after
+                # dispatch cannot prove that a business action was not applied.
+                assistant_side_effect = payload.get("assistant_run") is True and (
+                    feature.startswith(("auth.", "sign.", "post."))
+                    or feature in {"action.click", "action.fill", "challenge.2fa",
+                                   "challenge.altcha", "challenge.slider",
+                                   "challenge.image_captcha", "challenge.grid_captcha"}
+                )
                 try:
                     status, message, data = await asyncio.wait_for(
                         _run_step(
@@ -4651,9 +4910,14 @@ async def _execute_admitted_job(
                         timeout=max(1, int(timeout)),
                     )
                 except asyncio.TimeoutError:
-                    status = "waiting_human" if step.get("feature_type") in {"post.buy_card", "post.resign_click"} else "fail"
+                    status = ("unknown" if assistant_side_effect else
+                              "waiting_human" if feature in {"post.buy_card", "post.resign_click"} else "fail")
                     message = f"步骤超时（{timeout}s）"
-                    data = results[-1].get("data", {}) if step.get("feature_type") == "post.resign_click" else {}
+                    data = {**(results[-1].get("data", {}) if feature == "post.resign_click" else {}),
+                            "reason": "outcome_uncertain" if assistant_side_effect else "execution_timeout",
+                            "stage": "step_execution"}
+                    if assistant_side_effect:
+                        data["cause"] = "execution_timeout"
                 except asyncio.CancelledError:
                     partial = results[-1].get("data", {}) if step.get("feature_type") == "post.resign_click" else {}
                     job_status = "waiting_human" if "resign" in partial else "canceled"
@@ -4663,12 +4927,21 @@ async def _execute_admitted_job(
                     await emit_progress()
                     break
                 except Exception as exc:
-                    status, message, data = (
-                        "fail",
-                        f"{type(exc).__name__}: {str(exc)[:500]}",
-                        {},
-                    )
-                feature = str(step.get("feature_type") or "")
+                    if payload.get("assistant_run") is True:
+                        status = "unknown" if assistant_side_effect else "fail"
+                        message = "步骤执行异常，结果不确定，请核验后再操作" if assistant_side_effect else "步骤执行失败"
+                        data = {"reason": "outcome_uncertain" if assistant_side_effect else "execution_error",
+                                "stage": "step_execution"}
+                        if assistant_side_effect:
+                            data["cause"] = "execution_error"
+                    else:
+                        error_type = "RuntimeError" if isinstance(exc, _StepInputValidationError) else type(exc).__name__
+                        status, message = "fail", f"{error_type}: {str(exc)[:500]}"
+                        data = {"reason": "execution_error", "stage": "step_execution"}
+                    if isinstance(exc, _StepInputValidationError):
+                        if not assistant_side_effect:
+                            data["reason"] = "input_validation_failed"
+                        data["field"] = exc.field
                 if feature == "post.resign_click":
                     partial = results[-1].get("data", {})
                     if "resign" not in data and "resign" in partial:
@@ -4677,7 +4950,8 @@ async def _execute_admitted_job(
                     if resign.get("submit_attempted") or resign.get("success"):
                         payment_steps.add(str(step.get("step_key") or ""))
                         resign_dispatched_steps.add(str(step.get("step_key") or ""))
-                    if status not in {"success", "skipped", "restart", "fallback_interaction"}:
+                    if (status not in {"success", "skipped", "restart", "fallback_interaction"}
+                            and not (assistant_side_effect and status == "unknown")):
                         status = "waiting_human"
                 purchase = data.get("buy_card") if isinstance(data, dict) else None
                 if feature == "post.buy_card" and isinstance(purchase, dict) and (
@@ -4821,6 +5095,10 @@ async def _execute_admitted_job(
                     break
                 if status == "fallback_interaction":
                     job_status = "fallback_interaction"
+                    job_message = message
+                    break
+                if payload.get("assistant_run") is True and status == "unknown":
+                    job_status = "unknown"
                     job_message = message
                     break
                 policy = str(step.get("on_error") or "stop")

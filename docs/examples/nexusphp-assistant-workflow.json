@@ -1,0 +1,204 @@
+{
+  "name": "NexusPHP 登录签到示例",
+  "description": "基于 NexusPHP站点登录签到 及其父模板的脱敏改编，不是任意 NexusPHP 网站的已验证配置。仅演示无待处理挑战时的登录和当日签到；使用前按 docs/assistant-discovery.md 采集目标站点证据并重新校验。",
+  "parent_id": null,
+  "enabled": false,
+  "groups": [
+    {
+      "group_key": "login",
+      "name": "登录与状态确认",
+      "position": 1000000,
+      "step_anchor": 1000
+    },
+    {
+      "group_key": "sign",
+      "name": "当日签到与结果确认",
+      "position": 2000000,
+      "step_anchor": 5000
+    }
+  ],
+  "signals": [
+    {
+      "signal_key": "is_logged_in",
+      "label": "已登录",
+      "description": "来源模板的候选证据；必须在目标站点对比登录前后确认。排除文本命中时不可判为已登录。",
+      "include_texts": ["欢迎回来", "歡迎回來", "控制面板"],
+      "include_selectors": [],
+      "exclude_texts": ["请登录", "限制只能使用本IP登录", "Sign in"],
+      "exclude_selectors": [],
+      "match_mode": "any",
+      "enabled": true
+    },
+    {
+      "signal_key": "has_image_captcha",
+      "label": "存在图片验证码",
+      "description": "只检测来源模板中的候选图片元素，不读取图片代码或隐藏字段；命中时本示例不提交登录或签到。",
+      "include_texts": [],
+      "include_selectors": [
+        "img[alt='CAPTCHA']",
+        "img[alt='图片验证码']",
+        "img[src*='imagehash']"
+      ],
+      "exclude_texts": [],
+      "exclude_selectors": [],
+      "match_mode": "any",
+      "enabled": true
+    },
+    {
+      "signal_key": "is_checked_in",
+      "label": "今日已签到",
+      "description": "来源模板的候选成功与排除文本；必须确认指向当前账户和今日，而不是历史记录或导航文案。",
+      "include_texts": [
+        "今天已经签到", "今天已经簽到", "签到成功", "簽到成功",
+        "签到已得", "簽到已得", "已签到"
+      ],
+      "include_selectors": [],
+      "exclude_texts": ["每日签到", "签到得魔力", "簽到得魔力"],
+      "exclude_selectors": [],
+      "match_mode": "any",
+      "enabled": true
+    },
+    {
+      "signal_key": "has_sign_button",
+      "label": "存在当日签到入口",
+      "description": "文字或元素命中不等于有执行权限，也不证明按钮可点击或尚未签到。",
+      "include_texts": ["立即签到", "立即簽到"],
+      "include_selectors": ["input[value='立即签到']", "input[value='立即簽到']"],
+      "exclude_texts": [],
+      "exclude_selectors": [],
+      "match_mode": "any",
+      "enabled": true
+    }
+  ],
+  "steps": [
+    {
+      "step_key": "open_home",
+      "feature_type": "flow.open",
+      "label": "打开站点并检查已有登录状态",
+      "group_key": "login",
+      "position": 1000,
+      "enabled": true,
+      "condition": "always",
+      "on_error": "stop",
+      "config": {
+        "url": "{base_url}",
+        "wait_until": "domcontentloaded",
+        "retry_count": 0
+      }
+    },
+    {
+      "step_key": "open_login",
+      "feature_type": "action.navigate",
+      "label": "未登录时打开登录页",
+      "group_key": "login",
+      "position": 2000,
+      "enabled": true,
+      "condition": "signal:is_logged_in:false",
+      "on_error": "stop",
+      "config": {
+        "url": "{base_url}/login.php",
+        "wait_until": "domcontentloaded",
+        "retry_count": 0
+      }
+    },
+    {
+      "step_key": "submit_login",
+      "feature_type": "auth.form_login",
+      "label": "无图片验证码时提交站点私有凭据",
+      "group_key": "login",
+      "position": 3000,
+      "enabled": true,
+      "condition": "all(signal:is_logged_in:false,signal:has_image_captcha:false)",
+      "on_error": "stop",
+      "config": {
+        "username_selector": ["input[name='username']", "input[placeholder*='用户名']", "#username"],
+        "password_selector": ["input[type='password']", "input[name='password']"],
+        "submit_selector": [
+          "input[value='登录']", "input[value='登錄']", "button:has-text('登录')",
+          "input[id='submit-btn']", "input[type='submit']", "button[type='submit']"
+        ],
+        "username_field": "username",
+        "password_field": "password",
+        "success_selector": ["a[href*='logout.php']", "a[href*='userdetails.php']", "#info_block"]
+      }
+    },
+    {
+      "step_key": "login_not_confirmed",
+      "feature_type": "flow.result",
+      "label": "缺少登录证据时结束",
+      "group_key": "login",
+      "position": 4000,
+      "enabled": true,
+      "condition": "signal:is_logged_in:false",
+      "on_error": "stop",
+      "config": {
+        "output_value": false,
+        "message": "未确认登录成功；如有验证码或其他挑战，请人工检查，不自动重试提交。",
+        "llm_enabled": false
+      }
+    },
+    {
+      "step_key": "open_attendance",
+      "feature_type": "action.navigate",
+      "label": "已登录且未签到时访问签到页",
+      "group_key": "sign",
+      "position": 5000,
+      "enabled": true,
+      "condition": "all(signal:is_logged_in:true,signal:is_checked_in:false)",
+      "on_error": "stop",
+      "config": {
+        "url": "{base_url}/attendance.php",
+        "wait_until": "domcontentloaded",
+        "retry_count": 0
+      }
+    },
+    {
+      "step_key": "submit_sign",
+      "feature_type": "sign.button",
+      "label": "仅在未签到且存在入口时提交一次",
+      "group_key": "sign",
+      "position": 6000,
+      "enabled": true,
+      "condition": "all(signal:is_logged_in:true,signal:is_checked_in:false,signal:has_sign_button:true,signal:has_image_captcha:false)",
+      "on_error": "stop",
+      "config": {
+        "button_selector": ["input[value='立即簽到']", "input[value='立即签到']"],
+        "confirm_selector": [],
+        "success_signals": [
+          "今天已经签到", "今天已经簽到", "签到成功", "簽到成功",
+          "签到已得", "簽到已得", "已签到"
+        ]
+      }
+    },
+    {
+      "step_key": "sign_confirmed",
+      "feature_type": "flow.result",
+      "label": "登录和今日签到证据均成立时输出成功",
+      "group_key": "sign",
+      "position": 7000,
+      "enabled": true,
+      "condition": "all(signal:is_logged_in:true,signal:is_checked_in:true)",
+      "on_error": "stop",
+      "config": {
+        "output_value": true,
+        "message": "已确认登录及今日签到标记。",
+        "llm_enabled": false
+      }
+    },
+    {
+      "step_key": "sign_not_confirmed",
+      "feature_type": "flow.result",
+      "label": "其余情况不推断签到成功",
+      "group_key": "sign",
+      "position": 8000,
+      "enabled": true,
+      "condition": "always",
+      "on_error": "stop",
+      "config": {
+        "output_value": false,
+        "message": "未确认今日签到成功；先观察当前状态，不自动重试或重复签到。",
+        "llm_enabled": false
+      }
+    }
+  ]
+}

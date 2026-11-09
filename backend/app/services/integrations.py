@@ -16,6 +16,7 @@ from app.schemas.integration import (
     ConfigSource,
     IntegrationsView,
     IntegrationTestResult,
+    NumericView,
     ProxyView,
     TokenView,
     TwoFAuthView,
@@ -104,6 +105,8 @@ def mask_proxy_url(value: str) -> str:
 class IntegrationService:
     def resolve_vision(self, field: str) -> ResolvedValue:
         value = getattr(self.settings, f"vision_{field}")
+        if field == "max_tokens":
+            return self._resolve(str(value) if value is not None else None, "vision.max_tokens")
         if hasattr(value, "get_secret_value"):
             value = value.get_secret_value()
         return self._resolve((value or "").strip() or None, f"vision.{field}")
@@ -128,6 +131,9 @@ class IntegrationService:
 
     def vision_runtime(self) -> dict | None:
         from app.services.vision import validate_base_url
+        max_tokens = self._vision_max_tokens_view()
+        if max_tokens.error:
+            return None
         values = {field: self.resolve_vision(field).value for field in ("base_url", "model", "api_key")}
         if not all(values.values()):
             return None
@@ -136,7 +142,30 @@ class IntegrationService:
         except ValueError:
             return None
         supports = self.resolve_vision_supports_vision().value == "true"
-        return {**values, "supports_vision": supports, "timeout": self.settings.vision_timeout}
+        runtime = {**values, "supports_vision": supports, "timeout": self.settings.vision_timeout}
+        if max_tokens.value:
+            runtime["max_tokens"] = max_tokens.value
+        return runtime
+
+    def _vision_max_tokens_view(self) -> NumericView:
+        source = (
+            ConfigSource.ENV if self.settings.vision_max_tokens is not None
+            else ConfigSource.DB if self._row("vision.max_tokens") is not None
+            else ConfigSource.UNSET
+        )
+        value = None
+        error = None
+        try:
+            raw = self.resolve_vision("max_tokens").value
+            if source != ConfigSource.UNSET:
+                if not isinstance(raw, str) or not raw.isascii() or not raw.isdecimal():
+                    raise ValueError("invalid max_tokens")
+                value = int(raw)
+        except (IntegrationValidationError, ValueError, TypeError):
+            error = "Vision max_tokens is invalid or could not be decrypted"
+        return NumericView(
+            value=value, source=source, editable=source != ConfigSource.ENV, error=error
+        )
 
     def _vision_view(self):
         from app.schemas.integration import BooleanView, VisionView
@@ -162,21 +191,31 @@ class IntegrationService:
             source=supports.source,
             editable=supports.editable,
         )
+        values["max_tokens"] = self._vision_max_tokens_view()
         return VisionView(**values, available=self.vision_runtime() is not None)
 
     def update_vision(self, **fields) -> IntegrationsView:
         from app.services.vision import validate_base_url
         pending = {}
         for field, value in fields.items():
-            if value is None:
+            if value is None and field != "max_tokens":
                 continue
             resolved = (
-                self.resolve_vision_supports_vision()
+                self._vision_max_tokens_view()
+                if field == "max_tokens"
+                else self.resolve_vision_supports_vision()
                 if field == "supports_vision"
                 else self.resolve_vision(field)
             )
             if not resolved.editable:
                 raise ConfigLockedError(f"Vision {field} is locked by environment")
+            if field == "max_tokens":
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    value = 0
+                if type(value) is not int or value < 0:
+                    raise IntegrationValidationError("Vision max_tokens must be a nonnegative integer")
+                pending[field] = str(value)
+                continue
             if field == "supports_vision":
                 pending[field] = "true" if bool(value) else "false"
                 continue
@@ -195,10 +234,12 @@ class IntegrationService:
         return self.get_integrations()
 
     def delete_vision(self) -> IntegrationsView:
-        fields = ("base_url", "model", "api_key", "supports_vision")
+        fields = ("base_url", "model", "api_key", "supports_vision", "max_tokens")
         if any(
             not (
-                self.resolve_vision_supports_vision().editable
+                self._vision_max_tokens_view().editable
+                if field == "max_tokens"
+                else self.resolve_vision_supports_vision().editable
                 if field == "supports_vision"
                 else self.resolve_vision(field).editable
             )
@@ -230,7 +271,7 @@ class IntegrationService:
                     message="文本请求失败",
                     data={"mode": "text", "supports_vision": False},
                 )
-        image = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9WQAAAAASUVORK5CYII=")
+        image = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC")
         try:
             recognize(image, config, "Describe this image in a few words.")
             return IntegrationTestResult(ok=True, message="Vision image request succeeded")

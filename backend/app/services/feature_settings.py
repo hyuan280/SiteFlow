@@ -82,13 +82,16 @@ class FeatureSettingsService:
         self.session = session
         self._policy_cache: dict[str, tuple[dict, list[str], bool]] = {}
 
+    def _row(self, key: str):
+        return self.session.get(AppSetting, key)
+
     def policy(self, feature):
         cached = self._policy_cache.get(feature.key)
         if cached is not None:
             return cached
         defaults = _initial_defaults(feature)
         required = _base_required(feature)
-        row = self.session.get(AppSetting, f"feature.{feature.key}")
+        row = self._row(f"feature.{feature.key}")
         if row:
             policy = json.loads(row.value_json)
             policy_defaults = policy.get("defaults", {})
@@ -106,7 +109,7 @@ class FeatureSettingsService:
     def execution_settings(self, feature):
         if feature.key not in EXECUTION_SETTINGS_FEATURES:
             return None
-        row = self.session.get(AppSetting, f"feature.{feature.key}")
+        row = self._row(f"feature.{feature.key}")
         policy = json.loads(row.value_json) if row else {}
         stored = policy.get("execution_settings") or {}
         if feature.key == "flow.result":
@@ -204,5 +207,7 @@ class FeatureSettingsService:
         merged = {**defaults, **config}
         missing = [key for key in required if key not in merged or merged[key] is None]
         if missing:
-            raise FeatureConfigError(f"Required fields missing: {', '.join(missing)}")
+            raise FeatureConfigError(f"Required fields missing: {', '.join(missing)}", errors=[
+                {"loc": (key,), "type": "missing"} for key in missing[:10]
+            ])
         return feature.validate_full(merged)

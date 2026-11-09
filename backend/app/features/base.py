@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+)
 
 Category = Literal["flow", "auth", "challenge", "sign", "action", "post"]
 Cardinality = Literal["single", "multiple"]
@@ -53,8 +63,37 @@ class FeatureConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class GenerationHints(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    when_to_use: str = Field(max_length=1000)
+    prerequisites: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
+        default_factory=list, max_length=12,
+    )
+    avoid: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
+        default_factory=list, max_length=12,
+    )
+    evidence_required: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
+        default_factory=list, max_length=12,
+    )
+    examples: list[dict[str, JsonValue]] = Field(default_factory=list, max_length=3)
+
+    @field_validator("examples")
+    @classmethod
+    def _validate_examples(cls, value: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
+        try:
+            serialized = json.dumps(value, allow_nan=False, separators=(",", ":"))
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("examples must contain finite JSON values") from exc
+        if len(serialized) > 12000:
+            raise ValueError("serialized examples must not exceed 12000 characters")
+        return value
+
+
 class FeatureConfigError(ValueError):
-    pass
+    def __init__(self, message: str, *, errors: list[dict] | None = None):
+        super().__init__(message)
+        self.errors = errors or []
 
 
 FIELD_TITLES: dict[str, str] = {
@@ -149,6 +188,7 @@ class Feature:
     config_model: type[BaseModel]
     description: str = ""
     version: int = 1
+    generation_hints: GenerationHints | None = None
 
     def config_schema(self) -> dict[str, Any]:
         schema = self.config_model.model_json_schema()
@@ -182,26 +222,38 @@ class Feature:
         value" marker. Full validation happens after merge in the resolver.
         """
         if not isinstance(config, dict):
-            raise FeatureConfigError("config 必须是 JSON 对象")
+            raise FeatureConfigError("config 必须是 JSON 对象", errors=[{"loc": (), "type": "dict_type"}])
         fields = self.config_model.model_fields
         unknown = sorted(set(config) - set(fields))
         if unknown:
-            raise FeatureConfigError(f"未知配置字段: {', '.join(unknown)}")
+            raise FeatureConfigError(f"未知配置字段: {', '.join(unknown)}", errors=[
+                {"loc": (), "type": "extra_forbidden"},
+            ])
         for key, value in config.items():
             if value is None:
                 continue
             try:
                 TypeAdapter(fields[key].annotation).validate_python(value)
             except ValidationError as exc:
+                from app.services.workflow_diagnostics import safe_errors, schema_fields
+
                 message = exc.errors()[0].get("msg", str(exc))
-                raise FeatureConfigError(f"{key}: {message}") from exc
+                errors = safe_errors(exc.errors(), schema_fields(self.config_model.model_json_schema()))
+                for error in errors:
+                    error["loc"] = (key, *error["loc"])
+                raise FeatureConfigError(f"{key}: {message}", errors=errors) from exc
         return config
 
     def validate_full(self, config: dict[str, Any]) -> dict[str, Any]:
         try:
             model = self.config_model.model_validate(config)
         except ValidationError as exc:
+            from app.services.workflow_diagnostics import safe_errors, schema_fields
+
             message = exc.errors()[0].get("msg", str(exc))
             location = ".".join(str(part) for part in exc.errors()[0].get("loc", ()))
-            raise FeatureConfigError(f"{location}: {message}" if location else message) from exc
+            raise FeatureConfigError(
+                f"{location}: {message}" if location else message,
+                errors=safe_errors(exc.errors(), schema_fields(self.config_model.model_json_schema())),
+            ) from exc
         return model.model_dump(mode="json")

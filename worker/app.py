@@ -13,12 +13,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 import websockets
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from worker.executor import execute_job
+from worker.assistant_browser import (
+    AssistantBrowser, CheckSelectorRequest, InspectRequest, NavigateRequest,
+    ObserveRequest, OpenRequest, TokenRequest,
+)
+from worker.assistant_step import ExecuteRequest
 from worker.browser_backend import BrowserSession, create_backend
 from worker.plugin_broker import (
     BrokerActionError,
@@ -570,6 +577,8 @@ class PickerSession:
     page: Any
     url: str
     created_at: float
+    limiter: Any = None
+    acquired_slot: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def expired(self) -> bool:
@@ -594,13 +603,37 @@ async def _inject_picker(page: Any) -> None:
 
 
 async def _open_picker(manager: LaneManager, url: str, lane_key: str = "interaction") -> dict[str, Any]:
-    lease_id, _lane = await manager.lease_lane(lane_key)
     lane = manager.get(lane_key)
+    lease_id = None
     page = None
+    acquired_slot = False
+    provisioning = None
     try:
+        async def lease() -> None:
+            nonlocal lease_id
+            lease_id, _ = await manager.lease_lane(lane_key)
+
+        provisioning = asyncio.create_task(lease())
+        await asyncio.shield(provisioning)
+
+        async def acquire() -> None:
+            nonlocal acquired_slot
+            await lane.execution_semaphore.__aenter__()
+            acquired_slot = True
+
+        try:
+            await asyncio.wait_for(acquire(), 2)
+        except TimeoutError:
+            raise HTTPException(409, "Browser lane busy") from None
         if lane.context is None:
             raise RuntimeError("车道没有可用的浏览器上下文")
-        page = await lane.context.new_page()
+
+        async def new_page() -> None:
+            nonlocal page
+            page = await lane.context.new_page()
+
+        provisioning = asyncio.create_task(new_page())
+        await asyncio.shield(provisioning)
         await page.bring_to_front()
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         await _inject_picker(page)
@@ -617,16 +650,34 @@ async def _open_picker(manager: LaneManager, url: str, lane_key: str = "interact
             page=page,
             url=url,
             created_at=time.monotonic(),
+            limiter=lane.execution_semaphore,
+            acquired_slot=acquired_slot,
         )
         PICKER_SESSIONS[session_id] = session
         return session.view()
-    except Exception:
-        if page is not None:
+    except BaseException:
+        async def cleanup() -> None:
             try:
-                await page.close()
-            except Exception:
-                pass
-        await manager.release_lane(lane_key, lease_id)
+                if provisioning is not None:
+                    await asyncio.gather(provisioning, return_exceptions=True)
+                if page is not None:
+                    try:
+                        await asyncio.wait_for(page.close(), 5)
+                    except BaseException:
+                        pass
+            finally:
+                try:
+                    if lease_id is not None:
+                        await manager.release_lane(lane_key, lease_id)
+                finally:
+                    if acquired_slot:
+                        await lane.execution_semaphore.__aexit__(None, None, None)
+
+        cleanup_task = asyncio.create_task(cleanup())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
         raise
 
 
@@ -634,15 +685,28 @@ async def _close_picker(manager: LaneManager, session_id: str) -> None:
     session = PICKER_SESSIONS.pop(session_id, None)
     if session is None:
         return
-    async with session.lock:
-        try:
-            await session.page.close()
-        except Exception:
-            pass
-        try:
-            await manager.release_lane(session.lane_key, session.lease_id)
-        except Exception:
-            pass
+
+    async def cleanup() -> None:
+        async with session.lock:
+            try:
+                await asyncio.wait_for(session.page.close(), 5)
+            except BaseException:
+                pass
+            try:
+                await manager.release_lane(session.lane_key, session.lease_id)
+            except Exception:
+                pass
+            finally:
+                if session.acquired_slot:
+                    await session.limiter.__aexit__(None, None, None)
+                    session.acquired_slot = False
+
+    cleanup_task = asyncio.create_task(cleanup())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
 
 
 async def _picker_reaper(manager: LaneManager) -> None:
@@ -658,28 +722,123 @@ class PickerOpenRequest(BaseModel):
     lane_key: str = "interaction"
 
 
+class AssistantRecoveryBodyLimit:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        action = path.rsplit("/", 1)[-1]
+        if (scope["type"] != "http" or not path.startswith("/assistant-browser/")
+                or action not in {"execute", "screenshot", "refresh"}):
+            return await self.app(scope, receive, send)
+        limit = 128 * 1024 if action == "execute" else 4 * 1024
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > limit:
+                return await JSONResponse(status_code=413, content={"detail": "Browser request too large"})(scope, receive, send)
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        async def replay():
+            nonlocal body
+            if body is not None:
+                message = {"type": "http.request", "body": bytes(body), "more_body": False}
+                body = None
+                return message
+            return await receive()
+
+        return await self.app(scope, replay, send)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     manager = LaneManager()
     manager.plugin_broker = PluginBroker(PLUGIN_BROKER_URL)
     app.state.manager = manager
     await manager.start()
+    app.state.assistant_browser = AssistantBrowser(manager)
+    await app.state.assistant_browser.start()
     picker_task = asyncio.create_task(_picker_reaper(manager), name="picker-reaper")
     try:
         yield
     finally:
         picker_task.cancel()
         try:
-            await picker_task
-        except asyncio.CancelledError:
-            pass
-        for session_id in list(PICKER_SESSIONS):
-            await _close_picker(manager, session_id)
-        await manager.stop()
+            try:
+                await picker_task
+            except asyncio.CancelledError:
+                pass
+            for session_id in list(PICKER_SESSIONS):
+                await _close_picker(manager, session_id)
+        finally:
+            try:
+                await app.state.assistant_browser.stop()
+            finally:
+                await manager.stop()
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="SiteFlow Worker", version="0.2.0", lifespan=lifespan)
+    app.add_middleware(AssistantRecoveryBodyLimit)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith("/assistant-browser/"):
+            return JSONResponse(status_code=422, content={"detail": "Invalid browser request"})
+        return await request_validation_exception_handler(request, exc)
+
+    @app.post("/assistant-browser/open")
+    async def assistant_browser_open(payload: OpenRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.open(
+            payload.url, payload.lane_key, payload.token,
+            session_id=str(payload.session_id) if payload.session_id is not None else None,
+            trusted_origins=payload.trusted_origins,
+        )
+
+    @app.post("/assistant-browser/{session_id}/observe")
+    async def assistant_browser_observe(session_id: str, payload: ObserveRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.observe(
+            session_id, payload.token, payload.offset, payload.limit, payload.frame_id,
+        )
+
+    @app.post("/assistant-browser/{session_id}/inspect")
+    async def assistant_browser_inspect(session_id: str, payload: InspectRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.inspect(
+            session_id, payload.token, str(payload.snapshot_id), payload.node_id,
+            payload.offset, payload.limit,
+        )
+
+    @app.post("/assistant-browser/{session_id}/check-selector")
+    async def assistant_browser_check_selector(session_id: str, payload: CheckSelectorRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.check_selector(
+            session_id, payload.token, payload.selector, payload.frame_id,
+        )
+
+    @app.post("/assistant-browser/{session_id}/navigate")
+    async def assistant_browser_navigate(session_id: str, payload: NavigateRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.navigate(session_id, payload.token, payload.url)
+
+    @app.post("/assistant-browser/{session_id}/screenshot")
+    async def assistant_browser_screenshot(session_id: str, payload: TokenRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.screenshot(session_id, payload.token)
+
+    @app.post("/assistant-browser/{session_id}/refresh")
+    async def assistant_browser_refresh(session_id: str, payload: TokenRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.refresh(session_id, payload.token)
+
+    @app.post("/assistant-browser/{session_id}/close")
+    async def assistant_browser_close(session_id: str, payload: TokenRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.close(session_id, payload.token)
+
+    @app.post("/assistant-browser/{session_id}/execute")
+    async def assistant_browser_execute(session_id: str, payload: ExecuteRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.execute(session_id, payload)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -794,6 +953,8 @@ def create_app() -> FastAPI:
     async def open_picker(payload: PickerOpenRequest) -> dict[str, Any]:
         try:
             return await _open_picker(app.state.manager, payload.url, payload.lane_key)
+        except HTTPException:
+            raise
         except LaneDisabledError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except LaneStartError as exc:

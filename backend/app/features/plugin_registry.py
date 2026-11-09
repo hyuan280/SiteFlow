@@ -11,7 +11,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.features.base import Category, FeatureConfigError
+from app.features.base import Category, FeatureConfigError, GenerationHints
 from app.models.plugin import PluginRegistration
 
 _lock = threading.RLock()
@@ -41,6 +41,17 @@ class RemoteFeature:
     version: int
     schema: dict[str, Any]
     plugin_id: str
+
+    @property
+    def generation_hints(self) -> GenerationHints | None:
+        annotation = self.schema.get("x-siteflow-generation")
+        if not isinstance(annotation, dict):
+            return None
+        try:
+            return GenerationHints.model_validate(deepcopy(annotation))
+        except (ValueError, TypeError, RecursionError):
+            # Optional annotations must not invalidate an otherwise usable plugin.
+            return None
 
     def config_schema(self) -> dict[str, Any]:
         return deepcopy(self.schema)

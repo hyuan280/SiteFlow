@@ -44,11 +44,25 @@ def get_current_session(
     session: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> AuthSession:
+    return _current_session(request, session, settings, touch=True)
+
+
+def get_readonly_current_session(
+    request: Request,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> AuthSession:
+    return _current_session(request, session, settings, touch=False)
+
+
+def _current_session(
+    request: Request, session: Session, settings: Settings, *, touch: bool,
+) -> AuthSession:
     raw_token = request.cookies.get(SESSION_COOKIE)
     if not raw_token:
         raise HTTPException(status_code=401, detail="未登录")
     auth = AuthService(session, settings, request.app.state.bootstrap)
-    row = auth.get_session(raw_token)
+    row = auth.get_session(raw_token, touch=touch)
     if row is None:
         raise HTTPException(status_code=401, detail="会话已失效")
     return row

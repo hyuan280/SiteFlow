@@ -99,7 +99,7 @@ def test_request_uses_auto_grid_tool_and_selected_indices_schema(
     body = json.loads(request.content)
     assert body["model"] == "grid-model"
     assert body["temperature"] == 0.1
-    assert body["max_tokens"] == 2048
+    assert "max_tokens" not in body
     assert body["tool_choice"] == "auto"
     assert len(body["tools"]) == 1
     tool = body["tools"][0]

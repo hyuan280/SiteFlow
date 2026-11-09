@@ -690,7 +690,11 @@ onUnmounted(() => {
       <el-table-column label="结果汇总" min-width="220">
         <template #default="{ row }">{{ summaryText(row.summary) }}</template>
       </el-table-column>
-      <el-table-column prop="created_by" label="创建人" width="100" />
+      <el-table-column label="创建人" width="100">
+        <template #default="{ row }">
+          <span :title="row.trigger === 'assistant' ? '来源：智能助手' : undefined">{{ row.trigger === 'assistant' ? 'assistant' : row.created_by }}</span>
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="150" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" @click="openDetail(row.id)">详情</el-button>

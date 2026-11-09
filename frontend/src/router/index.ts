@@ -43,6 +43,11 @@ const router = createRouter({
           component: () => import("@/views/BrowserView.vue"),
         },
         {
+          path: "assistant",
+          name: "assistant",
+          component: () => import("@/views/AIAssistantView.vue"),
+        },
+        {
           path: "features",
           name: "features",
           component: () => import("@/views/FeaturesView.vue"),

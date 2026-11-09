@@ -53,7 +53,7 @@ def get_service(
 def update_vision(payload: VisionUpdate, service: IntegrationService = Depends(get_service),
                   _current: AuthSession = Depends(require_csrf)):
     try:
-        return service.update_vision(**payload.model_dump())
+        return service.update_vision(**payload.model_dump(exclude_unset=True))
     except ConfigLockedError as exc:
         raise HTTPException(409, str(exc)) from exc
     except IntegrationValidationError as exc:

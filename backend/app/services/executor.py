@@ -15,6 +15,7 @@ from app.core.config import Settings
 from app.core.crypto import CryptoService
 from app.models.execution import JobArtifact, JobStep, Run, SiteJob
 from app.models.workflow import Site, SiteResignRecord
+from app.services.assistant_run_guard import validate_guard
 from app.services.credentials import CredentialError, CredentialService
 from app.services.execution import ExecutionService, FINAL_JOB_STATUSES, FINAL_RUN_STATUSES
 from app.services.integrations import IntegrationService
@@ -439,6 +440,16 @@ class ExecutionManager:
                 session.commit()
                 return
             site = session.get(Site, job.site_id) if job.site_id is not None else None
+            if run.trigger == "assistant" and (
+                site is None
+                or not validate_guard(session, run_id, site, self.settings, self.crypto)
+            ):
+                self._finish_job(
+                    job, "fail", "助手测试配置已变化，请重新确认后运行",
+                    {"reason": "assistant_configuration_changed"},
+                )
+                session.commit()
+                return
             if site is None:
                 self._finish_job(job, "fail", "站点已不存在", {})
                 session.commit()
@@ -563,6 +574,21 @@ class ExecutionManager:
                 "resign_max_days": resign_days,
                 "plugin_runtimes": plugin_runtimes,
             }
+            if run.trigger == "assistant":
+                payload["assistant_run"] = True
+                # A separate session avoids cached ORM/policy values from payload construction.
+                with self.session_factory() as guard_session:
+                    current_site = guard_session.get(Site, site.id)
+                    unchanged = current_site is not None and validate_guard(
+                        guard_session, run_id, current_site, self.settings, self.crypto
+                    )
+                if not unchanged:
+                    self._finish_job(
+                        job, "fail", "助手测试配置已变化，请重新确认后运行",
+                        {"reason": "assistant_configuration_changed"},
+                    )
+                    session.commit()
+                    return
             job.message = "等待浏览器车道空位"
             job.heartbeat_at = datetime.now(timezone.utc)
             job.worker_id = "worker"
@@ -588,11 +614,13 @@ class ExecutionManager:
             with self.session_factory() as session:
                 job = session.get(SiteJob, job_id)
                 if job is not None:
+                    assistant = run.trigger == "assistant"
                     self._finish_job(
                         job,
-                        "error",
+                        "unknown" if assistant else "error",
+                        "助手运行结果无法确认，请人工核验后再运行" if assistant else
                         f"worker 执行失败: {type(exc).__name__}: {str(exc)[:500]}",
-                        {},
+                        {"reason": "assistant_outcome_uncertain"} if assistant else {},
                     )
                     session.commit()
             return

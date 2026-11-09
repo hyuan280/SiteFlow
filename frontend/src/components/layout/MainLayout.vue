@@ -70,6 +70,11 @@ const menuItems = [
     paths: ["M2 3h20v14H2z", "M8 21h8", "M12 17v4"],
   },
   {
+    path: "/assistant",
+    label: "智能助手",
+    paths: ["M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-3 2V11.5a8.5 8.5 0 0 1 17-1", "M8 10h.01", "M12 10h.01", "M16 10h.01"],
+  },
+  {
     path: "/features",
     label: "功能管理",
     paths: ["M3 3h7v7H3z", "M14 3h7v7h-7z", "M14 14h7v7h-7z", "M3 14h7v7H3z"],
@@ -156,7 +161,7 @@ async function changePassword(): Promise<void> {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="{ 'assistant-shell': route.path === '/assistant' }">
     <header class="app-topbar">
       <router-link to="/dashboard" class="brand">
         <span class="brand-mark">SF</span>
@@ -399,6 +404,9 @@ async function changePassword(): Promise<void> {
   padding: 26px 30px 48px;
 }
 
+.assistant-shell { height: 100dvh; }
+.assistant-shell .app-content { overflow: hidden; padding: 16px 20px; display: flex; flex-direction: column; }
+
 @media (max-width: 800px) {
   .app-topbar {
     padding: 0 16px;
@@ -444,5 +452,6 @@ async function changePassword(): Promise<void> {
     height: auto;
     padding: 18px 16px 36px;
   }
+  .assistant-shell .app-content { padding: 8px; height: 100%; }
 }
 </style>

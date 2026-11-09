@@ -1,4 +1,6 @@
 import os
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 import httpx
 import regex
@@ -31,7 +33,49 @@ def require_site_origin(current, base, trusted_urls=None):
     raise RuntimeError("Secret origin denied: 当前页面不属于站点同源或可信网址")
 
 
+@dataclass
+class AssistantSecretContext:
+    """In-process capability, never constructible from a JSON request payload."""
+
+    purpose: str
+    step_key: str
+    credentials: dict[str, str] = field(repr=False)
+    validate: Callable[[], Awaitable[None]] = field(repr=False)
+    used: bool = False
+    targets: dict = field(default_factory=dict, repr=False)
+    action_started: bool = False
+
+    async def resolve(self, step):
+        if (self.used or self.purpose not in {"auth.form_login", "auth.password_verify"}
+                or step.get("feature_type") != self.purpose or step.get("step_key") != self.step_key):
+            raise RuntimeError("Secret request denied")
+        self.used = True
+        await self.validate()
+        return dict(self.credentials)
+
+
+async def validate_assistant_submission(payload, page, step, filled=()):
+    """Assistant-only checks; job execution keeps its existing secret protocol."""
+    if payload is None or "_assistant_secret_context" not in payload:
+        return
+    context = payload["_assistant_secret_context"]
+    if (type(context) is not AssistantSecretContext or not context.used
+            or step.get("feature_type") != context.purpose or step.get("step_key") != context.step_key):
+        raise RuntimeError("Secret request denied")
+    require_site_origin(page.url, payload["base_url"], [])
+    await context.validate()
+    for key in filled:
+        if await context.targets[key + "_selector"].input_value() != context.credentials[key]:
+            raise RuntimeError("Secret input verification failed")
+    context.action_started = True
+
+
 async def resolve_secret(payload, step):
+    if "_assistant_secret_context" in payload:
+        context = payload["_assistant_secret_context"]
+        if type(context) is not AssistantSecretContext:
+            raise RuntimeError("Secret request denied")
+        return await context.resolve(step)
     access = payload.get("secret_access") or {}
     purpose = step["feature_type"]
     if purpose not in {"auth.form_login", "auth.password_verify", "challenge.2fa"}:

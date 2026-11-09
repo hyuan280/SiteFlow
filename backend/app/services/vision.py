@@ -21,9 +21,20 @@ def validate_base_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def _token_kwargs(config: dict) -> dict:
+    value = config.get("max_tokens")
+    if value is None:
+        return {}
+    if type(value) is not int or value < 0:
+        raise ValueError("invalid max_tokens")
+    # Omitting the cap uses the upstream default, not necessarily unlimited output.
+    return {"max_tokens": value} if value > 0 else {}
+
+
 def test_text(config: dict, prompt: str = "Reply with the single word OK.") -> str:
     try:
         base = validate_base_url(config["base_url"])
+        token_kwargs = _token_kwargs(config)
         with httpx.Client(timeout=config.get("timeout", 30), trust_env=False) as client:
             response = client.post(
                 f"{base}/chat/completions",
@@ -31,7 +42,7 @@ def test_text(config: dict, prompt: str = "Reply with the single word OK.") -> s
                 json={
                     "model": config["model"],
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 16,
+                    **token_kwargs,
                 },
             )
             response.raise_for_status()
@@ -46,6 +57,7 @@ def test_text(config: dict, prompt: str = "Reply with the single word OK.") -> s
 def recognize(image: bytes, config: dict, prompt: str) -> str:
     try:
         base = validate_base_url(config["base_url"])
+        token_kwargs = _token_kwargs(config)
         with httpx.Client(timeout=config.get("timeout", 30), trust_env=False) as client:
             response = client.post(
                 f"{base}/chat/completions",
@@ -53,7 +65,7 @@ def recognize(image: bytes, config: dict, prompt: str) -> str:
                 json={"model": config["model"], "messages": [{"role": "user", "content": [
                     {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image).decode("ascii")}},
-                ]}], "max_tokens": 128},
+                ]}], **token_kwargs},
             )
             response.raise_for_status()
             text = response.json()["choices"][0]["message"]["content"]

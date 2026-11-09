@@ -136,17 +136,18 @@ class AuthService:
         self.session.commit()
         return raw_token, csrf_token, row
 
-    def get_session(self, raw_token: str) -> AuthSession | None:
+    def get_session(self, raw_token: str, *, touch: bool = True) -> AuthSession | None:
         token_hash = hash_token(raw_token)
         row = self.session.query(AuthSession).filter(AuthSession.token_hash == token_hash).first()
         if row is None:
             return None
         now = utcnow()
         if ensure_aware(row.expires_at) <= now:
-            self.session.delete(row)
-            self.session.commit()
+            if touch:
+                self.session.delete(row)
+                self.session.commit()
             return None
-        if (now - ensure_aware(row.last_seen_at)).total_seconds() > 60:
+        if touch and (now - ensure_aware(row.last_seen_at)).total_seconds() > 60:
             row.last_seen_at = now
             self.session.commit()
         return row

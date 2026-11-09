@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import regex
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
@@ -341,12 +342,73 @@ class SiteWrite(BaseModel):
         return self
 
 
+class SiteSettingsPatch(BaseModel):
+    """Omitted fields stay untouched; only checkin_after accepts explicit null."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)] | None = None
+    trusted_urls: list[
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1024)]
+    ] | None = Field(default=None, max_length=20)
+    enabled: bool | None = None
+    lane_policy: LanePolicy | None = None
+    support_resign: bool | None = None
+    resign_max_days: int | None = Field(default=None, ge=1, le=365)
+    checkin_after: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+    tags: list[str] | None = Field(default=None, max_length=50)
+    notes: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_settings(cls, value):
+        if isinstance(value, dict) and any(
+            item is None and key != "checkin_after" for key, item in value.items()
+        ):
+            raise ValueError("Only checkin_after may be null")
+        return value
+
+    @field_validator("trusted_urls")
+    @classmethod
+    def _validate_trusted_urls(cls, value):
+        return SiteWrite._validate_trusted_urls(value)
+
+    @field_validator("tags")
+    @classmethod
+    def _clean_tags(cls, value):
+        return SiteWrite._clean_tags(value)
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value):
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("Invalid timezone") from None
+        return value
+
+
 class WorkflowRestore(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_revision: int = Field(ge=1, strict=True)
     expected_history_key: UUID | None = None
     accept_current_dependencies: bool = False
+
+
+class ResolvedWorkflowDraftView(ResolvedWorkflowView):
+    owner_id: int | None
+
+
+class WorkflowDraftValidation(BaseModel):
+    valid: Literal[True] = True
+    owner_type: Literal["site", "template"]
+    owner_id: int | None
+    history_key: str | None
+    current_revision: int | None
+    local: dict[str, Any]
+    resolved: ResolvedWorkflowDraftView
 
 
 class WorkflowVersionSummary(BaseModel):

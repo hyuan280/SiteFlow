@@ -194,7 +194,8 @@ const groupSections = computed<GroupSection[]>(() => {
   blocks.sort(
     (left, right) =>
       left.order - right.order ||
-      (left.kind === "group" ? 0 : 1) - (right.kind === "group" ? 0 : 1),
+      (left.kind === "group" ? 0 : 1) - (right.kind === "group" ? 0 : 1) ||
+      (left.group && right.group ? (left.group.key < right.group.key ? -1 : left.group.key > right.group.key ? 1 : 0) : 0),
   );
   const sections: GroupSection[] = [];
   let pending: TopItem[] = [];

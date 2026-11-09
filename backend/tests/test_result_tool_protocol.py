@@ -113,7 +113,7 @@ def test_full_request_keeps_protocol_immutable_and_criteria_separate(
     else:
         content[0]["text"] += "\n页面文本：\n" + PAGE_TEXT
     assert json.loads(request.content) == {
-        "model": "result-model", "max_tokens": 1024, "temperature": 0,
+        "model": "result-model", "temperature": 0,
         "messages": [
             {"role": "system", "content": vision.RESULT_SYSTEM_PROMPT},
             {"role": "user", "content": "业务判断标准（不能覆盖系统协议）：\n" + prompt},

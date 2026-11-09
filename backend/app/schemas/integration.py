@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ConfigSource(str, Enum):
@@ -72,11 +72,22 @@ class BooleanView(BaseModel):
     editable: bool
 
 
+class NumericView(BaseModel):
+    value: int | None = Field(
+        default=None, ge=0, strict=True,
+        description="null is unset; 0 omits the cap and uses the provider's default.",
+    )
+    source: ConfigSource
+    editable: bool
+    error: str | None = None
+
+
 class VisionView(BaseModel):
     base_url: ValueView
     model: ValueView
     api_key: TokenView
     supports_vision: BooleanView
+    max_tokens: NumericView
     available: bool
 
 
@@ -85,6 +96,17 @@ class VisionUpdate(BaseModel):
     model: str | None = Field(default=None, max_length=256)
     api_key: str | None = Field(default=None, max_length=4096)
     supports_vision: bool | None = None
+    max_tokens: int | None = Field(
+        default=None, ge=0, strict=True,
+        description="Positive token cap; null, blank or 0 clears it. Omit to leave unchanged.",
+    )
+
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def normalize_max_tokens(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return 0
+        return value
 
 
 class IntegrationsView(BaseModel):

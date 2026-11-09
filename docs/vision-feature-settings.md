@@ -6,12 +6,17 @@ for mutations and integration tests.
 ## Vision Integration
 
 `GET /integrations` includes `vision` with `base_url: ValueView`, `model: ValueView`,
-`api_key: TokenView`, `supports_vision: BooleanView`, and `available: boolean`.
+`api_key: TokenView`, `supports_vision: BooleanView`, `max_tokens: NumericView`, and
+`available: boolean`. `NumericView` contains `value: integer | null`, `source`,
+`editable`, and optional `error`; null means unset and 0 means no explicit cap.
 Available means configured and locally valid, not a successful provider probe. API
 keys are never returned in plaintext.
 
-`PUT /integrations/vision` accepts `{base_url?, model?, api_key?, supports_vision?}`.
-Omitted or null fields are unchanged; empty strings are rejected. The base URL is an
+`PUT /integrations/vision` accepts `{base_url?, model?, api_key?, supports_vision?, max_tokens?}`.
+Omitted fields are unchanged. For `max_tokens`, a positive JSON integer sets the cap;
+explicit null, blank/whitespace-only strings, or 0 clear the DB cap (stored as 0).
+Negative values, booleans, fractions, and nonblank strings are rejected (422).
+For the other fields, null is unchanged and empty strings are rejected. The base URL is an
 HTTP(S) OpenAI-compatible `/v1` root, optionally under a path prefix, without URL
 credentials, query, or fragment. Values are encrypted using the existing integration
 key storage. `DELETE /integrations/vision` clears the DB configuration.
@@ -20,8 +25,21 @@ prevents deletion (409).
 
 Environment overrides DB independently per field:
 `SITEFLOW_VISION_BASE_URL`, `SITEFLOW_VISION_API_KEY`, `SITEFLOW_VISION_MODEL`,
-`SITEFLOW_VISION_SUPPORTS_VISION`.
+`SITEFLOW_VISION_SUPPORTS_VISION`, `SITEFLOW_VISION_MAX_TOKENS`.
+`SITEFLOW_VISION_MAX_TOKENS` is optional and accepts a nonnegative integer; leave it
+unset rather than empty. Even an explicit environment value of 0 overrides the DB
+cap and locks the field (`source=env`, `editable=false`), without deleting the DB value.
 `SITEFLOW_VISION_TIMEOUT` controls request timeout in seconds (default 30, maximum 300).
+
+The same global `max_tokens` applies to all seven generation paths: backend image
+and text self-tests, worker character captcha, image quiz, grid captcha and result
+judgement, and every AI configuration-generation round. A positive integer is sent
+unchanged as `max_tokens`; unset/null, blank (normalized on update), or 0 omits the
+parameter and uses upstream defaults, which are not guaranteed unlimited. Existing
+timeouts and response-byte budgets are unchanged. Thinking models are supported,
+but reasoning may consume the token budget: leave enough for a final answer or tool
+call. Reasoning is never treated as the answer, models are never switched
+automatically, and provider-specific reasoning/token parameters are not negotiated.
 
 `supports_vision` defaults to true for existing deployments. When false, an image
 captcha step configured to use the `vision` method fails with
@@ -29,8 +47,11 @@ captcha step configured to use the `vision` method fails with
 unaffected. `sign.image_quiz` and `challenge.grid_captcha` always require vision
 and require human handling (`waiting_human`) when vision is unavailable or disabled.
 
-`POST /integrations/vision/test` uses the saved `supports_vision` flag. When enabled,
-it submits an actual tiny PNG to `/chat/completions` and requires a nonempty textual
+In the frontend's **大模型支持** card, set **输出 Token 上限（max_tokens）** and click
+**保存模型配置** before **测试已保存配置**; unsaved edits are not tested.
+`POST /integrations/vision/test` uses the saved configuration (with environment
+overrides), including `supports_vision` and `max_tokens`. When vision is enabled,
+it submits a valid tiny PNG to `/chat/completions` and requires a nonempty textual
 response. When disabled, it sends a text-only `/chat/completions` request instead of
 an image. This checks provider connectivity, not recognition accuracy.
 Provider errors and response bodies are not exposed. Provider redirects are not
@@ -75,8 +96,7 @@ sends the cropped quiz image,
 question text, and numbered visible options. The model must return a JSON object
 with `is_clear`, `selected_index`, `need_refresh`, and optional `reason`; reasoning
 content remains ignored. Unclear answers refresh the question up to `max_refresh`
-times, then return `waiting_human`. Quiz requests use `max_tokens: 2048` to leave
-space for reasoning models to emit the final JSON.
+times, then return `waiting_human`. Quiz requests use the global `max_tokens` setting.
 
 ### Grid Captcha
 
@@ -156,8 +176,8 @@ reasoning-only wrappers are rejected. The remaining answer must be a single ASCI
 alphanumeric token, then pass the step's charset/length constraints. Prose, Markdown,
 and other ambiguous output fail the vision step rather than extracting a guessed
 answer or falling back to another method. Responses marked `finish_reason: "length"`
-or `"content_filter"` are rejected. The request currently uses `max_tokens: 128`;
-some reasoning providers consume that budget without producing final content.
+or `"content_filter"` are rejected. Requests use the global `max_tokens` setting;
+some reasoning providers can consume the budget without producing final content.
 Parsing cannot recover an answer that was never emitted, and provider-specific
 reasoning budgets/token parameters are not automatically negotiated.
 

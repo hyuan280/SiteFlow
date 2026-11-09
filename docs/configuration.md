@@ -20,6 +20,7 @@
 | `SITEFLOW_PROXY_URL` | 否 | 代理 URL；配置后才启用 `proxy_general` / `proxy_interaction` |
 | `SITEFLOW_TWOFAUTH_URL` | 否 | 2FAuth 服务地址，例如 `https://2fa.example.com` |
 | `SITEFLOW_TWOFAUTH_TOKEN` | 否 | 2FAuth API Bearer Token |
+| `SITEFLOW_VISION_MAX_TOKENS` | 否 | 全局模型 Token 上限；正整数发送 `max_tokens`，`0` 不发送该参数但仍覆盖数据库并锁定字段；不使用环境变量覆盖时请勿设置（不要赋空值） |
 
 环境变量使用 `SITEFLOW_*` 前缀。
 
@@ -163,6 +164,12 @@ DELETE /api/v1/sites/{id}/credential
 - 站点列表和详情中的 `credential` 字段只包含上述元数据。
 - 站点解析结果不包含凭据；本地凭据由 API 在任务启动前解密，Bitwarden 站点由 worker 在任务启动后后台预取，进入 `auth.form_login` 时使用，任务结束清除。
 - 当前仅支持本地加密存储；后续 Bitwarden 通过独立提供器接入，不改变站点/步骤模型。
+
+### 3.6 大模型支持
+
+「系统设置 → 大模型支持」提供「输出 Token 上限（max_tokens）」字段，修改后先「保存模型配置」，再「测试已保存配置」。全局正整数上限会原样用于全部七条模型生成路径：后端图片/文本自测、Worker 字符验证码/图片答题/九宫格/结果判断，以及 AI 配置生成的每轮请求。未设置、null、空白或 0 均不向上游发送 `max_tokens`，使用服务商默认值，不保证无限输出；原有超时和响应字节限制不变。
+
+`PUT /api/v1/integrations/vision` 省略 `max_tokens` 时保留原值；显式提交 null、空白字符串或 0 会清除数据库上限（存为 0），正整数设置上限。环境变量 `SITEFLOW_VISION_MAX_TOKENS` 优先于数据库，即使为 0 也会锁定该字段，且阻止整体清除；数据库值保留，移除环境变量后恢复使用。支持思考模型，但推理可能消耗 Token 预算，应为最终答案或工具调用预留足够空间；代码不会把推理当成答案，也不会自动切换模型。完整 API 与测试行为见 [Vision 配置](vision-feature-settings.md#vision-integration)。
 
 ## 4. 配置解析优先级
 
