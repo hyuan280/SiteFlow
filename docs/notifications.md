@@ -18,24 +18,34 @@
 run_id, status, status_label, trigger, trigger_label, mode, created_by,
 started_at, finished_at, created_at, site_count,
 success_count, fail_count, waiting_count, unknown_count, deferred_count,
-canceled_count, sites, summary
+canceled_count, unsuccessful_count, sites, deferred_sites, unsuccessful_sites,
+siteflow_domain, summary
 ```
+
+- `deferred_count` / `deferred_sites`：推迟站点数量 / 列表，仅包含 `deferred` 状态。
+- `unsuccessful_count` / `unsuccessful_sites`：未成功站点数量 / 列表，与分析页一致，严格包含 `fail`、`error`、`unknown`、`waiting_human`、`deferred`、`canceled`、`interrupted`，排除 `success`、`skipped`、`queued`、`running`。
+- `sites`、`deferred_sites`、`unsuccessful_sites` 格式相同，每行形如 `示例站点 D：已推迟 · 稍后重试`；空列表渲染为空字符串。
+- `siteflow_domain`：SiteFlow 完整公开访问地址，来自 `Settings.siteflow_domain` / 环境变量 `SITEFLOW_DOMAIN`，未配置时渲染为空字符串。
 
 默认布局：
 
 ```text
-标题：[SiteFlow] 运行 #{{run_id}} {{status_label}}
+标题：[SiteFlow] 运行任务通知 #{{run_id}}
 正文：
-SiteFlow 运行 #{{run_id}} 已结束
 状态：{{status_label}}
-站点：{{site_count}} 个（成功 {{success_count}}，失败 {{fail_count}}，等待人工 {{waiting_count}}）
+站点：成功 {{success_count}}，失败 {{fail_count}}，推迟 {{deferred_count}}，等待人工 {{waiting_count}}
 触发：{{trigger_label}}
 结束时间：{{finished_at}}
 
+
 {{sites}}
+-------------------------------------
+详细信息查看：{{siteflow_domain}}
 ```
 
 时间按 `SITEFLOW_SCHEDULER_TIMEZONE` 格式化，默认 `Asia/Shanghai`。
+
+页面预览和后端测试通知的示例为 4 个站点：A、B 成功，C 失败，D 为「已推迟 · 稍后重试」，即成功 2、失败 1、推迟 1；`summary` 也包含推迟数量。
 
 ## 触发时机
 
@@ -79,7 +89,7 @@ SiteFlow 运行 #{{run_id}} 已结束
 ```json
 {
   "event": "run.finished",
-  "title": "[SiteFlow] 运行 #128 成功",
+  "title": "[SiteFlow] 运行任务通知 #128",
   "body": "布局渲染后的正文",
   "content": "与 body 相同，兼容使用 {content} 的 webhook 模板",
   "format": "text",
@@ -122,6 +132,18 @@ SiteFlow 运行 #{{run_id}} 已结束
 启用开关始终可以在页面修改，即使通道配置来自环境变量。数据库中的启用值优先；没有数据库记录时使用环境变量的 `*_ENABLED` 默认值。环境配置若未设置 `*_ENABLED`，默认不启用。
 
 数据库中的邮件密码、HTTP 请求头等配置使用 `SITEFLOW_MASTER_KEY` 加密保存；邮件密码、HTTP 请求头值不会回显。
+
+### 公开访问地址
+
+在后端环境中配置完整公开访问地址（包含 `https://` 或 `http://`）：
+
+```dotenv
+SITEFLOW_DOMAIN=https://siteflow.example.com
+```
+
+该变量对应 `Settings.siteflow_domain`，用于渲染模板中的 `{{siteflow_domain}}`；未配置时为空字符串，不会自动推断访问地址。修改环境变量后需重启后端。
+
+已保存的自定义通知模板不会被新的默认模板覆盖。如需使用新的变量或默认布局，请在「通知布局」中手动修改并保存。
 
 ### 邮件环境变量
 

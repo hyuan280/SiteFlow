@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "SiteFlow"
+    siteflow_domain: str = Field(default="", validation_alias="SITEFLOW_DOMAIN")
     database_url: str = "sqlite:///./data/siteflow.db"
     artifact_root: str = Field(default="./data/artifacts", validation_alias="SITEFLOW_ARTIFACT_ROOT")
     artifact_retention_days: int = Field(

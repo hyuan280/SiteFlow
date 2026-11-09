@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings
 from app.models.execution import Run, SiteJob
 from app.models.integration import IntegrationConfig
 from app.main import create_app
@@ -44,8 +46,17 @@ def test_notification_defaults_and_layout_roundtrip(client: TestClient) -> None:
     response = client.get("/api/v1/notifications")
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["layout"]["title_template"]
-    assert body["layout"]["body_template"]
+    assert body["layout"]["title_template"] == "[SiteFlow] 运行任务通知 #{{run_id}}"
+    assert body["layout"]["body_template"] == (
+        "状态：{{status_label}}\n"
+        "站点：成功 {{success_count}}，失败 {{fail_count}}，推迟 {{deferred_count}}，"
+        "等待人工 {{waiting_count}}\n"
+        "触发：{{trigger_label}}\n"
+        "结束时间：{{finished_at}}\n\n\n"
+        "{{sites}}\n"
+        "-------------------------------------\n"
+        "详细信息查看：{{siteflow_domain}}"
+    )
     assert body["layout"]["format"] == "text"
     assert body["email"]["enabled"] is False
     assert body["email"]["notify_success"] is True
@@ -319,7 +330,10 @@ def test_notification_test_endpoints_use_saved_layout(
         "/api/v1/notifications/layout",
         json={
             "title_template": "Run {{run_id}} {{status_label}}",
-            "body_template": "{{summary}}\n{{sites}}",
+            "body_template": (
+                "{{summary}}\n{{sites}}\n推迟：{{deferred_sites}}\n"
+                "未成功 {{unsuccessful_count}}：{{unsuccessful_sites}}\n{{siteflow_domain}}"
+            ),
             "format": "text",
         },
     ).status_code == 200
@@ -334,6 +348,9 @@ def test_notification_test_endpoints_use_saved_layout(
     assert calls[0][1]["title"] == "Run 0 失败"
     assert "示例站点 A：成功" in calls[0][1]["body"]
     assert "示例站点 C：失败" in calls[1][1]["body"]
+    assert "推迟：示例站点 D：已推迟" in calls[0][1]["body"]
+    assert "未成功 2：示例站点 C：失败" in calls[1][1]["body"]
+    assert "{{siteflow_domain}}" not in calls[0][1]["body"]
 
 
 def test_html_layout_escapes_site_text(client: TestClient) -> None:
@@ -359,6 +376,94 @@ def test_html_layout_escapes_site_text(client: TestClient) -> None:
         assert "<script>" not in message["body"]
     finally:
         session.close()
+
+
+def test_notification_domain_uses_environment(monkeypatch) -> None:
+    monkeypatch.setenv("SITEFLOW_DOMAIN", "https://siteflow.example.com")
+    assert Settings(_env_file=None).siteflow_domain == "https://siteflow.example.com"
+
+
+def test_notification_run_site_groups(client: TestClient) -> None:
+    response = client.put(
+        "/api/v1/notifications/layout",
+        json={
+            "title_template": "{{site_count}}/{{unsuccessful_count}}/{{deferred_count}}",
+            "body_template": "{{deferred_sites}}\n---\n{{unsuccessful_sites}}",
+            "format": "text",
+        },
+    )
+    assert response.status_code == 200, response.text
+    statuses = [
+        "success", "skipped", "queued", "running", "fail", "error", "unknown",
+        "waiting_human", "deferred", "canceled", "interrupted",
+    ]
+    with client.app.state.session_factory() as session:
+        run = Run(mode="manual", trigger="manual", status="fail", created_by="admin")
+        session.add(run)
+        session.flush()
+        session.add_all([
+            SiteJob(
+                run_id=run.id,
+                site_name=status,
+                lane="general",
+                status=status,
+                message="detail",
+            )
+            for status in statuses
+        ])
+        session.commit()
+        service = NotificationService(
+            session, client.app.state.settings, client.app.state.crypto
+        )
+        message = service._render(service._run_event(run.id))
+    assert message["title"] == "11/7/1"
+    deferred, unsuccessful = message["body"].split("\n---\n")
+    assert deferred == "deferred：已推迟 · detail"
+    assert [line.split("：")[0] for line in unsuccessful.splitlines()] == statuses[4:]
+
+
+@pytest.mark.parametrize("format", ["text", "html"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_notification_new_variables_render(client: TestClient, format: str, empty: bool) -> None:
+    response = client.put(
+        "/api/v1/notifications/layout",
+        json={
+            "title_template": "{{unsuccessful_count}}/{{deferred_count}}",
+            "body_template": (
+                "{{siteflow_domain}}|{{deferred_sites}}|{{unsuccessful_sites}}|{{summary}}"
+            ),
+            "format": format,
+        },
+    )
+    assert response.status_code == 200, response.text
+    settings = client.app.state.settings.model_copy(update={
+        "siteflow_domain": "" if empty else " https://siteflow.example.com/?a=1&b=2 "
+    })
+    with client.app.state.session_factory() as session:
+        service = NotificationService(session, settings, client.app.state.crypto)
+        event = service._sample_event()
+        event["sites"][2]["site_name"] = "<failed>"
+        event["sites"][3]["message"] = "<later> & retry"
+        if empty:
+            event["sites"] = event["sites"][:2]
+            event.update(site_count=2, fail_count=0, deferred_count=0)
+        message = service._render(event)
+    domain, deferred, unsuccessful, summary = message["body"].split("|")
+    if empty:
+        assert message["title"] == "0/0"
+        assert (domain, deferred, unsuccessful) == ("", "", "")
+        assert summary == "成功 2，失败 0，推迟 0，等待人工 0"
+    else:
+        assert message["title"] == "2/1"
+        if format == "html":
+            assert domain == "https://siteflow.example.com/?a=1&amp;b=2"
+            assert deferred == "示例站点 D：已推迟 · &lt;later&gt; &amp; retry"
+            assert unsuccessful == "&lt;failed&gt;：失败 · 登录失败<br>" + deferred
+        else:
+            assert domain == "https://siteflow.example.com/?a=1&b=2"
+            assert deferred == "示例站点 D：已推迟 · <later> & retry"
+            assert unsuccessful == "<failed>：失败 · 登录失败\n" + deferred
+        assert summary == "成功 2，失败 1，推迟 1，等待人工 0"
 
 
 def test_email_timeout_has_actionable_message(client: TestClient, monkeypatch) -> None:

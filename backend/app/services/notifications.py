@@ -57,20 +57,25 @@ DEFAULT_HTTP_TIMEOUT = 10.0
 DEFAULT_EMAIL_PORT = 587
 DEFAULT_EMAIL_SECURITY = "starttls"
 
-DEFAULT_LAYOUT_TITLE = "[SiteFlow] 运行 #{{run_id}} {{status_label}}"
-DEFAULT_LAYOUT_BODY = """SiteFlow 运行 #{{run_id}} 已结束
-状态：{{status_label}}
-站点：{{site_count}} 个（成功 {{success_count}}，失败 {{fail_count}}，等待人工 {{waiting_count}}）
+DEFAULT_LAYOUT_TITLE = "[SiteFlow] 运行任务通知 #{{run_id}}"
+DEFAULT_LAYOUT_BODY = """状态：{{status_label}}
+站点：成功 {{success_count}}，失败 {{fail_count}}，推迟 {{deferred_count}}，等待人工 {{waiting_count}}
 触发：{{trigger_label}}
 结束时间：{{finished_at}}
 
-{{sites}}"""
+
+{{sites}}
+-------------------------------------
+详细信息查看：{{siteflow_domain}}"""
 DEFAULT_LAYOUT_FORMAT = "text"
 
 STATUS_LABELS = {
     **RUN_STATUS_LABELS,
     "deferred": "已推迟",
     "skipped": "已跳过",
+}
+UNSUCCESSFUL_STATUSES = {
+    "fail", "error", "unknown", "waiting_human", "deferred", "canceled", "interrupted"
 }
 
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
@@ -769,12 +774,12 @@ class NotificationService:
             "started_at": self._format_time(now),
             "finished_at": self._format_time(now),
             "created_at": self._format_time(now),
-            "site_count": 3,
+            "site_count": 4,
             "success_count": 2,
             "fail_count": 1,
             "waiting_count": 0,
             "unknown_count": 0,
-            "deferred_count": 0,
+            "deferred_count": 1,
             "canceled_count": 0,
             "sites": [
                 {
@@ -804,20 +809,43 @@ class NotificationService:
                     "lane": "general",
                     "attempt": 1,
                 },
+                {
+                    "site_id": None,
+                    "site_name": "示例站点 D",
+                    "status": "deferred",
+                    "status_label": "已推迟",
+                    "message": "稍后重试",
+                    "lane": "general",
+                    "attempt": 1,
+                },
             ],
         }
 
     def _render(self, event: dict[str, Any]) -> dict[str, str]:
         layout = self._layout()
         raw_context = dict(event)
-        site_lines = [
-            f"{item['site_name']}：{item['status_label']}"
-            + (f" · {item['message']}" if item.get("message") else "")
-            for item in event.get("sites", [])
-        ]
-        raw_context["sites"] = "\n".join(site_lines)
+        raw_context["siteflow_domain"] = self.settings.siteflow_domain.strip()
+        sites = event.get("sites", [])
+        site_groups = {
+            "sites": sites,
+            "deferred_sites": [item for item in sites if item["status"] == "deferred"],
+            "unsuccessful_sites": [
+                item for item in sites if item["status"] in UNSUCCESSFUL_STATUSES
+            ],
+        }
+        raw_context["unsuccessful_count"] = len(site_groups["unsuccessful_sites"])
+        site_lines = {
+            key: [
+                f"{item['site_name']}：{item['status_label']}"
+                + (f" · {item['message']}" if item.get("message") else "")
+                for item in items
+            ]
+            for key, items in site_groups.items()
+        }
+        raw_context.update({key: "\n".join(lines) for key, lines in site_lines.items()})
         raw_context["summary"] = (
             f"成功 {event['success_count']}，失败 {event['fail_count']}，"
+            f"推迟 {event['deferred_count']}，"
             f"等待人工 {event['waiting_count']}"
         )
         if layout["format"] == "html":
@@ -825,8 +853,10 @@ class NotificationService:
                 key: html.escape(str(value)) if not isinstance(value, list) else value
                 for key, value in raw_context.items()
             }
-            body_context["sites"] = "<br>".join(html.escape(line) for line in site_lines)
-            body_context["summary"] = html.escape(raw_context["summary"])
+            body_context.update({
+                key: "<br>".join(html.escape(line) for line in lines)
+                for key, lines in site_lines.items()
+            })
         else:
             body_context = raw_context
 

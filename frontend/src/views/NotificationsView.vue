@@ -51,20 +51,29 @@ const httpForm = reactive({
   timeout_seconds: 10,
 });
 
-const placeholders = [
-  "run_id",
-  "status",
-  "status_label",
-  "trigger_label",
-  "site_count",
-  "success_count",
-  "fail_count",
-  "waiting_count",
-  "sites",
-  "summary",
-  "started_at",
-  "finished_at",
-];
+const placeholders = {
+  run_id: "本次运行的任务编号。",
+  status: "运行状态代码，例如 success、fail、deferred。",
+  status_label: "运行状态的中文名称，例如成功、失败、已推迟。",
+  trigger_label: "触发来源，例如定时调度、手动执行。",
+  site_count: "本次运行的站点任务总数。",
+  success_count: "成功站点数量，仅统计 success 状态。",
+  fail_count: "失败站点数量，包含 fail 和 error 状态。",
+  deferred_count: "已推迟站点数量，仅统计 deferred 状态。",
+  waiting_count: "等待人工处理的站点数量。",
+  unsuccessful_count:
+    "未成功站点数量，与分析页一致，包含失败、错误、未知、等待人工、推迟、取消和中断，不含成功、跳过、排队和运行中。",
+  sites: "本次运行的全部站点列表，逐行显示站点、状态和消息；空列表为空字符串。",
+  deferred_sites:
+    "已推迟站点列表，仅包含 deferred 状态；与 sites 格式相同，空列表为空字符串。",
+  unsuccessful_sites:
+    "未成功站点列表，包含失败、错误、未知、等待人工、推迟、取消和中断；与 sites 格式相同，空列表为空字符串。",
+  siteflow_domain:
+    "SiteFlow 完整公开访问地址，通过后端环境变量 SITEFLOW_DOMAIN=https://siteflow.example.com 配置，修改后需重启后端；未配置时为空字符串，预览使用示例地址。",
+  summary: "站点统计摘要，包含成功、失败、推迟和等待人工的数量。",
+  started_at: "运行开始时间，按配置的调度时区显示。",
+  finished_at: "运行结束时间，按配置的调度时区显示。",
+};
 
 const sampleValues: Record<string, string | number> = {
   run_id: 128,
@@ -73,17 +82,21 @@ const sampleValues: Record<string, string | number> = {
   trigger_label: "定时调度",
   mode: "scheduled",
   created_by: "admin",
-  site_count: 3,
+  site_count: 4,
   success_count: 2,
   fail_count: 1,
   waiting_count: 0,
   unknown_count: 0,
-  deferred_count: 0,
+  deferred_count: 1,
   canceled_count: 0,
-  summary: "成功 2，失败 1，等待人工 0",
+  unsuccessful_count: 2,
+  siteflow_domain: "https://siteflow.example.com",
+  summary: "成功 2，失败 1，推迟 1，等待人工 0",
   started_at: "2026-10-25 10:00:12 CST",
   finished_at: "2026-10-25 10:01:38 CST",
-  sites: "示例站点 A：成功 · 签到成功\n示例站点 B：成功 · 签到成功\n示例站点 C：失败 · 登录失败",
+  sites: "示例站点 A：成功 · 签到成功\n示例站点 B：成功 · 签到成功\n示例站点 C：失败 · 登录失败\n示例站点 D：已推迟 · 稍后重试",
+  deferred_sites: "示例站点 D：已推迟 · 稍后重试",
+  unsuccessful_sites: "示例站点 C：失败 · 登录失败\n示例站点 D：已推迟 · 稍后重试",
 };
 
 const layoutError = computed(() => {
@@ -101,9 +114,9 @@ const httpHasDb = computed(() => channelHasDb(settings.value?.http));
 
 const layoutPreviewTitle = computed(() => renderTemplate(layoutForm.title_template));
 const layoutPreviewBody = computed(() => renderTemplate(layoutForm.body_template));
-const layoutTitlePlaceholder = "[SiteFlow] 运行 #{{ run_id }} {{ status_label }}";
+const layoutTitlePlaceholder = "[SiteFlow] 运行任务通知 #{{run_id}}";
 const layoutBodyPlaceholder =
-  "支持 {{run_id}}、{{status_label}}、{{sites}} 等变量";
+  "状态：{{status_label}}\n站点：成功 {{success_count}}，失败 {{fail_count}}，推迟 {{deferred_count}}，等待人工 {{waiting_count}}\n触发：{{trigger_label}}\n结束时间：{{finished_at}}\n\n\n{{sites}}\n-------------------------------------\n详细信息查看：{{siteflow_domain}}";
 const headerPlaceholder = computed(() =>
   settings.value?.http.header_names.length
     ? `当前请求头：${settings.value.http.header_names.join(", ")}；留空保持，输入 {} 清除`
@@ -496,9 +509,15 @@ onMounted(() => {
 
       <div class="placeholder-row">
         <span class="muted">可用变量：</span>
-        <el-tag v-for="item in placeholders" :key="item" size="small" effect="plain">
-          {{ item }}
-        </el-tag>
+        <el-tooltip
+          v-for="(description, name) in placeholders"
+          :key="name"
+          :content="description"
+          :popper-style="{ maxWidth: '360px' }"
+          placement="top"
+        >
+          <el-tag size="small" effect="plain" tabindex="0">{{ name }}</el-tag>
+        </el-tooltip>
       </div>
       <p v-if="layoutError" class="error">{{ layoutError }}</p>
     </el-card>
