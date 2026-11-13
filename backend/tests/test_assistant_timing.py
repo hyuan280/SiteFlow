@@ -19,9 +19,17 @@ from tests.test_assistant_execution import OWNER, arguments, execution, response
 from tests.test_assistant_retry import load, mutate, unknown
 
 
+@pytest.fixture(autouse=True)
+def legacy_approval_timing(monkeypatch):
+    # Exercise the retained dialog lifecycle explicitly, not ordinary non-post
+    # routing. Actual post features remain unsupported by isolated execution.
+    monkeypatch.setattr("app.services.assistant_retry.builtin_category", lambda key: "post")
+
+
 @pytest.mark.parametrize("kind", ["interaction", "retry"])
 @pytest.mark.parametrize("outcome", ["approve", "deny", "timeout", "active_timeout", "stop", "shutdown"])
-def test_real_turn_pauses_only_human_wait(execution, monkeypatch, kind, outcome):
+@pytest.mark.parametrize("startup_delay", [0, 0.35])
+def test_real_turn_pauses_only_human_wait(execution, monkeypatch, kind, outcome, startup_delay):
     manager, sid = execution.manager, execution.session_id
     if kind == "retry":
         original = unknown(execution)["operation_id"]
@@ -47,6 +55,12 @@ def test_real_turn_pauses_only_human_wait(execution, monkeypatch, kind, outcome)
         wait_for_user = manager._wait_for_user
 
         async def observed_wait(turn, event, timeout):
+            if not waiting.is_set():
+                # Setup is not the timing subject. Start the short measured
+                # budget at the first human wait, retaining it for approval work.
+                turn["deadline"] = loop.time() + 0.3
+                turn["timeout"].reschedule(turn["deadline"])
+                state["initial_deadline"] = turn["deadline"]
             before, deadline = loop.time(), turn["deadline"]
             waiting.set()
             try:
@@ -72,6 +86,7 @@ def test_real_turn_pauses_only_human_wait(execution, monkeypatch, kind, outcome)
             state["turn"] = turn
             state["initial_deadline"] = turn["deadline"]
             tools = AssistantTools(manager, owner, sid, None, turn=turn)
+            await asyncio.sleep(startup_delay)
             state["result"] = await tools.dispatch(name, args)
             state["remaining_after"] = turn["deadline"] - loop.time()
             if outcome in {"deny", "timeout"}:
@@ -82,12 +97,17 @@ def test_real_turn_pauses_only_human_wait(execution, monkeypatch, kind, outcome)
         monkeypatch.setattr(manager, "_conversation", conversation)
         monkeypatch.setattr(manager, "_auto_title", AsyncMock())
         manager._worker.side_effect = worker
-        task = asyncio.create_task(manager._run_turn(OWNER, sid, {
-            "_assistant_settings": {"turn_timeout_seconds": 0.3},
-        }))
+        config = {"_assistant_settings": {"turn_timeout_seconds": 10}}
+        task = asyncio.create_task(manager._run_turn(OWNER, sid, config))
         manager.tasks[sid] = task
-        async with asyncio.timeout(2):
-            await waiting.wait()
+        observer = asyncio.create_task(waiting.wait())
+        try:
+            done, _ = await asyncio.wait({task, observer}, timeout=2,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            assert observer in done and not task.done(), manager.detail(OWNER, sid)["messages"]
+        finally:
+            observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)
         item = load(execution)[pending]
         # A prompt gets its own full cap, even with < 1 second of active time.
         if outcome != "timeout":
@@ -135,8 +155,7 @@ def test_real_turn_pauses_only_human_wait(execution, monkeypatch, kind, outcome)
             manager._auto_title.assert_not_awaited()
         else:
             manager._auto_title.assert_awaited_once_with(
-                OWNER, sid, {"_assistant_settings": {"turn_timeout_seconds": 0.3}},
-                state["turn"]["deadline"])
+                OWNER, sid, config, state["turn"]["deadline"])
             if outcome == "approve":
                 assert state["result"]["ok"] and manager._worker.await_count == 1
                 assert 0.15 < state["remaining_at_execution"] <= 0.3
@@ -149,6 +168,34 @@ def test_real_turn_pauses_only_human_wait(execution, monkeypatch, kind, outcome)
                     ("retry", "timeout"): "retry_approval_timeout",
                 }[kind, outcome]
                 manager._worker.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_active_setup_time_is_not_paused(execution, monkeypatch):
+    manager, sid = execution.manager, execution.session_id
+    mutate(execution, lambda data: data["target"].update(execution_consent=False))
+
+    async def scenario():
+        async def conversation(owner, session_id, config):
+            tools = AssistantTools(manager, owner, sid, None, turn=manager._active_turns[sid])
+            await asyncio.sleep(0.4)
+            await tools.dispatch("execute_step", arguments())
+
+        wait_for_user = AsyncMock(wraps=manager._wait_for_user)
+        monkeypatch.setattr(manager, "_wait_for_user", wait_for_user)
+        monkeypatch.setattr(manager, "_conversation", conversation)
+        monkeypatch.setattr(manager, "_auto_title", AsyncMock())
+        await asyncio.wait_for(manager._run_turn(OWNER, sid, {
+            "_assistant_settings": {"turn_timeout_seconds": 0.3},
+        }), timeout=2)
+        wait_for_user.assert_not_awaited()
+        manager._worker.assert_not_awaited()
+        manager._auto_title.assert_not_awaited()
+        assert not load(execution).get(INTERACTION)
+        assert not load(execution).get(LEDGER)
+        assert not manager._active_turns and not manager.tasks
+        assert "[provider_timeout]" in manager.detail(OWNER, sid)["messages"][-1]["content"]
 
     asyncio.run(scenario())
 

@@ -11,6 +11,7 @@ from sqlalchemy import select
 from app.models.assistant import AssistantMessage, AssistantSession
 from app.services.assistant import AssistantManager
 from app.services.assistant_prompt import SYSTEM_PROMPT
+from app.services.assistant_tokens import estimate_context_tokens
 from app.services.assistant_tools import AssistantTools
 from app.services.config_ai_generation import _json
 from tests.test_assistant_api import (  # noqa: F401
@@ -37,7 +38,9 @@ def test_two_turn_two_tool_prefixes_are_exact_and_only_wire_fields_replayed(
     assistant_client, provider, monkeypatch, auto_compact,
 ):
     client = assistant_client
-    save(client, auto_compact=auto_compact, auto_title=False)
+    # Exercise exact replay below the soft watermark, independent of static prompt/tool growth.
+    context_cap = 1000000
+    save(client, auto_compact=auto_compact, auto_title=False, context_max_tokens=context_cap)
     manager = client.app.state.assistant_manager
     identifier = create(client)
     original = stored(manager, identifier)
@@ -67,7 +70,10 @@ def test_two_turn_two_tool_prefixes_are_exact_and_only_wire_fields_replayed(
         assert detail["messages"][-1]["content"] == f"Answer {turn}"
         # Empty assistant tool-call rows exist for replay, but add no blank UI bubbles.
         assert all(row["content"] for row in detail["messages"] if row["role"] == "assistant")
-    bodies = [json.loads(request.content)["messages"] for request in provider[1]]
+    requests = [json.loads(request.content) for request in provider[1]]
+    assert all(estimate_context_tokens(body["messages"], body["tools"]) < int(context_cap * 0.6)
+               for body in requests)
+    bodies = [body["messages"] for body in requests]
     assert len(bodies) == 6
     for index, messages in enumerate(bodies):
         assert_complete(messages)
@@ -228,7 +234,7 @@ def test_compaction_off_restores_history_behind_summary_without_mutating_it(
     assistant_client, provider, monkeypatch, overflow,
 ):
     client = assistant_client
-    save(client, auto_compact=False, auto_title=False, context_max_tokens=24000)
+    save(client, auto_compact=False, auto_title=False, context_max_tokens=30000)
     manager = client.app.state.assistant_manager
     identifier = create(client)
     canonical = {"role": "assistant", "content": None, "tool_calls": [
@@ -288,7 +294,7 @@ def test_old_canonical_projection_retains_retrievable_identity_through_later_fit
     assistant_client, provider, monkeypatch,
 ):
     client = assistant_client
-    save(client, auto_compact=True, auto_title=False, context_max_tokens=24000)
+    save(client, auto_compact=True, auto_title=False, context_max_tokens=30000)
     manager = client.app.state.assistant_manager
     identifier = create(client)
     result = {"ok": True, "elements": [{"text": "X" * 100000}]}

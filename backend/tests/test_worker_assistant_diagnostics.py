@@ -13,13 +13,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from worker import executor  # noqa: E402
+from tests.assistant_consumption_helpers import approved_consumption_payload  # noqa: F401, E402
 
 
 PRIVATE = "private-password-and-selector-value"
 
 
 @pytest.fixture
-def job(monkeypatch, tmp_path):
+def job(monkeypatch, tmp_path, approved_consumption_payload):
     monkeypatch.setattr(executor, "ARTIFACT_ROOT", tmp_path)
     monkeypatch.setattr(executor.JobArtifacts, "capture_failure", AsyncMock())
     page = SimpleNamespace(
@@ -37,7 +38,7 @@ def job(monkeypatch, tmp_path):
     )
     progress = AsyncMock()
 
-    def run(feature="action.click", *, assistant=True, policy="stop", **step_options):
+    def run(feature="action.click", *, assistant=True, policy="stop", approved=True, **step_options):
         payload = {
             "job_id": 1, "run_id": 1, "lane_key": "general", "base_url": page.url,
             "assistant_run": assistant,
@@ -48,7 +49,14 @@ def job(monkeypatch, tmp_path):
                  "config": {"output_value": True}},
             ],
         }
+        if approved:
+            payload = approved_consumption_payload(payload)
         result = asyncio.run(executor.execute_job(manager, payload, on_step=progress))
+        if not approved:
+            page.close.assert_not_awaited()
+            lane.context.new_page.assert_not_awaited()
+            manager.lease_lane.assert_not_awaited()
+            return result
         page.close.assert_awaited()
         assert lane.task_pages == {}
         manager.release_lane.assert_awaited_with("general", "test-lease")
@@ -60,7 +68,7 @@ def job(monkeypatch, tmp_path):
 SIDE_EFFECTS = [
     "auth.form_login", "auth.password_verify", "sign.button", "sign.image_quiz",
     "sign.iframe_form", "sign.unit3d_claim", "action.click", "action.fill",
-    "post.buy_card", "post.resign", "post.resign_click", "challenge.2fa",
+    "post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog", "challenge.2fa",
     "challenge.altcha", "challenge.slider", "challenge.image_captcha", "challenge.grid_captcha",
 ]
 
@@ -160,6 +168,17 @@ def test_resign_checkpoint_survives_uncertain_exception(monkeypatch, job):
     assert result["status"] == "unknown"
     assert result["steps"][0]["data"]["resign"] == {"submit_attempted": True}
     assert result["steps"][0]["data"]["reason"] == "outcome_uncertain"
+
+
+@pytest.mark.parametrize("feature", ["post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog"])
+def test_unapproved_consuming_full_run_rejects_before_page_creation(monkeypatch, job, feature):
+    run_step = AsyncMock()
+    monkeypatch.setattr(executor, "_run_step", run_step)
+    result = job.run(feature, approved=False)
+    assert result["status"] == "fail"
+    assert result["reason"] == "assistant_configuration_changed"
+    assert result["steps"] == []
+    run_step.assert_not_awaited()
 
 
 @pytest.mark.parametrize("condition", ["false", "unknown"])

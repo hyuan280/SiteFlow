@@ -8,6 +8,7 @@ from app.core.config import Settings
 from app.models.auth import AuthSession
 from app.schemas.scheduler import SchedulerSettingsUpdate, SchedulerSettingsView
 from app.services.scheduler_settings import (
+    SchedulerConflictError,
     SchedulerLockedError,
     SchedulerSettingsService,
     SchedulerValidationError,
@@ -42,7 +43,7 @@ def update_scheduler_settings(
 ) -> SchedulerSettingsView:
     try:
         return service.update(payload)
-    except SchedulerLockedError as exc:
+    except (SchedulerLockedError, SchedulerConflictError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SchedulerValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

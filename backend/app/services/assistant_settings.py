@@ -23,6 +23,7 @@ _NEW_PERMISSIONS = {"auto_authorize_execution", "auto_authorize_screenshot",
 _LEGACY_FIELDS = {"max_tool_calls", "max_model_rounds", "max_parallel_tool_calls",
                   "turn_timeout_seconds", "max_tokens", "context_max_bytes",
                   "auto_compact", "auto_title"}
+_PREVIOUS_FIELDS = set(AssistantSettingsValues.model_fields) - {"max_auth_uses_per_turn"}
 
 
 def _json(value: dict) -> str:
@@ -65,7 +66,11 @@ class AssistantSettingsService:
                     **{key: value for key, value in values.items() if key != "context_max_bytes"},
                     "context_max_tokens": max(16000, (budget + 3) // 4),
                     **dict.fromkeys(_NEW_PERMISSIONS, False),
+                    "max_auth_uses_per_turn": 3,
                 }
+            elif isinstance(values, dict) and set(values) == _PREVIOUS_FIELDS:
+                # Only the exact previous token-budget shape may omit this limit.
+                data["values"] = {**values, "max_auth_uses_per_turn": 3}
             view = AssistantSettingsView.model_validate({**data, "source": "db"})
             if view.values.model_fields_set != set(AssistantSettingsValues.model_fields):
                 raise ValueError

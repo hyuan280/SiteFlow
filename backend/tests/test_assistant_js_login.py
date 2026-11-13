@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -131,8 +130,8 @@ def test_real_chromium_generic_login_transport(public_dns, caplog, mode):
                         assert result["after"]["elements"]
                         await browser.observe(session_id, TOKEN)
                         await browser.screenshot(session_id, TOKEN)
-                    with pytest.raises(HTTPException, match="uncertain"):
-                        await browser.execute(session_id, payload.model_copy(update={"operation_id": uuid.uuid4()}))
+                    assert session.uncertain
+                    assert session.unresolved_operations == {str(payload.operation_id)}
                     # Retained page scripts cannot POST outside active execution.
                     assert await page.evaluate("""async () => {
                         try { await fetch('/late', {method:'POST', body:'private-body'}); return false; }

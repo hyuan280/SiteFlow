@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,10 @@ class ExecutionManager:
             await asyncio.gather(*(tasks + notification_tasks), return_exceptions=True)
 
     def schedule_run_notification(self, run_id: int) -> None:
+        dispatcher = getattr(self, "notification_dispatch", None)
+        if dispatcher is not None:
+            dispatcher.ensure(run_id)
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -113,25 +118,13 @@ class ExecutionManager:
 
     async def _execute_run(self, run_id: int) -> None:
         async with self._run_semaphore:
-            with self.session_factory() as session:
-                run = session.get(Run, run_id)
-                if run is None:
-                    return
-                if run.status in FINAL_RUN_STATUSES:
-                    return
-                if run.cancel_requested:
-                    self._cancel_pending(session, run)
-                    return
-                run.status = "running"
-                run.started_at = datetime.now(timezone.utc)
-                session.commit()
-                job_ids = [
-                    job.id
-                    for job in session.query(SiteJob)
-                    .filter(SiteJob.run_id == run_id)
-                    .order_by(SiteJob.id)
-                    .all()
-                ]
+            prepared = await asyncio.to_thread(self._prepare_run, run_id)
+            if prepared is None:
+                return
+            job_ids, canceled = prepared
+            if canceled:
+                self._wake_run_notification(run_id)
+                return
 
             tasks = [
                 asyncio.create_task(
@@ -148,7 +141,35 @@ class ExecutionManager:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
 
-            self._finalize_run(run_id)
+            finalized = await asyncio.to_thread(self._finalize_run, run_id, _notify=False)
+            if finalized is not None:
+                self._wake_run_notification(run_id)
+            if finalized:
+                takeover = getattr(self, "takeover", None)
+                if takeover is not None:
+                    takeover.wake()
+
+    def _prepare_run(self, run_id: int) -> tuple[list[int], bool] | None:
+        with self.session_factory() as session:
+            run = session.get(Run, run_id)
+            if run is None or run.status in FINAL_RUN_STATUSES:
+                return None
+            if run.cancel_requested:
+                self._cancel_pending(session, run, _notify=False)
+                return [], True
+            run.status = "running"
+            run.started_at = datetime.now(timezone.utc)
+            session.commit()
+            return list(session.scalars(select(SiteJob.id).where(
+                SiteJob.run_id == run_id).order_by(SiteJob.id))), False
+
+    def _wake_run_notification(self, run_id: int) -> None:
+        # The worker has already registered the intent in its terminal transaction.
+        dispatcher = getattr(self, "notification_dispatch", None)
+        if dispatcher is not None:
+            dispatcher.wake()
+        else:
+            self.schedule_run_notification(run_id)
 
     async def _execute_job_guarded(self, run_id: int, job_id: int) -> None:
         with self.session_factory() as session:
@@ -409,7 +430,7 @@ class ExecutionManager:
         except ValueError:
             return None
 
-    def _cancel_pending(self, session, run: Run) -> None:
+    def _cancel_pending(self, session, run: Run, *, _notify: bool = True) -> None:
         now = datetime.now(timezone.utc)
         run.status = "canceled"
         run.finished_at = now
@@ -420,11 +441,16 @@ class ExecutionManager:
                 job.message = "运行已取消"
                 job.finished_at = now
         run.summary_json = json.dumps(ExecutionService._counts(jobs))
+        dispatcher = getattr(self, "notification_dispatch", None)
+        if dispatcher is not None:
+            dispatcher.register(session, run.id)
         session.commit()
-        self.schedule_run_notification(run.id)
+        if _notify:
+            self.schedule_run_notification(run.id)
 
     async def _execute_job(self, run_id: int, job_id: int) -> str | None:
         payload: dict[str, Any] | None = None
+        reserve_auth = None
         with self.session_factory() as session:
             run = session.get(Run, run_id)
             job = session.get(SiteJob, job_id)
@@ -444,9 +470,14 @@ class ExecutionManager:
                 site is None
                 or not validate_guard(session, run_id, site, self.settings, self.crypto)
             ):
+                from app.services.assistant_run_guard import consumption_plan
+
+                stored_plan = consumption_plan(session, run_id, self.crypto)
                 self._finish_job(
-                    job, "fail", "助手测试配置已变化，请重新确认后运行",
-                    {"reason": "assistant_configuration_changed"},
+                    job, "unknown" if stored_plan is not None else "fail",
+                    "助手测试配置已变化，请重新确认后运行",
+                    {"reason": "assistant_configuration_changed",
+                     **({"outcome_uncertain": True} if stored_plan is not None else {})},
                 )
                 session.commit()
                 return
@@ -462,6 +493,24 @@ class ExecutionManager:
                 self._finish_job(job, "fail", f"工作流解析失败: {exc}", {})
                 session.commit()
                 return
+
+            if run.trigger == "assistant":
+                from app.services.assistant_categories import (
+                    Denied, builtin_category, reserve_run_auth_use, run_auth_binding,
+                )
+
+                try:
+                    if any(step.enabled and builtin_category(step.feature_type) == "auth"
+                           for step in resolved.steps):
+                        action_id, binding = run_auth_binding(session, run_id, self.crypto)
+                        reserve_auth = partial(
+                            reserve_run_auth_use, self.session_factory, self.settings, self.crypto,
+                            action_id, binding, job.id, job.attempt)
+                except Denied:
+                    self._finish_job(job, "fail", "Assistant auth budget binding unavailable",
+                                     {"reason": "execution_authorization_changed"})
+                    session.commit()
+                    return
 
             cookies = None
             try:
@@ -576,6 +625,16 @@ class ExecutionManager:
             }
             if run.trigger == "assistant":
                 payload["assistant_run"] = True
+                from app.services.assistant_run_guard import consumption_plan
+                from app.services.assistant_consumption import CONSUMING_FEATURES
+
+                plan = consumption_plan(session, run_id, self.crypto) if any(
+                    step.enabled and step.feature_type in CONSUMING_FEATURES for step in resolved.steps
+                ) else None
+                if plan is not None:
+                    payload["assistant_consumption_plan"] = plan
+                    payload["resign_pending_dates"] = list(plan["review"]["dates"])
+                    payload["resign_today"] = plan["review"]["today"]
                 # A separate session avoids cached ORM/policy values from payload construction.
                 with self.session_factory() as guard_session:
                     current_site = guard_session.get(Site, site.id)
@@ -584,11 +643,16 @@ class ExecutionManager:
                     )
                 if not unchanged:
                     self._finish_job(
-                        job, "fail", "助手测试配置已变化，请重新确认后运行",
-                        {"reason": "assistant_configuration_changed"},
+                        job, "unknown" if plan is not None else "fail",
+                        "助手测试配置已变化，请重新确认后运行",
+                        {"reason": "assistant_configuration_changed",
+                         **({"outcome_uncertain": True} if plan is not None else {})},
                     )
                     session.commit()
                     return
+            from app.services.assistant_takeover import capture_job_config
+
+            capture_job_config(session, self.settings, self.crypto, site, job, payload)
             job.message = "等待浏览器车道空位"
             job.heartbeat_at = datetime.now(timezone.utc)
             job.worker_id = "worker"
@@ -601,7 +665,7 @@ class ExecutionManager:
                 "job_id": job.id,
             }
         payload["secret_access"] = {
-            "token": self.secret_providers.register(job, site, resolved.steps),
+            "token": self.secret_providers.register(job, site, resolved.steps, reserve_auth=reserve_auth),
             "providers": {
                 step.step_key: step_provider(site, step)
                 for step in resolved.steps if step.feature_type in SECRET_PURPOSES
@@ -647,6 +711,9 @@ class ExecutionManager:
             ).limit(1)) is not None
 
         if str(result.get("status") or "") in {"restart", "fallback_interaction"}:
+            if payload.get("assistant_consumption_plan") is not None:
+                result = {**result, "status": "unknown",
+                          "message": "\u6d88\u8d39\u8fd0\u884c\u7981\u6b62\u81ea\u52a8\u91cd\u8bd5\u6216\u5207\u6362\u8f66\u9053\uff0c\u8bf7\u4eba\u5de5\u6838\u9a8c\u5e76\u53d1\u8d77\u65b0\u8bf7\u6c42\u91cd\u65b0\u786e\u8ba4"}
             paid = any(
                 isinstance(row, dict) and row.get("feature_type") == "post.buy_card"
                 and isinstance(row.get("data"), dict)
@@ -746,7 +813,7 @@ class ExecutionManager:
             run = session.get(Run, run_id)
             status = self._canonical_status(str(result.get("status") or "error"))
             if run is not None and run.cancel_requested:
-                status = "canceled"
+                status = "unknown" if payload.get("assistant_consumption_plan") is not None else "canceled"
             message = str(result.get("message") or "")
             steps = result.get("steps")
             step_rows = steps if isinstance(steps, list) else []
@@ -831,11 +898,20 @@ class ExecutionManager:
         job.finished_at = datetime.now(timezone.utc)
         job.heartbeat_at = job.finished_at
 
-    def _finalize_run(self, run_id: int) -> None:
+    def _finalize_run(self, run_id: int, *, _notify: bool = True) -> bool | None:
         with self.session_factory() as session:
             run = session.get(Run, run_id)
             if run is None:
                 return
+            if run.status in FINAL_RUN_STATUSES:
+                if _notify:
+                    self.schedule_run_notification(run_id)
+                else:
+                    dispatcher = getattr(self, "notification_dispatch", None)
+                    if dispatcher is not None:
+                        dispatcher.register(session, run_id)
+                        session.commit()
+                return False
             jobs = session.query(SiteJob).filter(SiteJob.run_id == run.id).all()
             for job in jobs:
                 if job.status == "queued":
@@ -861,5 +937,13 @@ class ExecutionManager:
                 run.status = "fail"
             run.summary_json = json.dumps(counts)
             run.finished_at = datetime.now(timezone.utc)
+            dispatcher = getattr(self, "notification_dispatch", None)
+            if dispatcher is not None:
+                dispatcher.register(session, run.id)
             session.commit()
-            self.schedule_run_notification(run.id)
+            if _notify:
+                self.schedule_run_notification(run.id)
+                takeover = getattr(self, "takeover", None)
+                if takeover is not None:
+                    takeover.wake()
+            return True

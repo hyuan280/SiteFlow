@@ -11,6 +11,9 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.assistant_site_config import UpdateSiteConfig
+from app.schemas.assistant_scheduler import UpdateScheduler
+from app.schemas.assistant_operations import RunCancelInteraction
+from app.services.assistant_templates import TemplateFromSiteRequest
 
 
 def public_url(value: str) -> str:
@@ -95,7 +98,7 @@ class SetTarget(AssistantInput):
     execution_consent: bool = False
     credential_consent: bool = False
     allow_sign: bool = False
-    execution_features: list[str] = Field(default_factory=list, max_length=10)
+    execution_features: list[str] = Field(default_factory=list, max_length=18)
     trusted_origins: list[str] = Field(default_factory=list, max_length=20)
 
     @field_validator("trusted_origins")
@@ -268,8 +271,32 @@ class QuestionInteraction(AssistantInput):
         return self
 
 
+class InteractionPurposeTemplateImport(TemplateFromSiteRequest):
+    purpose: Literal["template_import"]
+
+
 class InteractionPurposeSiteConfig(UpdateSiteConfig):
     purpose: Literal["site_config"]
+
+
+class InteractionPurposeScheduler(UpdateScheduler):
+    purpose: Literal["scheduler_config"]
+
+
+class ConsumptionInteraction(AssistantInput):
+    purpose: Literal["consumption"]
+    run_plan_id: str = Field(min_length=36, max_length=36)
+    step_key: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
+
+
+class CookieClearInteraction(AssistantInput):
+    purpose: Literal["cookie_clear"]
+    operation_id: str = Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+
+    @field_validator("operation_id")
+    @classmethod
+    def canonical_operation(cls, value):
+        return str(UUID(value))
 
 
 PublicUserInteraction = Annotated[
@@ -279,7 +306,10 @@ PublicUserInteraction = Annotated[
 
 UserInteraction = Annotated[
     TargetInteraction | TrustedOriginsInteraction | ProxyInteraction | AuthorizationInteraction
-    | QuestionInteraction | InteractionPurposeSiteConfig, Field(discriminator="purpose"),
+    | QuestionInteraction | InteractionPurposeSiteConfig | ConsumptionInteraction
+    | InteractionPurposeTemplateImport | InteractionPurposeScheduler | RunCancelInteraction
+    | CookieClearInteraction,
+    Field(discriminator="purpose"),
 ]
 
 

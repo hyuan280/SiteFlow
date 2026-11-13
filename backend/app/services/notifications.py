@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
 from typing import Any
+from types import SimpleNamespace
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -47,8 +48,10 @@ EMAIL_ENABLED_KEY = "notification.email.enabled"
 HTTP_ENABLED_KEY = "notification.http.enabled"
 EMAIL_NOTIFY_SUCCESS_KEY = "notification.email.notify_success"
 EMAIL_NOTIFY_MANUAL_KEY = "notification.email.notify_manual"
+EMAIL_NOTIFY_ASSISTANT_KEY = "notification.email.notify_assistant"
 HTTP_NOTIFY_SUCCESS_KEY = "notification.http.notify_success"
 HTTP_NOTIFY_MANUAL_KEY = "notification.http.notify_manual"
+HTTP_NOTIFY_ASSISTANT_KEY = "notification.http.notify_assistant"
 LAYOUT_KEY = "notification.layout"
 
 EMAIL_SECURITY_VALUES = {"ssl", "starttls", "none"}
@@ -68,6 +71,8 @@ DEFAULT_LAYOUT_BODY = """状态：{{status_label}}
 -------------------------------------
 详细信息查看：{{siteflow_domain}}"""
 DEFAULT_LAYOUT_FORMAT = "text"
+PENDING_ASSISTANT_PREFIX = "助手复查中，结果稍后发出。原任务结果："
+INVESTIGATION_TITLE = "[SiteFlow] 助手调查结果 #{}"
 
 STATUS_LABELS = {
     **RUN_STATUS_LABELS,
@@ -386,8 +391,10 @@ class NotificationService:
         keys = {
             ("email", "success"): EMAIL_NOTIFY_SUCCESS_KEY,
             ("email", "manual"): EMAIL_NOTIFY_MANUAL_KEY,
+            ("email", "assistant"): EMAIL_NOTIFY_ASSISTANT_KEY,
             ("http", "success"): HTTP_NOTIFY_SUCCESS_KEY,
             ("http", "manual"): HTTP_NOTIFY_MANUAL_KEY,
+            ("http", "assistant"): HTTP_NOTIFY_ASSISTANT_KEY,
         }
         return keys[(channel, name)]
 
@@ -492,6 +499,7 @@ class NotificationService:
             enabled=self._enabled("email"),
             notify_success=self._flag("email", "success"),
             notify_manual=self._flag("email", "manual"),
+            notify_assistant=self._flag("email", "assistant"),
             available=not errors,
             smtp_host=field("smtp_host"),
             smtp_port=field("smtp_port"),
@@ -536,6 +544,7 @@ class NotificationService:
             enabled=self._enabled("http"),
             notify_success=self._flag("http", "success"),
             notify_manual=self._flag("http", "manual"),
+            notify_assistant=self._flag("http", "assistant"),
             available=not errors,
             url=field("url"),
             method=field("method", "POST"),
@@ -582,7 +591,8 @@ class NotificationService:
 
     def _normalize_email_updates(self, payload: EmailNotificationUpdate) -> dict[str, Any]:
         updates = payload.model_dump(
-            exclude_unset=True, exclude={"enabled", "notify_success", "notify_manual"}
+            exclude_unset=True,
+            exclude={"enabled", "notify_success", "notify_manual", "notify_assistant"},
         )
         normalized: dict[str, Any] = {}
         for field, value in updates.items():
@@ -608,7 +618,8 @@ class NotificationService:
 
     def _normalize_http_updates(self, payload: HTTPNotificationUpdate) -> dict[str, Any]:
         updates = payload.model_dump(
-            exclude_unset=True, exclude={"enabled", "notify_success", "notify_manual"}
+            exclude_unset=True,
+            exclude={"enabled", "notify_success", "notify_manual", "notify_assistant"},
         )
         normalized: dict[str, Any] = {}
         for field, value in updates.items():
@@ -651,6 +662,8 @@ class NotificationService:
             self._set_flag("email", "success", payload.notify_success)
         if payload.notify_manual is not None:
             self._set_flag("email", "manual", payload.notify_manual)
+        if payload.notify_assistant is not None:
+            self._set_flag("email", "assistant", payload.notify_assistant)
         self.session.commit()
         return self.view()
 
@@ -683,6 +696,8 @@ class NotificationService:
             self._set_flag("http", "success", payload.notify_success)
         if payload.notify_manual is not None:
             self._set_flag("http", "manual", payload.notify_manual)
+        if payload.notify_assistant is not None:
+            self._set_flag("http", "assistant", payload.notify_assistant)
         self.session.commit()
         return self.view()
 
@@ -711,7 +726,7 @@ class NotificationService:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(self._timezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    def _run_event(self, run_id: int) -> dict[str, Any]:
+    def _run_event(self, run_id: int, *, include_conclusions: bool = True) -> dict[str, Any]:
         run = self.session.get(Run, run_id)
         if run is None:
             raise NotificationValidationError(f"运行 {run_id} 不存在")
@@ -730,17 +745,18 @@ class NotificationService:
         )
         site_rows = [
             {
+                "job_id": job.id,
                 "site_id": job.site_id,
                 "site_name": job.site_name,
                 "status": job.status,
                 "status_label": STATUS_LABELS.get(job.status, job.status),
-                "message": (job.message or "")[:500],
+                "message": job.message or "",
                 "lane": job.lane,
                 "attempt": job.attempt,
             }
             for job in jobs
         ]
-        return {
+        event = {
             "run_id": run.id,
             "status": run.status,
             "status_label": status_label,
@@ -760,6 +776,88 @@ class NotificationService:
             "canceled_count": counts.get("canceled", 0),
             "sites": site_rows,
         }
+        if include_conclusions:
+            self.apply_conclusions(event)
+        else:
+            self._sanitize_messages(event)
+        return event
+
+    def apply_conclusions(
+        self, event: dict[str, Any], *, completed_before: datetime | None = None,
+    ) -> None:
+        from app.services.assistant_takeover_conclusions import notification_conclusions
+
+        conclusions = notification_conclusions(
+            self.session, self.crypto, event["run_id"], completed_before=completed_before,
+        )
+        for site in event.get("sites", []):
+            conclusion = conclusions.get(site.get("job_id"))
+            if conclusion and isinstance(conclusion.get("message"), str) and conclusion["message"].strip():
+                site["message"] = conclusion["message"][:500]
+        self._sanitize_messages(event)
+
+    def annotate_assistant_pending(
+        self, event: dict[str, Any], job_ids: Any,
+    ) -> None:
+        """Mark jobs whose takeover needs fresh analysis without touching results."""
+        pending = {job_id for job_id in job_ids if isinstance(job_id, int)}
+        if not pending:
+            return
+        for site in event.get("sites", []):
+            if site.get("job_id") not in pending:
+                continue
+            original = site.get("message") or ""
+            site["message"] = (PENDING_ASSISTANT_PREFIX + original)[:500]
+        self._sanitize_messages(event)
+
+    def investigation_notice(
+        self, *, action: Any, run: Any, job: Any, site: Any, conclusion: str,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Build a distinct plain-text investigation notice, never a run result."""
+        action_status = (
+            "已更新配置但未重新验证" if action.status == "updated" else "仅调查"
+        )
+        site_name = site.name if site is not None else job.site_name
+        safe_site = {"sites": [{"message": site_name}]}
+        self._sanitize_messages(safe_site)
+        site_name = safe_site["sites"][0]["message"][:128]
+        status_label = STATUS_LABELS.get(job.status, job.status)
+        title = INVESTIGATION_TITLE.format(run.id)
+        body = (
+            "助手调查结果\n"
+            f"站点：{site_name}\n"
+            f"来源：运行 #{run.id} / 站点任务 #{job.id}\n"
+            f"原任务状态：{status_label}（{job.status}）\n"
+            f"调查状态：{action_status}\n"
+            f"结论：{conclusion}\n"
+        )
+        event = {
+            "event": "assistant.investigation",
+            "run_id": run.id,
+            "run_status": run.status,
+            "job_id": job.id,
+            "job_status": job.status,
+            "site_id": job.site_id,
+            "site_name": site_name,
+            "conclusion": conclusion,
+            "action_status": action.status,
+        }
+        return event, {"title": title, "body": body, "format": "text"}
+
+    def _sanitize_messages(self, event: dict[str, Any]) -> None:
+        from app.services.assistant_operations import _known_keys, _sanitize_log
+        from app.services.integrations import IntegrationValidationError
+
+        try:
+            keys = _known_keys(self.session, SimpleNamespace(manager=self, config={}))
+        except (CryptoError, IntegrationValidationError):
+            # Fail closed on message content, not on the terminal run transaction.
+            logger.warning("notification message sanitization: an integration secret is unreadable")
+            for site in event.get("sites", []):
+                site["message"] = "[redacted]"
+            return
+        for site in event.get("sites", []):
+            site["message"] = _sanitize_log(site.get("message") or "", keys)[:500]
 
     def _sample_event(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
@@ -979,14 +1077,31 @@ class NotificationService:
     def _send_http(self, target: DeliveryTarget, message: dict[str, str], event: dict[str, Any]) -> str:
         assert target.values is not None
         values = target.values
-        payload = {
-            "event": "run.finished",
-            "title": message["title"],
-            "body": message["body"],
-            "content": message["body"],
-            "format": message["format"],
-            "run": event,
-        }
+        if event.get("event") == "assistant.investigation":
+            payload = {
+                "event": "assistant.investigation",
+                "title": message["title"],
+                "body": message["body"],
+                "content": message["body"],
+                "format": message["format"],
+                "run_id": event["run_id"],
+                "run_status": event["run_status"],
+                "job_id": event["job_id"],
+                "job_status": event["job_status"],
+                "site_id": event["site_id"],
+                "site_name": event["site_name"],
+                "conclusion": event["conclusion"],
+                "action_status": event["action_status"],
+            }
+        else:
+            payload = {
+                "event": "run.finished",
+                "title": message["title"],
+                "body": message["body"],
+                "content": message["body"],
+                "format": message["format"],
+                "run": event,
+            }
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "SiteFlow-Notifier/1.0",
@@ -1010,9 +1125,10 @@ class NotificationService:
         channel: str | None = None,
         require_enabled: bool = True,
         respect_filters: bool = False,
+        targets: list[DeliveryTarget] | None = None,
     ) -> list[ChannelDeliveryResult]:
         results: list[ChannelDeliveryResult] = []
-        for target in self._targets(channel):
+        for target in self._targets(channel) if targets is None else targets:
             if require_enabled and not target.enabled:
                 continue
             if respect_filters and not self._accepts_run(target.channel, event):
@@ -1061,6 +1177,18 @@ class NotificationService:
         event = self._run_event(run_id)
         message = self._render(event)
         return self._send(message, event, require_enabled=True, respect_filters=True)
+
+    def send_event(
+        self, event: dict[str, Any], message: dict[str, str], *, targets: list[DeliveryTarget],
+    ) -> list[ChannelDeliveryResult]:
+        """Send an already rendered event using its frozen channel selection."""
+        return self._send(message, event, targets=targets)
+
+    def investigation_targets(self) -> list[DeliveryTarget]:
+        return [
+            target for target in self._targets()
+            if target.enabled and not target.error and self._flag(target.channel, "assistant")
+        ]
 
     def test_channel(self, channel: str) -> NotificationTestResult:
         event = self._sample_event()

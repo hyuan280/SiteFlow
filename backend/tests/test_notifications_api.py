@@ -61,6 +61,7 @@ def test_notification_defaults_and_layout_roundtrip(client: TestClient) -> None:
     assert body["email"]["enabled"] is False
     assert body["email"]["notify_success"] is True
     assert body["email"]["notify_manual"] is True
+    assert body["email"]["notify_assistant"] is True
     assert body["email"]["available"] is False
     assert body["email"]["smtp_port"]["value"] == 587
     assert body["email"]["security"]["value"] == "starttls"
@@ -68,6 +69,7 @@ def test_notification_defaults_and_layout_roundtrip(client: TestClient) -> None:
     assert body["http"]["enabled"] is False
     assert body["http"]["notify_success"] is True
     assert body["http"]["notify_manual"] is True
+    assert body["http"]["notify_assistant"] is True
     assert body["http"]["method"]["value"] == "POST"
     assert body["http"]["timeout_seconds"]["value"] == 10
 
@@ -96,12 +98,14 @@ def test_notification_filters_apply_per_channel(client: TestClient, monkeypatch)
     assert response.status_code == 200, response.text
     response = client.put(
         "/api/v1/notifications/email",
-        json={"notify_success": False, "notify_manual": False},
+        json={"notify_success": False, "notify_manual": False, "notify_assistant": False},
     )
     assert response.status_code == 200, response.text
     email = response.json()["email"]
     assert email["notify_success"] is False
     assert email["notify_manual"] is False
+    assert email["notify_assistant"] is False
+    assert response.json()["http"]["notify_assistant"] is True
 
     session = client.app.state.session_factory()
     try:
@@ -183,6 +187,26 @@ def test_notification_filters_apply_per_channel(client: TestClient, monkeypatch)
     assert response.json()["http"]["notify_manual"] is True
 
 
+@pytest.mark.parametrize("channel", ["email", "http"])
+def test_assistant_flag_persists_independently_in_database(client: TestClient, channel: str) -> None:
+    from app.models.setting import AppSetting
+
+    other = "http" if channel == "email" else "email"
+    response = client.put(f"/api/v1/notifications/{channel}", json={"notify_assistant": False})
+    assert response.status_code == 200, response.text
+    settings = client.get("/api/v1/notifications").json()
+    assert settings[channel]["notify_assistant"] is False
+    assert settings[other]["notify_assistant"] is True
+    assert settings[channel]["notify_success"] is True
+    assert settings[channel]["notify_manual"] is True
+    with client.app.state.session_factory() as db:
+        row = db.get(AppSetting, f"notification.{channel}.notify_assistant")
+        assert json.loads(row.value_json) is False
+        assert db.get(IntegrationConfig, f"notification.{channel}") is None
+    response = client.put(f"/api/v1/notifications/{channel}", json={"notify_assistant": True})
+    assert response.status_code == 200 and response.json()[channel]["notify_assistant"] is True
+
+
 def test_email_db_roundtrip_masks_password(client: TestClient) -> None:
     response = client.put("/api/v1/notifications/email", json=_email_payload())
     assert response.status_code == 200, response.text
@@ -251,9 +275,11 @@ def test_env_email_config_is_locked_but_enabled_can_change(client: TestClient, t
     )
     assert response.status_code == 409
 
-    response = env_client.put("/api/v1/notifications/email", json={"enabled": False})
+    response = env_client.put(
+        "/api/v1/notifications/email", json={"enabled": False, "notify_assistant": False})
     assert response.status_code == 200, response.text
     assert response.json()["email"]["enabled"] is False
+    assert response.json()["email"]["notify_assistant"] is False
     assert env_client.get("/api/v1/notifications").json()["email"]["enabled"] is False
 
     response = env_client.put("/api/v1/notifications/email", json={"enabled": True})
@@ -304,9 +330,11 @@ def test_http_db_roundtrip_hides_headers_and_env_locks_url(client: TestClient, t
         "/api/v1/notifications/http",
         json={"url": "https://changed.example.com"},
     ).status_code == 409
-    response = locked_client.put("/api/v1/notifications/http", json={"enabled": False})
+    response = locked_client.put(
+        "/api/v1/notifications/http", json={"enabled": False, "notify_assistant": False})
     assert response.status_code == 200, response.text
     assert response.json()["http"]["enabled"] is False
+    assert response.json()["http"]["notify_assistant"] is False
 
 
 def test_notification_test_endpoints_use_saved_layout(
@@ -587,17 +615,16 @@ def test_run_finalization_schedules_notification(client: TestClient, monkeypatch
 
     sent: list[int] = []
 
-    def fake_send(self, run_id: int):  # type: ignore[no-untyped-def]
-        sent.append(run_id)
+    def fake_send(self, event, message, *, targets):  # type: ignore[no-untyped-def]
+        sent.append(event["run_id"])
         return []
 
-    monkeypatch.setattr(NotificationService, "send_run", fake_send)
+    monkeypatch.setattr(NotificationService, "send_event", fake_send)
     manager: ExecutionManager = client.app.state.executor
 
     async def finalize() -> None:
         manager._finalize_run(run_id)
-        await asyncio.sleep(0)
-        await asyncio.gather(*list(manager._notification_tasks))
+        await asyncio.to_thread(manager.notification_dispatch.dispatch_pending)
 
     asyncio.run(finalize())
     assert sent == [run_id]

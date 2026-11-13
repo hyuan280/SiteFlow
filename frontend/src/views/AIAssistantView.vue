@@ -4,21 +4,33 @@ import { useRouter } from "vue-router";
 import { ElMessageBox } from "element-plus";
 
 import AssistantSettingsDialog from "@/components/AssistantSettingsDialog.vue";
+import AssistantTakeoverDialog from "@/components/AssistantTakeoverDialog.vue";
 import AssistantMarkdown from "@/components/AssistantMarkdown.vue";
 import AssistantInteractionReview from "@/components/AssistantInteractionReview.vue";
-import { interactionPurposeLabel, siteConfigResult } from "@/utils/assistant-review";
+import { interactionPurposeLabel, siteConfigResult, operationResultLabel } from "@/utils/assistant-review";
+import { createAssistantMessageCache } from "@/utils/assistant-message-cache";
 import { ApiError, apiRequest } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
-import { assistantRunLanePolicies, isAssistantDetail, isAssistantSession, isAssistantScreenshot, isAssistantUnresolvedOperation } from "@/types/assistant";
+import { assistantRunLanePolicies, isAssistantDetail, isAssistantPendingInteraction, isAssistantSessionList, isAssistantScreenshot, isAssistantUnresolvedOperation } from "@/types/assistant";
 import type { AssistantDetail, AssistantMessage, AssistantSession, AssistantUnresolvedOperation } from "@/types/assistant";
 
 const auth = useAuthStore();
 const router = useRouter();
 const settingsOpen = ref(false);
+const takeoverOpen = ref(false);
 const sessions = ref<AssistantSession[]>([]);
 const selectedId = ref("");
 const detail = ref<AssistantDetail | null>(null);
+const messageCache = createAssistantMessageCache();
+const openMessageIds = reactive(new Set<number>());
+function toggleMessage(id: number, event: Event): void {
+  if ((event.currentTarget as HTMLDetailsElement).open) openMessageIds.add(id);
+  else openMessageIds.delete(id);
+}
 const listLoading = ref(false);
+const moreLoading = ref(false);
+const nextOffset = ref<number | null>(null);
+let historyPaged = false;
 const detailLoading = ref(false);
 const listError = ref("");
 const error = ref("");
@@ -106,7 +118,7 @@ const recoveryOperations = computed(() => {
     for (const message of current.messages) {
       if (message.role !== "tool" || !["execute_step", "retry_step"].includes(message.tool_name ?? "")) continue;
       try {
-        const result = JSON.parse(message.content);
+        const result = messageCache.parse(message);
         const item = { operation_id: result.operation_id, status: result.status, code: result.code,
           can_authorize: result.can_authorize === true, ...(typeof result.feature_type === "string" ? { feature_type: result.feature_type } : {}) };
         if (isAssistantUnresolvedOperation(item)) operations.set(item.operation_id.toLowerCase(), item);
@@ -156,7 +168,7 @@ const interactionSeconds = computed(() => pendingInteraction.value
   ? Math.max(0, Math.ceil((Date.parse(pendingInteraction.value.expires_at) - interactionNow.value) / 1000)) : 0);
 const interactionValid = computed(() => {
   const item = pendingInteraction.value;
-  if (!item) return false;
+  if (!item || !isAssistantPendingInteraction(item)) return false;
   const options = item.options ?? [];
   const fields = item.fields ?? [];
   return (!options.length || (interactionSelections.value.length > 0 &&
@@ -223,6 +235,8 @@ function resetSelection(id = ""): void {
   closeStream();
   selectedId.value = id;
   detail.value = null;
+  messageCache.clear();
+  openMessageIds.clear();
   detailLoading.value = false;
   content.value = "";
   action.value = "";
@@ -251,6 +265,8 @@ async function handleFailure(cause: unknown, publish: (message: string) => void)
     resetSelection();
     listRequest++;
     sessions.value = [];
+    nextOffset.value = null;
+    listLoading.value = moreLoading.value = false;
     auth.clear();
     await router.replace({ name: "login" });
     return;
@@ -282,6 +298,16 @@ async function handleFailure(cause: unknown, publish: (message: string) => void)
     credentials_unavailable: "无法取得可用凭据，请检查所绑定站点的已保存凭据或 Bitwarden 域名匹配配置。",
     screenshot_consent_required: "请让助手发起交互式图像授权请求，核对后决定是否发送。",
     browser_reopen_required: "请先通过聊天让助手打开浏览器。",
+    cookie_site_required: "清除 Cookie 需要明确绑定已保存站点，不会按主机查找其他站点。",
+    cookie_binding_changed: "Cookie 站点绑定已失效，请重新确认目标；不会回退到其他站点。",
+    cookie_restore_unavailable: "无法恢复已保存 Cookie，浏览器未继续导航，请核对绑定站点的 Cookie 配置。",
+    cookie_clear_binding_changed: "Cookie 清除范围或绑定已改变，原批准不可复用，请重新发起完整确认。",
+    cookie_clear_approval_required: "清除 Cookie 需要核对服务端提供的范围并人工批准。",
+    cookie_clear_internal_only: "Cookie 清除确认只能由专用工具发起，请让助手重新请求。",
+    cookie_clear_operation_conflict: "此 Cookie 清除操作已处理，请核对原结果，不要重复执行。",
+    browser_outcome_unknown: "已清除站点保存的 Cookie；浏览器 Cookie 清除结果未知，不代表全部成功，不要自动重试。",
+    browser_scope_changed: "已清除站点保存的 Cookie；浏览器范围已改变，浏览器 Cookie 清除结果未知，不要自动重试。",
+    site_run_active: "该站点有排队或运行中的任务，暂不能清除 Cookie。",
     retry_step_unavailable: "此旧记录没有可安全重试的冻结步骤，无法授权重试。",
     retry_binding_changed: "目标或凭据绑定已改变，不能重试原操作。",
     retry_not_uncertain: "此操作已不在结果不确定的记录中，请刷新会话核对。",
@@ -317,10 +343,11 @@ function applySnapshot(value: unknown, id: string, preserveProgress = false): vo
   let next = preserveUsage(preserveContext(preserveContext(preserveTitle(preserveTitle(value, listed), current), listed), current), current);
   if (current) {
     const last = current.messages.at(-1)?.id ?? 0;
+    const statuses = new Map(value.messages.map(message => [message.id, message.status]));
     // Title, context and usage revisions are independent of message/tool progress.
     if (preserveProgress || (value.messages.at(-1)?.id ?? 0) < last ||
       current.messages.some(message => message.status && message.status !== "running" &&
-        value.messages.some(next => next.id === message.id && next.status === "running")) ||
+        statuses.get(message.id) === "running") ||
       ((value.messages.at(-1)?.id ?? 0) === last && current.status === "idle" && value.status === "running")) {
       next = { ...current, title: next.title, title_locked: next.title_locked, title_revision: next.title_revision, context: next.context, usage: next.usage };
     }
@@ -332,9 +359,18 @@ function applySnapshot(value: unknown, id: string, preserveProgress = false): vo
     }
   }
   detail.value = next;
+  messageCache.prune(next.messages);
+  const messageIds = new Set(next.messages.map(message => message.id));
+  for (const id of openMessageIds) if (!messageIds.has(id)) openMessageIds.delete(id);
   snapshot++;
-  sessions.value = sessions.value.map(item => item.id === id ? { ...item, title: next.title,
-    title_locked: next.title_locked, title_revision: next.title_revision, status: next.status, context: next.context } : item);
+  const contextUnchanged = listed?.context?.revision === next.context?.revision &&
+    listed?.context?.compressed === next.context?.compressed &&
+    listed?.context?.summary_through_message_id === next.context?.summary_through_message_id;
+  if (listed && (listed.title !== next.title || listed.title_locked !== next.title_locked ||
+    listed.title_revision !== next.title_revision || listed.status !== next.status || !contextUnchanged)) {
+    sessions.value = sessions.value.map(item => item.id === id ? { ...item, title: next.title,
+      title_locked: next.title_locked, title_revision: next.title_revision, status: next.status, context: next.context } : item);
+  }
 }
 
 function connect(id: string, currentEpoch: number): void {
@@ -342,11 +378,15 @@ function connect(id: string, currentEpoch: number): void {
   connection.value = "connecting";
   const source = new EventSource(`/api/v1/assistant/sessions/${encodeURIComponent(id)}/events`, { withCredentials: true });
   stream = source;
+  let lastData: string | undefined;
   const current = () => alive && epoch === currentEpoch && stream === source;
   source.addEventListener("update", event => {
     if (!current()) return;
+    const data = (event as MessageEvent<string>).data;
+    if (data === lastData) { connection.value = "live"; return; }
     try {
-      applySnapshot(JSON.parse((event as MessageEvent<string>).data), id);
+      applySnapshot(JSON.parse(data), id);
+      lastData = data;
       connection.value = "live";
     } catch {
       error.value = "收到的会话更新格式无效，未显示该更新。请刷新核对。";
@@ -357,11 +397,11 @@ function connect(id: string, currentEpoch: number): void {
     if (!current()) return;
     connection.value = "offline";
     // EventSource hides HTTP status. A read checks auth; native SSE alone reconnects.
-    void refreshDetail();
+    void refreshDetail(true);
   };
 }
 
-async function refreshDetail(): Promise<void> {
+async function refreshDetail(preserveProgress = false): Promise<void> {
   const id = selectedId.value;
   if (!alive || !id) return;
   const currentEpoch = epoch;
@@ -371,7 +411,7 @@ async function refreshDetail(): Promise<void> {
   try {
     const value = await apiRequest<unknown>(`/assistant/sessions/${encodeURIComponent(id)}`);
     if (!alive || epoch !== currentEpoch || request !== detailRequest) return;
-    applySnapshot(value, id, revision !== snapshot);
+    applySnapshot(value, id, preserveProgress || revision !== snapshot);
     if (!stream && detail.value) connect(id, currentEpoch);
   } catch (cause) {
     if (!alive || epoch !== currentEpoch || request !== detailRequest) return;
@@ -387,37 +427,53 @@ async function selectSession(id: string): Promise<void> {
   await refreshDetail();
 }
 
-async function loadSessions(): Promise<void> {
-  if (!alive) return;
+async function loadSessions(append = false): Promise<void> {
+  if (!alive || listLoading.value || (append && (moreLoading.value || nextOffset.value === null))) return;
   const request = ++listRequest;
   const currentEpoch = epoch;
-  listLoading.value = true;
+  const offset = append ? nextOffset.value! : 0;
+  listLoading.value = !append;
+  moreLoading.value = append;
   listError.value = "";
   try {
-    const value = await apiRequest<unknown>("/assistant/sessions");
+    const value = await apiRequest<unknown>(append
+      ? `/assistant/sessions?offset=${offset}&limit=100` : "/assistant/sessions");
     if (!alive || request !== listRequest) return;
-    if (!value || typeof value !== "object" || !("items" in value) || !Array.isArray(value.items) ||
-      !value.items.every(isAssistantSession) || new Set(value.items.map(item => item.id)).size !== value.items.length) {
+    if (!isAssistantSessionList(value) ||
+      (value.offset !== undefined && (value.offset !== offset || value.limit !== 100))) {
       throw new Error("Invalid assistant sessions");
     }
-    sessions.value = value.items.map(item => {
-      const previous = sessions.value.find(previous => previous.id === item.id);
+    const previousItems = new Map(sessions.value.map(item => [item.id.toLowerCase(), item]));
+    const incoming = value.items.map(item => {
+      const previous = previousItems.get(item.id.toLowerCase());
       const next = preserveContext(preserveTitle(item, previous), previous);
       return detail.value?.id === item.id
-        ? { ...preserveContext(preserveTitle(next, detail.value), detail.value), status: detail.value.status } : next;
+         ? { ...preserveContext(preserveTitle(next, detail.value), detail.value), status: detail.value.status } : next;
     });
+    // Only explicit exhaustion proves the head is the whole list; legacy heads were capped.
+    const exhaustive = !append && value.next_offset === null;
+    const merged = exhaustive ? incoming : append ? [...sessions.value, ...incoming] : [...incoming, ...sessions.value];
+    const unique = new Map<string, AssistantSession>();
+    for (const item of merged) {
+      const key = item.id.toLowerCase();
+      if (append || !unique.has(key)) unique.set(key, item);
+    }
+    sessions.value = [...unique.values()];
+    if (exhaustive) historyPaged = false;
+    if (append || !historyPaged) nextOffset.value = value.next_offset ?? null;
+    if (append) historyPaged = true;
     if (detail.value) {
       const listed = sessions.value.find(item => item.id === detail.value?.id);
       detail.value = { ...preserveTitle(detail.value, listed), context: listed?.context ?? detail.value.context };
     }
-    if (!selectedId.value && currentEpoch === epoch && !creating.value && value.items[0]) {
+    if (!append && !selectedId.value && currentEpoch === epoch && !creating.value && value.items[0]) {
       await selectSession(value.items[0].id);
     }
   } catch (cause) {
     if (!alive || request !== listRequest) return;
     await handleFailure(cause, message => { listError.value = message; });
   } finally {
-    if (alive && request === listRequest) listLoading.value = false;
+    if (alive && request === listRequest) listLoading.value = moreLoading.value = false;
   }
 }
 
@@ -435,6 +491,8 @@ async function createSession(): Promise<void> {
     resetSelection(value.id);
     applySnapshot(value, value.id);
     connect(value.id, epoch);
+    listRequest++;
+    listLoading.value = moreLoading.value = false;
     void loadSessions();
   } catch (cause) {
     if (!alive || epoch !== currentEpoch) return;
@@ -666,7 +724,13 @@ async function deleteSession(): Promise<void> {
     await apiRequest(`/assistant/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
     if (!alive || epoch !== currentEpoch) return;
     resetSelection();
+    // A known removal before the next live offset shifts all remaining rows left.
+    if (nextOffset.value !== null && sessions.value.some(item => item.id === id)) {
+      nextOffset.value = Math.max(0, nextOffset.value - 1);
+    }
     sessions.value = sessions.value.filter(item => item.id !== id);
+    listRequest++;
+    listLoading.value = moreLoading.value = false;
     void loadSessions();
   } catch (cause) {
     if (!alive || epoch !== currentEpoch) return;
@@ -677,21 +741,13 @@ async function deleteSession(): Promise<void> {
 }
 
 function toolResult(message: AssistantMessage): string {
-  if (message.tool_name === "browser_screenshot") {
-    try {
-      const result = JSON.parse(message.content);
-      const metadata = Object.fromEntries(["ok", "code", "mime_type", "width", "height", "masked", "image_id", "url_redacted"].filter(key =>
-        ["string", "number", "boolean"].includes(typeof result?.[key])).map(key => [key, result[key]]));
-      return JSON.stringify(metadata, null, 2);
-    } catch { return "截图工具结果格式无效，未显示图像。"; }
-  }
-  try { return JSON.stringify(JSON.parse(message.content), null, 2); } catch { return message.content; }
+  return messageCache.pretty(message);
 }
 
 function uncertaintyStatus(message: AssistantMessage): "pending" | "historical" | null {
   if (message.role !== "tool" || !["execute_step", "retry_step"].includes(message.tool_name ?? "")) return null;
   try {
-    const result = JSON.parse(message.content);
+    const result = messageCache.parse(message);
     if (result?.status !== "unknown" || result?.code !== "outcome_uncertain") return null;
     const unresolved = detail.value?.unresolved_operations;
     return unresolved === undefined || unresolved.some(item => item.operation_id.toLowerCase() === result.operation_id?.toLowerCase())
@@ -706,7 +762,7 @@ function isContextLimit(message: AssistantMessage): boolean {
 function trustResult(message: AssistantMessage): Record<string, unknown> | null {
   if (message.role !== "tool" || !["browser_open", "browser_observe", "browser_navigate"].includes(message.tool_name ?? "")) return null;
   try {
-    const result = JSON.parse(message.content);
+    const result = messageCache.parse(message);
     if (!result || typeof result !== "object" || Array.isArray(result)) return null;
     if (result.ok === false && result.code === "browser_trust_required") return result;
     return Array.isArray(result.warnings) ? result.warnings.slice(0, 4).find((warning: unknown): warning is Record<string, unknown> =>
@@ -719,7 +775,7 @@ function trustResult(message: AssistantMessage): Record<string, unknown> | null 
 function isProposal(message: AssistantMessage): boolean {
   if (message.role !== "tool" || message.tool_name !== "submit_workflow_draft") return false;
   try {
-    const result = JSON.parse(message.content);
+    const result = messageCache.parse(message);
     return result?.ok === true && result?.submitted === true && Boolean(result.proposal);
   } catch { return false; }
 }
@@ -729,7 +785,7 @@ function workflowResult(message: AssistantMessage): { kind: "import"; site_id: n
   if (message.role !== "tool" || message.status === "running" || message.status === "error" ||
     !["import_workflow_draft", "run_site"].includes(message.tool_name ?? "")) return null;
   try {
-    const result = JSON.parse(message.content);
+    const result = messageCache.parse(message);
     if (result?.ok !== true) return null;
     if (message.tool_name === "import_workflow_draft" && Number.isSafeInteger(result.site_id) && result.site_id > 0 &&
       typeof result.name === "string" && ["created", "updated"].includes(result.operation) &&
@@ -744,6 +800,12 @@ function workflowResult(message: AssistantMessage): { kind: "import"; site_id: n
     }
   } catch { /* Tool JSON remains available even when the result cannot form a safe link. */ }
   return null;
+}
+
+function messageMetadata(message: AssistantMessage) {
+  const parse = () => messageCache.parse(message);
+  return { uncertainty: uncertaintyStatus(message), trust: trustResult(message), proposal: isProposal(message),
+    workflow: workflowResult(message), config: siteConfigResult(message, parse), operation: operationResultLabel(message, parse) };
 }
 
 onMounted(() => {
@@ -762,6 +824,7 @@ onBeforeUnmount(() => {
     <header class="page-heading">
       <div><h1>智能助手</h1><p class="muted">对话梳理需求，观察网站，按授权单步验证，生成待人工审阅的配置提案。</p></div>
       <div class="heading-actions">
+        <el-button @click="takeoverOpen = true">助手接管</el-button>
         <el-button @click="settingsOpen = true">助手设置</el-button>
         <el-button type="primary" :loading="creating" :disabled="creating" @click="createSession">新建会话</el-button>
       </div>
@@ -769,8 +832,7 @@ onBeforeUnmount(() => {
     <p v-if="createError" class="error-text" role="alert">{{ createError }}</p>
     <div class="assistant-grid">
       <aside class="sessions-panel" aria-label="助手会话">
-        <div class="panel-heading"><strong>会话</strong><el-button text :loading="listLoading" @click="loadSessions">刷新列表</el-button></div>
-        <p v-if="listError" class="error-text" role="alert">{{ listError }}</p>
+        <div class="panel-heading"><strong>会话</strong><el-button text :loading="listLoading" :disabled="listLoading" @click="loadSessions()">刷新列表</el-button></div>
         <p v-if="!sessions.length && !listLoading" class="muted">暂无会话。新建会话后开始对话。</p>
         <nav class="session-list" aria-label="选择会话">
           <button v-for="session in sessions" :key="session.id" type="button" class="session-item"
@@ -781,6 +843,10 @@ onBeforeUnmount(() => {
             <small v-if="session.context?.compressed" :title="`上下文修订 ${session.context.revision}。${contextTip}`">较早上下文已整理，完整记录仍保留</small>
             <time :datetime="session.updated_at">{{ new Date(session.updated_at).toLocaleString() }}</time>
           </button>
+          <button v-if="nextOffset !== null" type="button" class="session-more"
+            :disabled="listLoading || moreLoading" :aria-busy="moreLoading" @click="loadSessions(true)"
+            title="按当前排序加载；会话更新可能使分页重叠或遗漏，非历史快照。">{{ moreLoading ? '正在加载会话…' : '加载更多会话' }}</button>
+          <p v-if="listError" class="error-text" role="alert">{{ listError }}</p>
         </nav>
       </aside>
       <section class="chat-panel" aria-label="助手对话" :aria-busy="detailLoading || running">
@@ -797,7 +863,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div v-if="selectedId" class="workspace-actions">
-            <el-button :disabled="detailLoading || !!action" @click="refreshDetail">刷新会话</el-button>
+            <el-button :disabled="detailLoading || !!action" @click="refreshDetail()">刷新会话</el-button>
             <el-button :disabled="!canUseBrowser" :loading="action === 'refresh'" @click="refreshBrowser">刷新网页</el-button>
             <el-button :disabled="!canScreenshot" :loading="action === 'screenshot'" @click="takeScreenshot">截图预览</el-button>
             <el-button :disabled="!detail || detailLoading || running || !!action" @click="openTitle">重命名</el-button>
@@ -826,41 +892,44 @@ onBeforeUnmount(() => {
           </section>
             <p v-if="!detail.messages.length" class="empty-chat">描述希望配置的网站流程。尚未确认目标也可以先交流。</p>
             <article v-for="message in detail.messages" :key="message.id" class="message-card" :class="`role-${message.role}`">
+              <template v-for="meta in [messageMetadata(message)]" :key="message.id">
               <div class="message-heading">
                 <strong>{{ message.role === 'tool' ? (message.title || '工具调用') : message.role === 'user' ? '你' : message.role === 'assistant' ? '智能助手' : '系统' }}</strong>
                 <span v-if="message.tool_name" class="mono muted">{{ message.tool_name }}</span>
-                <el-tag v-if="message.status" size="small" :type="uncertaintyStatus(message) === 'historical' ? 'info' : uncertaintyStatus(message) ? 'warning' : message.status === 'error' ? 'danger' : message.status === 'running' ? 'warning' : 'success'">
-                  {{ uncertaintyStatus(message) === 'historical' ? '历史结果不确定，已处理' : uncertaintyStatus(message) ? '结果不确定' : message.status === 'running' ? '进行中' : message.status === 'success' ? '成功' : '失败' }}
+                <el-tag v-if="message.status" size="small" :type="meta.uncertainty === 'historical' ? 'info' : meta.uncertainty ? 'warning' : message.status === 'error' ? 'danger' : message.status === 'running' ? 'warning' : 'success'">
+                  {{ meta.uncertainty === 'historical' ? '历史结果不确定，已处理' : meta.uncertainty ? '结果不确定' : message.status === 'running' ? '进行中' : message.status === 'success' ? '成功' : '失败' }}
                 </el-tag>
                 <time class="muted" :datetime="message.created_at">{{ new Date(message.created_at).toLocaleTimeString() }}</time>
               </div>
               <template v-if="message.role === 'tool'">
-                <section v-if="trustResult(message)" class="trust-notice" role="alert">
+                <section v-if="meta.trust" class="trust-notice" role="alert">
                   <strong>跨来源访问已阻止，需用户核对并确认可信来源。</strong>
-                  <p v-if="trustResult(message)?.source === 'blocked_request'">已阻止页面发起的跨来源请求，当前页面仍保留，可继续观察；不会自动重试。</p>
-                  <p>当前完整 URL：{{ trustResult(message)?.source_url }}</p>
-                  <p>目标完整 URL：{{ trustResult(message)?.target_url }}</p>
-                  <p>待核对 origin：{{ trustResult(message)?.target_origin }}</p>
-                  <p v-if="trustResult(message)?.source_url_redacted === true || trustResult(message)?.target_url_redacted === true || trustResult(message)?.url_redacted === true">脱敏参数不可直接作为可运行地址。</p>
+                  <p v-if="meta.trust.source === 'blocked_request'">已阻止页面发起的跨来源请求，当前页面仍保留，可继续观察；不会自动重试。</p>
+                  <p>当前完整 URL：{{ meta.trust.source_url }}</p>
+                  <p>目标完整 URL：{{ meta.trust.target_url }}</p>
+                  <p>待核对 origin：{{ meta.trust.target_origin }}</p>
+                  <p v-if="meta.trust.source_url_redacted === true || meta.trust.target_url_redacted === true || meta.trust.url_redacted === true">脱敏参数不可直接作为可运行地址。</p>
                   <p>不会自动添加可信来源、导航或重试。请在聊天中要求助手发起交互式可信来源确认，核对服务端提供的授权面板后决定；不要提供凭据。</p>
                 </section>
-                <p v-if="isProposal(message)" class="proposal-notice">配置提案已生成，供人工审阅；此提案提交调用本身未保存或执行，实际导入与运行以对应工具结果为准。</p>
-                <template v-for="result in [workflowResult(message)]" :key="message.id">
+                <p v-if="meta.proposal" class="proposal-notice">配置提案已生成，供人工审阅；此提案提交调用本身未保存或执行，实际导入与运行以对应工具结果为准。</p>
+                <template v-for="result in [meta.workflow]" :key="message.id">
                   <p v-if="result?.kind === 'import'" class="proposal-notice">已{{ result.operation === 'created' ? '新建' : '更新' }}站点「{{ result.name }}」（#{{ result.site_id }}）。<router-link to="/sites">查看站点配置</router-link></p>
                   <p v-else-if="result?.kind === 'run'" class="proposal-notice">已触发完整测试任务，创建人：助手 · {{ result.status }} · {{ result.lane }}。<router-link :to="{ path: '/runs', query: { run: String(result.run_id) } }">查看运行 #{{ result.run_id }}</router-link></p>
                 </template>
-                <template v-for="result in [siteConfigResult(message)]" :key="`config-${message.id}`">
+                <template v-for="result in [meta.config]" :key="`config-${message.id}`">
                   <p v-if="result" class="proposal-notice">已更新站点<span v-if="result.name">「{{ result.name }}」</span>（#{{ result.site_id }}）。<span v-if="result.fields.length">变更字段：{{ result.fields.join('、') }}。</span><router-link to="/sites">查看站点配置</router-link></p>
                 </template>
                 <p v-if="message.tool_name === 'browser_screenshot'" class="muted">仅展示图像证据元数据，不加载模型图像地址。需要查看当前网页时，请使用上方“截图预览”。截图不证明原操作失败。</p>
-                <details><summary>{{ isProposal(message) ? '展开完整配置提案 JSON' : '展开工具结果' }}</summary><pre>{{ toolResult(message) }}</pre></details>
+                <p v-if="meta.operation" class="proposal-notice">{{ meta.operation }}</p>
+                <details @toggle="toggleMessage(message.id, $event)"><summary>{{ meta.proposal ? '展开完整配置提案 JSON' : '展开工具结果' }}</summary><pre v-if="openMessageIds.has(message.id)">{{ toolResult(message) }}</pre></details>
               </template>
               <template v-else-if="isContextLimit(message)">
                 <p class="message-content">{{ contextLimitText }}</p>
-                <details><summary>展开原始系统记录</summary><pre>{{ message.content }}</pre></details>
+                <details @toggle="toggleMessage(message.id, $event)"><summary>展开原始系统记录</summary><pre v-if="openMessageIds.has(message.id)">{{ message.content }}</pre></details>
               </template>
               <AssistantMarkdown v-else-if="message.role === 'assistant' && message.status !== 'error'" :content="message.content" />
               <p v-else class="message-content">{{ message.content }}</p>
+              </template>
             </article>
             <p v-if="running || action === 'send'" class="activity" role="status"><span class="activity-dot" />助手正在处理，请等待。可停止后台任务。</p>
           </div>
@@ -918,6 +987,7 @@ onBeforeUnmount(() => {
     </div>
     <div v-if="safetyVisible" class="safety-rail" role="note"><p>不要粘贴密码、Cookie、令牌或其他秘密。发送即同意将消息、有限历史和授权观察结果发送给模型，可能包含个人资料。聊天记录加密保存；提案本身不保存，授权后的工具可实际保存配置、触发任务并产生费用或其他副作用。切换页面不会停止后台任务。</p><button type="button" aria-label="关闭安全提示" @click="dismissSafety">关闭</button></div>
     <AssistantSettingsDialog v-model="settingsOpen" />
+    <AssistantTakeoverDialog v-model="takeoverOpen" @session="selectSession" />
     <el-dialog v-model="usageOpen" title="上下文与累计用量" width="min(900px, 94vw)" class="usage-dialog" destroy-on-close>
       <p>{{ contextTip }}</p><p>{{ contextUsageLabel }}占用 {{ contextPercentText }}。对话请求的输入 + 输出，不含摘要、标题请求。分母为对应请求的预算快照。</p>
       <p v-if="contextUsageStale" class="usage-warning" role="status">最近调用未返回完整用量，以下保留上次有效的计数和预算，不代表当前上下文；没有有效记录时显示“--”。下次有效测量会更新，整理上下文后会清除旧测量。</p>
@@ -979,6 +1049,8 @@ h1 { margin: 0 0 8px; font-size: 26px; }
 .session-item span, .session-item time { font-size: 12px; color: #7a8794; }
 .session-item i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #a7b3c0; margin-right: 6px; }
 .session-item i.active { background: #e6a23c; }
+.session-more { flex: none; padding: 10px; border: 1px solid #c5cfdb; border-radius: 8px; background: #fff; color: #2f7ed8; cursor: pointer; }
+.session-more:disabled { cursor: default; color: #7a8794; }
 .workspace-heading { padding: 14px 18px; border-bottom: 1px solid #e4e9f0; align-items: flex-start; flex: none; }
 .workspace-title { min-width: 0; }
 .title-line { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -1040,6 +1112,7 @@ pre { max-height: 440px; overflow: auto; white-space: pre-wrap; overflow-wrap: a
   .panel-heading { flex: none; gap: 4px; }
   .panel-heading strong, .sessions-panel > p { display: none; }
   .session-list { display: flex; margin: 0; gap: 4px; overflow: auto; }
+  .session-list .error-text { flex: 0 0 220px; max-height: 36px; overflow: auto; margin: 0; }
   .session-item { display: block; width: auto; flex: 0 0 100px; padding: 6px; }
   .session-item strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
   .session-item span, .session-item time, .session-item small { display: none; }

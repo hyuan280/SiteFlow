@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 from jsonschema import Draft202012Validator
@@ -10,6 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models.assistant import AssistantMessage, AssistantSession
+from app.schemas.assistant import CreateSession
 from app.services.assistant import AssistantError, AssistantManager
 from app.services.assistant_execution import AssistantExecution
 from app.services.assistant_prompt import SYSTEM_PROMPT, tool_definitions
@@ -43,10 +43,17 @@ def stored_messages(manager, identifier):
                     AssistantMessage.session_id == identifier))}
 
 
+@pytest.fixture
+def dispatch_context(client):
+    manager = client.app.state.assistant_manager
+    sid = manager.create("host-owner", CreateSession())["id"]
+    return manager, sid
+
+
 def test_retrieval_protocol_schema_and_no_replay_prompt():
     definitions = tool_definitions()
     names = [item["function"]["name"] for item in definitions]
-    assert len(names) == len(set(names)) == 28
+    assert len(names) == len(set(names)) == 39
     for definition in definitions:
         assert definition["type"] == "function"
         Draft202012Validator.check_schema(definition["function"]["parameters"])
@@ -91,9 +98,11 @@ def test_retrieval_protocol_schema_and_no_replay_prompt():
     *[{"message_id": 1, key: "PRIVATE"}
       for key in ("owner", "session_id", "arguments", "_credential_binding", "title", "extra")],
 ])
-def test_dispatch_rejects_malformed_arguments_before_manager_read(arguments):
+def test_dispatch_rejects_malformed_arguments_before_manager_read(dispatch_context, arguments, monkeypatch):
+    manager, sid = dispatch_context
     read = Mock()
-    tools = AssistantTools(SimpleNamespace(get_tool_result=read), "owner", "session", None)
+    monkeypatch.setattr(manager, "get_tool_result", read)
+    tools = AssistantTools(manager, "host-owner", sid, None)
     assert asyncio.run(tools.dispatch("get_tool_result", arguments)) == {
         "ok": False, "code": "invalid_arguments",
     }
@@ -104,24 +113,28 @@ def test_dispatch_rejects_malformed_arguments_before_manager_read(arguments):
     {"message_id": 1}, {"message_id": 3, "offset": 0, "limit": 1},
     {"message_id": 3, "offset": 20000, "limit": 10000},
 ])
-def test_dispatch_passes_exact_arguments_and_host_scope_without_target(arguments):
+def test_dispatch_passes_exact_arguments_and_host_scope_without_target(dispatch_context, arguments, monkeypatch):
+    manager, sid = dispatch_context
     result = {"ok": True, "content": "original page"}
     read = Mock(return_value=result)
-    tools = AssistantTools(SimpleNamespace(get_tool_result=read), "host-owner", "host-session", None)
+    monkeypatch.setattr(manager, "get_tool_result", read)
+    tools = AssistantTools(manager, "host-owner", sid, None)
     assert asyncio.run(tools.dispatch("get_tool_result", arguments)) is result
-    read.assert_called_once_with("host-owner", "host-session", **arguments)
+    read.assert_called_once_with("host-owner", sid, **arguments)
 
 
 @pytest.mark.parametrize("error", [
     AssistantError("tool_result_not_found", 404), RuntimeError("PRIVATE_INTERNAL_FAILURE"),
 ])
-def test_dispatch_unavailable_result_does_not_expose_exception(error):
+def test_dispatch_unavailable_result_does_not_expose_exception(dispatch_context, error, monkeypatch):
+    manager, sid = dispatch_context
     read = Mock(side_effect=error)
-    tools = AssistantTools(SimpleNamespace(get_tool_result=read), "owner", "session", None)
+    monkeypatch.setattr(manager, "get_tool_result", read)
+    tools = AssistantTools(manager, "host-owner", sid, None)
     assert asyncio.run(tools.dispatch("get_tool_result", {"message_id": 1})) == {
         "ok": False, "code": "tool_result_unavailable",
     }
-    read.assert_called_once_with("owner", "session", message_id=1)
+    read.assert_called_once_with("host-owner", sid, message_id=1)
 
 
 @pytest.mark.parametrize("changes", [
@@ -177,7 +190,10 @@ def test_unavailable_records_are_never_decrypted(
     assert asyncio.run(tools.dispatch("get_tool_result", {"message_id": message_id})) == {
         "ok": False, "code": "tool_result_unavailable",
     }
-    decrypt.assert_not_called()
+    # Dispatch may decrypt the caller's owned session for persisted takeover policy,
+    # but must never decrypt an unavailable message or a foreign session.
+    assert all(isinstance(args.args[0], AssistantSession) and args.args[0].id == identifier
+               and args.args[0].owner == owner for args in decrypt.call_args_list)
     assert stored_messages(manager, original_record[0]) == before
 
 
@@ -228,7 +244,8 @@ def test_character_pages_reconstruct_exact_stored_json_without_envelope_or_side_
         assert page["content"] == "" and page["next_offset"] is None
         assert page["offset"] == offset and page["total"] == len(content)
     assert decrypt.call_count > 1
-    assert all(isinstance(args.args[0], AssistantMessage) and args.args[0].id == message_id
+    assert all((isinstance(args.args[0], AssistantMessage) and args.args[0].id == message_id)
+               or (isinstance(args.args[0], AssistantSession) and args.args[0].id == identifier)
                for args in decrypt.call_args_list)
     browser.assert_not_awaited()
     execution.assert_not_awaited()

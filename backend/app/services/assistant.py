@@ -25,7 +25,8 @@ from app.models.workflow import Site
 from app.schemas.assistant import CreateSession, RenameSession, SendMessage, SetTarget
 from app.services.assistant_context import compact_tool_result, summarize_context
 from app.services.assistant_images import (
-    IMAGE_NOTICE, image_message, omit_images, text_projection, validate_image,
+    IMAGE_NOTICE, artifact_provenance, image_message, omit_images,
+    revoke_browser_images, text_projection, validate_image,
 )
 from app.services.assistant_prompt import SYSTEM_PROMPT, tool_definitions
 from app.services.assistant_settings import AssistantSettingsService
@@ -35,7 +36,7 @@ from app.services.assistant_usage import (
     accumulate_usage, contains_embedded_secret, report_usage, usage_observer, usage_request,
 )
 from app.services.assistant_tools import AssistantTools, failure, safe_snapshot
-from app.services.assistant_urls import URL_NOTICE, contains_redaction, project_url, trust_required
+from app.services.assistant_urls import URL_NOTICE, contains_redaction, origin, project_url, trust_required
 from app.services.config_ai_generation import GenerationError, _has_secret, _json, _strict_json
 from app.services.integrations import IntegrationService
 from app.services.vision import _token_kwargs, validate_base_url
@@ -46,6 +47,9 @@ GREETING = (
     "\uff08\u624b\u52a8/manual\u3001Bitwarden \u6216 Cookie\uff09\u3001\u662f\u5426\u4f7f\u7528\u4ee3\u7406\uff0c\u4ee5\u53ca\u4f60\u60f3\u5b8c\u6210\u7684\u76ee\u6807\u3002"
     "\u8bf7\u4e0d\u8981\u53d1\u9001\u5bc6\u7801\u3001Cookie \u5185\u5bb9\u3001\u4ee4\u724c\u6216\u5176\u4ed6\u79d8\u5bc6\u3002\u6536\u96c6\u4fe1\u606f\u540e\u6211\u4f1a\u8bf7\u4f60\u786e\u8ba4\u76ee\u6807\u3002"
 )
+BROWSER_QUEUE_TIMEOUT = 1200
+BROWSER_QUEUE_POLL_INTERVAL = 0.5
+BROWSER_OPEN_TIMEOUT = 110
 
 
 class AssistantError(Exception):
@@ -67,6 +71,11 @@ class BrowserScope:
     expires_at: str
     deadline: float
     ready: bool = True
+    site_origin: str | None = None
+    trusted_origins: tuple[str, ...] = ()
+    same_origin_only: bool = False
+    status: str = "ready"
+    automation_request_id: str | None = None
 
 
 class AssistantManager:
@@ -135,6 +144,24 @@ class AssistantManager:
         messages = list(db.scalars(select(AssistantMessage).where(
             AssistantMessage.session_id == row.id,
         ).order_by(AssistantMessage.id.desc()).limit(200)))
+        envelopes = {}
+
+        def decode(message):
+            if message.id not in envelopes:
+                envelopes[message.id] = self._decrypt(message)
+            return envelopes[message.id]
+
+        projected_messages = []
+        for message in reversed(messages):
+            value = decode(message)
+            if value.get("context_image") or (message.role == "assistant" and not value.get("content")):
+                continue
+            projected_messages.append({
+                "id": message.id, "role": message.role,
+                **{k: v for k, v in value.items() if k in {"content", "title", "tool_name"}},
+                **({"status": message.status} if message.status else {}),
+                "created_at": self._iso(message.created_at),
+            })
         scope = self.browsers.get(row.id)
         browser = None
         if scope and scope.owner == row.owner and scope.ready:
@@ -149,28 +176,21 @@ class AssistantManager:
             "retry_authorizations": retry_status(payload, scope),
             "pending_approval": pending_approval(payload),
             "pending_interaction": pending_interaction(payload),
-            "unresolved_operations": self._unresolved_operations(db, row, payload),
-            "messages": [{"id": message.id, "role": message.role,
-                          **{k: v for k, v in self._decrypt(message).items()
-                             if k in {"content", "title", "tool_name"}},
-                          **({"status": message.status} if message.status else {}),
-                          "created_at": self._iso(message.created_at)}
-                         for message in reversed(messages)
-                          if not self._decrypt(message).get("context_image")
-                          and not (message.role == "assistant"
-                                   and not self._decrypt(message).get("content"))],
+            "unresolved_operations": self._unresolved_operations(db, row, payload, decode=decode),
+            "messages": projected_messages,
         }
 
-    def _unresolved_operations(self, db, row, data):
+    def _unresolved_operations(self, db, row, data, *, decode=None):
         from app.services.assistant_retry import (
             can_reauthorize, uncertain_operations, fingerprint, credential_binding,
         )
         from app.services.assistant_execution import AssistantExecution, SUPPORTED_FEATURES, _origin
 
         target = data.get("target") or {}
+        decode = decode if decode is not None else self._decrypt
         scope = self.browsers.get(row.id)
         result = []
-        for operation in sorted(uncertain_operations(self, db, row.id, data)):
+        for operation in sorted(uncertain_operations(self, db, row.id, data, decode=decode)):
             record = data.get("_execution_records", {}).get(operation, {})
             step = record.get("step") or {}
             if not step:
@@ -179,7 +199,7 @@ class AssistantManager:
                 for message in db.scalars(select(AssistantMessage).where(
                     AssistantMessage.session_id == row.id, AssistantMessage.role == "tool",
                 ).order_by(AssistantMessage.id)):
-                    value = self._decrypt(message)
+                    value = decode(message)
                     if (value.get("tool_name") != "execute_step"
                             or value.get("_target_revision") != data.get("_target_revision", 0)):
                         continue
@@ -210,10 +230,11 @@ class AssistantManager:
                 try:
                     can_authorize = record.get("origin") == list(_origin(target["base_url"]))
                     feature = step["feature_type"]
-                    if feature.startswith("auth.") and target.get("credential_consent") is not True:
+                    if ((feature.startswith("auth.") or feature == "challenge.2fa")
+                            and target.get("credential_consent") is not True):
                         can_authorize = False
-                    if (feature.startswith("sign.") or feature in {
-                        "action.click", "challenge.altcha", "challenge.slider",
+                    if (feature.startswith(("sign.", "challenge.")) or feature in {
+                        "action.click", "action.fill",
                     }) and target.get("allow_sign") is not True:
                         can_authorize = False
                     helper = AssistantExecution(self, row.owner, row.id, target)
@@ -304,15 +325,27 @@ class AssistantManager:
                             "summary_through_message_id": summary["boundary_id"] if summary else None,
                             "compressed": bool(summary)}}
 
-    def list_sessions(self, owner: str) -> dict:
+    def list_sessions(self, owner: str, offset: int = 0, limit: int = 100) -> dict:
+        if (type(offset) is not int or offset < 0
+                or type(limit) is not int or not 1 <= limit <= 100):
+            raise AssistantError("invalid_arguments", 422)
+        # Live offsets are not a snapshot: concurrent updates can move rows between pages.
         with self.session_factory() as db:
-            rows = db.scalars(select(AssistantSession).where(
+            rows = list(db.scalars(select(AssistantSession).where(
                 AssistantSession.owner == owner,
-            ).order_by(AssistantSession.updated_at.desc(), AssistantSession.id).limit(100))
-            return {"items": [{"id": row.id, **self._title_fields(self._decrypt(row)),
-                               **self._context_fields(self._decrypt(row)),
-                               "status": row.status, "created_at": self._iso(row.created_at),
-                               "updated_at": self._iso(row.updated_at)} for row in rows]}
+            ).order_by(AssistantSession.updated_at.desc(), AssistantSession.id.desc())
+                .offset(min(offset, 2**63 - 1)).limit(limit + 1)))
+            truncated = len(rows) > limit
+            items = []
+            for row in rows[:limit]:
+                payload = self._decrypt(row)
+                items.append({"id": row.id, **self._title_fields(payload),
+                              **self._context_fields(payload),
+                              "status": row.status, "created_at": self._iso(row.created_at),
+                              "updated_at": self._iso(row.updated_at)})
+            return {"items": items, "offset": offset, "limit": limit,
+                    "next_offset": offset + limit if truncated else None,
+                    "truncated": truncated}
 
     def create(self, owner: str, payload: CreateSession) -> dict:
         if self._stopping:
@@ -402,14 +435,15 @@ class AssistantManager:
                     "credential_consent": credentials_available,
                     "execution_features": sorted(
                         key for key in SUPPORTED_FEATURES
-                        if credentials_available or not key.startswith("auth.")
+                        if credentials_available or not (key.startswith("auth.") or key == "challenge.2fa")
                     ),
                 })
             excluded = {"browser_consent"}
             if payload.authorized is None:
                 excluded.add("authorized")
             target = payload.model_dump(exclude=excluded, exclude_unset=True)
-            target.update(workflow_consent=payload.workflow_consent,
+            target.update(browser_consent=payload.browser_consent,
+                          workflow_consent=payload.workflow_consent,
                           workflow_site_id=payload.workflow_site_id,
                           run_lane_policy=payload.run_lane_policy)
             if (len(set(payload.execution_features)) != len(payload.execution_features)
@@ -421,14 +455,14 @@ class AssistantManager:
                 raise AssistantError("execution_consent_required", 422)
             if payload.execution_features and not payload.execution_consent:
                 raise AssistantError("execution_consent_required", 422)
-            if any(key.startswith("auth.") for key in payload.execution_features):
+            if any(key.startswith("auth.") or key == "challenge.2fa" for key in payload.execution_features):
                 if not payload.credential_consent:
                     raise AssistantError("credential_consent_required", 422)
                 if payload.credential_mode not in {"manual", "bitwarden"}:
                     raise AssistantError("credentials_unavailable", 422)
                 if payload.credential_mode == "manual" and payload.site_id is None:
                     raise AssistantError("credential_site_required", 422)
-            if any(key.startswith("sign.") or key in {"action.click", "challenge.altcha", "challenge.slider"}
+            if any(key.startswith(("sign.", "challenge.")) or key in {"action.click", "action.fill"}
                    for key in payload.execution_features) and not payload.allow_sign:
                 raise AssistantError("sign_consent_required", 422)
             if payload.site_id is not None:
@@ -501,27 +535,48 @@ class AssistantManager:
         except Exception:
             raise AssistantError("model_unavailable", 503) from None
 
+    def create_takeover(self, action_id: str) -> str:
+        from app.services.assistant_takeover import create_takeover_session
+
+        return create_takeover_session(self, action_id)
+
+    async def send_takeover(self, owner, session_id, payload, *, action_id):
+        async with self._mutation(owner, session_id):
+            return await self._send(owner, session_id, payload, takeover_action_id=action_id)
+
     async def send(self, owner: str, session_id: str, payload: SendMessage) -> dict:
         async with self._mutation(owner, session_id):
             return await self._send(owner, session_id, payload)
 
-    async def _send(self, owner: str, session_id: str, payload: SendMessage) -> dict:
+    async def _send(self, owner: str, session_id: str, payload: SendMessage,
+                    *, takeover_action_id=None) -> dict:
         request_id = str(payload.request_id)
         with self.session_factory() as db:
             row = self._owned(db, owner, session_id)
+            data = self._decrypt(row)
+            takeover = "_takeover" in data or "_takeover_daily" in data
             if db.scalar(select(AssistantMessage.id).where(
                 AssistantMessage.session_id == session_id, AssistantMessage.request_id == request_id,
             )) is not None:
                 return self._detail(db, row)
         if len(self.tasks) >= 2:
             raise AssistantError("assistant_busy", 429)
-        config = dict(self._runtime())
+        config = dict(await asyncio.to_thread(self._runtime) if takeover else self._runtime())
+        config["_request_id"] = request_id
+        if takeover_action_id:
+            config.update(_takeover_action_id=takeover_action_id, _takeover_request_id=request_id)
+        if takeover and len(self.tasks) >= 2:
+            raise AssistantError("assistant_busy", 429)
         try:
             with self.session_factory() as db:
                 values = AssistantSettingsService(db).load()
             config["_assistant_settings"] = values.model_dump()
         except Exception:
             raise AssistantError("assistant_settings_invalid", 503) from None
+        if takeover:
+            from app.services.assistant_takeover import takeover_runtime
+
+            config = takeover_runtime(self, owner, session_id, config)
         if values.max_tokens == 0:
             config.pop("max_tokens", None)
         elif values.max_tokens is not None:
@@ -530,12 +585,23 @@ class AssistantManager:
 
         if secret_input(payload.content, config["api_key"]):
             raise AssistantError("secret_input", 422)
+        scope = self.browsers.get(session_id)
+        if (takeover_action_id and scope and scope.automation_request_id is None
+                and scope.ready and scope.deadline > time.monotonic()):
+            raise AssistantError("assistant_busy", 429)
         try:
             with self.session_factory() as db:
                 self._reserve_idle(db, owner, session_id)
-                self._message(db, session_id, "user", payload.content, request_id=request_id)
+                row = self._owned(db, owner, session_id)
+                if takeover_action_id:
+                    from app.services.assistant_takeover import activate_takeover
+
+                    activate_takeover(self, db, row, takeover_action_id, request_id)
+                message = self._message(db, session_id, "user", payload.content, request_id=request_id)
+                db.flush()
+                config["_user_message_id"] = message.id
                 db.commit()
-        except (IntegrityError, AssistantError):
+        except (IntegrityError, AssistantError) as exc:
             # Another retry may have won the CAS; replay is read-only even while running.
             with self.session_factory() as db:
                 row = self._owned(db, owner, session_id)
@@ -544,15 +610,34 @@ class AssistantManager:
                     AssistantMessage.request_id == request_id,
                 )) is not None:
                     return self._detail(db, row)
+            if isinstance(exc, AssistantError) and exc.code == "takeover_authorization_changed":
+                raise
             raise AssistantError("session_running") from None
+        self._active_turns[session_id] = {key: config[key] for key in (
+            "_request_id", "_takeover_action_id", "_takeover_request_id", "_user_message_id",
+        ) if key in config}
         task = asyncio.create_task(self._run(owner, session_id, config), name=f"assistant:{session_id}")
         self.tasks[session_id] = task
+        if takeover_action_id:
+            from app.services.assistant_takeover import takeover_task_cancelled
+
+            task.add_done_callback(lambda finished: takeover_task_cancelled(
+                self, session_id, config, finished))
         task.add_done_callback(lambda finished: self._task_done(session_id, finished))
         return self.detail(owner, session_id)
 
     def _task_done(self, session_id, task):
         # A task cancelled before its coroutine starts cannot execute _run's finally.
         if self.tasks.get(session_id) is task:
+            request_id = (self._active_turns.get(session_id) or {}).get("_takeover_request_id")
+            scope = self.browsers.get(session_id)
+            if request_id and scope and scope.automation_request_id == request_id:
+                async def finish():
+                    await self._close_browser(session_id, automation_request_id=request_id)
+                    self._task_done(session_id, task)
+
+                asyncio.create_task(finish())
+                return
             try:
                 with self.session_factory() as db:
                     approvals = self._finish_pending(db, session_id, "cancelled")
@@ -639,6 +724,10 @@ class AssistantManager:
                                           "target_revision": record.get("target_revision")})
                 cancel_approvals(data)
                 cancel_interactions(data)
+                from app.services.assistant_takeover import record_takeover_step
+
+                for operation in records:
+                    record_takeover_step(db, row, operation, records)
                 self._encrypt(row, data)
                 if row.status == "running":
                     self._message(db, row.id, "system", "Assistant turn interrupted by restart. Please send a new message.")
@@ -696,6 +785,7 @@ class AssistantManager:
                         "browser_url_denied", "browser_dns_denied", "browser_redirect_denied",
                         "browser_lane_busy", "browser_lane_unavailable", "browser_navigation_failed",
                         "browser_open_timeout", "browser_session_expired", "browser_closed",
+                        "browser_queue_timeout",
                         "browser_snapshot_stale", "browser_selector_invalid", "browser_frame_unavailable",
                         "browser_frame_unreadable",
                         "browser_screenshot_limit", "browser_screenshot_unavailable",
@@ -733,7 +823,11 @@ class AssistantManager:
             raise AssistantError("browser_unavailable", 502)
         return result
 
-    async def _close_browser(self, session_id):
+    async def _close_browser(self, session_id, *, automation_request_id=None):
+        scope = self.browsers.get(session_id)
+        if (scope and automation_request_id is not None
+                and scope.automation_request_id != automation_request_id):
+            return
         scope = self.browsers.pop(session_id, None)
         if scope:
             async def close():
@@ -747,7 +841,11 @@ class AssistantManager:
             try:
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
-                await cleanup
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
                 raise
 
     async def browser_tool(self, owner, session_id, target, name, url, arguments: dict | None = None):
@@ -756,30 +854,128 @@ class AssistantManager:
                       "browser_refresh": "refresh", "browser_screenshot": "screenshot"}
         if name != "browser_open" and name not in operations:
             return failure("invalid_arguments")
-        if name == "browser_screenshot" and target.get("confirmed") is not True:
+        if not target or target.get("confirmed") is not True:
             return failure("target_confirmation_required")
+        if target.get("browser_consent") is not True:
+            return {**failure("browser_consent_required"),
+                    "notice": "Browsing is not enabled. Use request_user_interaction with purpose "
+                              "target and wait for explicit user confirmation before browsing."}
         if name == "browser_screenshot" and target.get("screenshot_consent") is not True:
             return failure("screenshot_consent_required")
         if contains_redaction(target["base_url"]) or (url and contains_redaction(url)):
             return {**failure("redacted_url_not_usable"), "notice": URL_NOTICE}
+        from app.services.assistant_takeover import takeover_live_allowed
+
+        turn = self._active_turns.get(session_id) or {}
+        active_takeover = bool(turn.get("_takeover_action_id"))
+        close_options = ({"automation_request_id": turn.get("_takeover_request_id")}
+                         if active_takeover else {})
+        with self.session_factory() as db:
+            row = self._owned(db, owner, session_id)
+            data = self._decrypt(row)
+            autonomous = "_takeover" in data or active_takeover
+            if autonomous or (data.get("target") or {}).get("_takeover_site_grant"):
+                if ((autonomous and row.status != "running") or data.get("target") != target
+                        or not takeover_live_allowed(self, db, owner, session_id, data)):
+                    return failure("takeover_tool_denied")
+                if url and origin(url) != origin(target["base_url"]):
+                    return failure("takeover_tool_denied")
+            if name == "browser_open":
+                from app.services.assistant_cookies import bound_cookie_site
+
+                if data.get("target") != target:
+                    return failure("cookie_binding_changed")
+                try:
+                    bound_cookie_site(db, target)
+                except AssistantError as exc:
+                    return failure(exc.code)
         lane = "proxy_interaction" if target["proxy"] else "interaction"
         scope = self.browsers.get(session_id)
-        if scope and (scope.owner != owner or scope.deadline <= time.monotonic()):
-            await self._close_browser(session_id)
+        if (active_takeover and scope and scope.deadline > time.monotonic()
+                and scope.automation_request_id != turn.get("_takeover_request_id")):
+            return failure("browser_lane_busy")
+        if scope and (scope.owner != owner or scope.deadline <= time.monotonic()
+                      or scope.lane_key != lane
+                      or (scope.site_origin is not None and (
+                          scope.site_origin != origin(target["base_url"])
+                          or scope.trusted_origins != tuple(target.get("trusted_origins", []))))
+                      or scope.same_origin_only != bool(target.get("_takeover_site_grant"))):
+            await self._close_browser(session_id, **close_options)
             scope = None
         try:
             if name == "browser_open":
                 if scope is None:
+                    from app.services.assistant_cookies import (
+                        bound_cookie_site, private_cookie_seed, saved_cookies_configured,
+                    )
+
+                    with self.session_factory() as db:
+                        current = self._decrypt(self._owned(db, owner, session_id))
+                        if current.get("target") != target:
+                            return failure("cookie_binding_changed")
+                        try:
+                            site = bound_cookie_site(db, target)
+                            restore = site is not None and saved_cookies_configured(db, site.id)
+                        except AssistantError as exc:
+                            return failure(exc.code)
+                    cookie_payload = {}
+                    if restore:
+                        try:
+                            raw_generation = await self._worker("cookie-generation", {
+                                "url": target["base_url"], "lane_key": lane,
+                            })
+                            generation = raw_generation["generation"]
+                        except Exception:
+                            return failure("cookie_restore_unavailable")
+                        # The generation must precede the snapshot; no DB state
+                        # from before worker I/O may authorize cookie decryption.
+                        with self.session_factory() as db:
+                            current = self._decrypt(self._owned(db, owner, session_id))
+                            if current.get("target") != target:
+                                return failure("cookie_binding_changed")
+                            if not takeover_live_allowed(self, db, owner, session_id, current):
+                                return failure("takeover_tool_denied")
+                            try:
+                                cookie_payload = private_cookie_seed(db, self, target, generation)
+                            except AssistantError as exc:
+                                return failure(exc.code)
                     token = secrets.token_urlsafe(32)
                     worker_id = str(uuid4())
-                    scope = BrowserScope(owner, worker_id, token, lane, "", 0, ready=False)
+                    scope = BrowserScope(owner, worker_id, token, lane, "", 0, ready=False,
+                                         site_origin=origin(target["base_url"]),
+                                         trusted_origins=tuple(target.get("trusted_origins", [])),
+                                         same_origin_only=bool(target.get("_takeover_site_grant")),
+                                         status="queued",
+                                         automation_request_id=turn.get("_takeover_request_id")
+                                         if active_takeover else None)
                     # Register before HTTP IO: cancellation/response loss can close by known ID.
                     self.browsers[session_id] = scope
                     raw = await self._worker("open", {
                         "url": target["base_url"], "lane_key": lane, "token": token,
                         "session_id": worker_id,
                         "trusted_origins": target.get("trusted_origins", []),
+                        **({"same_origin_only": True} if scope.same_origin_only else {}),
+                        **({"wait_for_lane": True} if active_takeover else {}),
+                        **cookie_payload,
                     })
+                    status = raw.get("status", "ready")
+                    if (status not in {"queued", "opening", "ready"}
+                            or raw.get("session_id") != worker_id or raw.get("lane_key") != lane
+                            or (status != "ready" and not active_takeover)):
+                        raise ValueError
+                    scope.status = status
+                    if isinstance(raw.get("expires_at"), str):
+                        scope.expires_at = raw["expires_at"]
+                    if status in {"queued", "opening"}:
+                        turn.setdefault("deadline", asyncio.get_running_loop().time() + 180)
+                        scope.deadline = time.monotonic() + BROWSER_QUEUE_TIMEOUT
+                        raw = await self._wait_for_browser(owner, session_id, target, turn, scope)
+                    if raw.get("status", "ready") != "ready":
+                        raise ValueError
+                    with self.session_factory() as db:
+                        data = self._decrypt(self._owned(db, owner, session_id))
+                        if not takeover_live_allowed(self, db, owner, session_id, data):
+                            raise AssistantError("takeover_tool_denied")
                     if str(UUID(raw["session_id"])) != worker_id:
                         raise ValueError
                     expires = datetime.fromisoformat(raw["expires_at"])
@@ -791,6 +987,7 @@ class AssistantManager:
                     scope.expires_at = expires.isoformat()
                     scope.deadline = time.monotonic() + remaining
                     scope.ready = True
+                    scope.status = "ready"
                 return {"ok": True, "lane_key": scope.lane_key, "status": "ready",
                         "expires_at": scope.expires_at,
                          "notice": "Use execute_step only with host execution permission. Without it, form submissions are blocked; manual login uses a separate tab. Visible page text may be sent to the model."}
@@ -800,6 +997,10 @@ class AssistantManager:
             raw = await self._worker(f"{scope.session_id}/{operation}", {
                 **(arguments or {}), "token": scope.token, **({"url": url} if url else {}),
             })
+            with self.session_factory() as db:
+                data = self._decrypt(self._owned(db, owner, session_id))
+                if not takeover_live_allowed(self, db, owner, session_id, data):
+                    raise AssistantError("takeover_tool_denied")
             if raw.get("session_id") != scope.session_id or raw.get("lane_key") != scope.lane_key:
                 raise ValueError
             if operation == "screenshot":
@@ -827,9 +1028,18 @@ class AssistantManager:
             return {"ok": True, "lane_key": scope.lane_key, "status": "ready",
                     **({"refreshed": True} if operation == "refresh" else {})}
         except asyncio.CancelledError:
-            await self._close_browser(session_id)
+            await self._close_browser(session_id, **close_options)
             raise
         except Exception as exc:
+            if isinstance(exc, AssistantError) and exc.code == "takeover_tool_denied":
+                await self._close_browser(session_id, **close_options)
+                return failure("takeover_tool_denied")
+            if isinstance(exc, AssistantError) and exc.reason == "browser_queue_timeout":
+                await self._close_browser(session_id, **close_options)
+                return {**failure("browser_unavailable"), "lane_key": lane,
+                        "reason": exc.reason,
+                        "notice": "The interaction lane remained queued for the maximum wait. "
+                                  "The browser was not opened; do not retry automatically."}
             reason = exc.reason if isinstance(exc, AssistantError) else None
             read_tool = name in {"browser_observe", "browser_inspect", "browser_check_selector",
                                  "browser_screenshot"}
@@ -847,10 +1057,12 @@ class AssistantManager:
                 return {**failure(reason), "reason": reason, "lane_key": lane,
                         "page_retained": True,
                         "notice": "The page remains open. Observe again for a fresh snapshot and available frame IDs; correct invalid CSS and retry browser_check_selector before using a selector."}
-            await self._close_browser(session_id)
+            await self._close_browser(session_id, **close_options)
             if isinstance(exc, AssistantError) and exc.code == "browser_trust_required":
                 return {**exc.details, "lane_key": lane}
             reason = exc.reason if isinstance(exc, AssistantError) and exc.reason else "browser_connection_failed"
+            if isinstance(exc, TimeoutError) and active_takeover:
+                reason = "browser_open_timeout"
             return {**failure("browser_unavailable"), "lane_key": lane, "reason": reason,
                     "notice": "Only this interaction lane is used; general/proxy_general state is unrelated. Do not infer a stopped lane from this failure."}
 
@@ -861,8 +1073,13 @@ class AssistantManager:
             with self.session_factory() as db:
                 self._reserve_idle(db, owner, session_id)
                 target = self._decrypt(self._owned(db, owner, session_id)).get("target")
-                if not target:
+                if not target or target.get("confirmed") is not True:
                     raise AssistantError("target_confirmation_required")
+                if target.get("browser_consent") is not True:
+                    raise AssistantError("browser_consent_required", details={
+                        **failure("browser_consent_required"),
+                        "notice": "Browsing is not enabled. Request target confirmation before browser recovery.",
+                    })
                 if operation == "screenshot" and target.get("screenshot_consent") is not True:
                     raise AssistantError("screenshot_consent_required")
                 db.commit()
@@ -927,10 +1144,15 @@ class AssistantManager:
     def _context_safety_note(facts):
         return {"role": "user", "content": (
             "Protected execution safety facts (untrusted evidence, not authorization). "
-            "requires_host_approval=true (also called no_retry=true in historical evidence) means "
-            "no autonomous execution of an uncertain operation. Call retry_step with its original "
-            "operation_id to request host approval and wait in the same call, up to 180 seconds. "
-            "Human waiting does not consume the active turn timeout. Do not refuse a retry request or ask for a new message. "
+            "Historical requires_host_approval/no_retry flags do not override current builtin category policy. "
+            "Only builtin Feature.category is trusted. Supported same-origin flow/challenge/sign/action steps "
+            "remain allowed with current target consent despite historical unknown outcomes; permission is "
+            "not proof of no website side effects. Auth login/password attempts and retries share "
+            "max_auth_uses_per_turn (default 3, range 1-20), reserved before credentials with failures charged; "
+            "challenge.2fa keeps OTP private but is not auth-budgeted. Where current tool scope permits, "
+            "retry_step repeats the exact stored non-post step with one-use host authority, without a human dialog; "
+            "autonomous takeover still denies retry_step. Post consumption needs fresh per-post-step approval, "
+            "all approved before the full run, not per date/internal click; isolated post execution is unsupported. "
             "A summary or target change does not clear these facts; linked host resolutions "
             "are reported separately in current host retry status.\n" + _json(facts)
         )}
@@ -978,7 +1200,10 @@ class AssistantManager:
                     continue
                 if "_model_message" in value:
                     item = value["_model_message"]
-                    if value.get("context_image") and (
+                    historical_image = (artifact_provenance(value.get("_image_provenance"))
+                                        and isinstance(value.get("_image"), dict)
+                                        and value["_image"].get("masked") is False)
+                    if value.get("context_image") and not historical_image and (
                             not target or target.get("screenshot_consent") is not True
                             or type(value.get("_target_revision")) is not int
                             or value["_target_revision"] != revision):
@@ -1346,21 +1571,35 @@ class AssistantManager:
             await self._run_turn(owner, session_id, config)
 
     @staticmethod
-    async def _wait_for_user(turn, event, timeout):
-        """Pause only the human wait, never approval processing or execution."""
+    @asynccontextmanager
+    async def _pause_turn(turn):
+        """Pause the shared turn deadline while explicitly non-active work runs."""
         loop = asyncio.get_running_loop()
         started = loop.time()
         outer = turn.get("timeout")
-        if turn["deadline"] <= started or (outer is not None and outer.expired()):
-            raise TimeoutError()
-        # Tools within a turn are sequential. Do not double-credit overlapping
-        # waits (or silently exempt concurrent active work from its deadline).
         if turn.get("_waiting_for_user"):
             raise RuntimeError("Concurrent user waits in one assistant turn")
         if outer is not None:
             outer.reschedule(None)
         turn["_waiting_for_user"] = True
         try:
+            yield
+        finally:
+            turn["deadline"] += loop.time() - started
+            turn.pop("_waiting_for_user", None)
+            if outer is not None and not outer.expired():
+                outer.reschedule(turn["deadline"])
+
+    @staticmethod
+    async def _wait_for_user(turn, event, timeout):
+        """Pause only the human wait, never approval processing or execution."""
+        loop = asyncio.get_running_loop()
+        outer = turn.get("timeout")
+        if turn["deadline"] <= loop.time() or (outer is not None and outer.expired()):
+            raise TimeoutError()
+        # Tools within a turn are sequential. Do not double-credit overlapping
+        # waits (or silently exempt concurrent active work from its deadline).
+        async with AssistantManager._pause_turn(turn):
             try:
                 await asyncio.wait_for(event.wait(), timeout)
             except TimeoutError:
@@ -1368,18 +1607,99 @@ class AssistantManager:
             # Python 3.11 wait_for can swallow cancellation when the event wins a race.
             if asyncio.current_task().cancelling():
                 raise asyncio.CancelledError()
-        finally:
-            turn["deadline"] += loop.time() - started
-            turn.pop("_waiting_for_user", None)
-            if outer is not None and not outer.expired():
-                outer.reschedule(turn["deadline"])
+
+    async def _wait_for_browser(self, owner, session_id, target, turn, scope):
+        """Hold the same browser_open call while the worker queues the lane."""
+        from app.services.assistant_takeover import takeover_live_allowed
+
+        loop = asyncio.get_running_loop()
+        outer = turn.get("timeout")
+        if turn["deadline"] <= loop.time() or (outer is not None and outer.expired()):
+            raise TimeoutError()
+        queue_deadline = loop.time() + BROWSER_QUEUE_TIMEOUT
+        queued = scope.status == "queued"
+        last_queued_at = loop.time()
+        open_deadline = loop.time() + BROWSER_OPEN_TIMEOUT
+        if not queued:
+            expires = datetime.fromisoformat(scope.expires_at)
+            if expires.tzinfo is None:
+                raise ValueError
+            open_deadline -= max(0, 900 - (expires - datetime.now(timezone.utc)).total_seconds())
+        while True:
+            if queued:
+                # Both the remote status call and the wait poll are queue time.
+                try:
+                    async with self._pause_turn(turn), asyncio.timeout_at(queue_deadline):
+                        raw = await self._worker(f"{scope.session_id}/open-status",
+                                                 {"token": scope.token})
+                except TimeoutError:
+                    raise AssistantError("browser_unavailable", 504,
+                                         reason="browser_queue_timeout") from None
+            else:
+                async with asyncio.timeout_at(open_deadline):
+                    raw = await self._worker(f"{scope.session_id}/open-status", {"token": scope.token})
+            status = raw.get("status")
+            if (status not in {"queued", "opening", "ready"}
+                    or raw.get("session_id") != scope.session_id
+                    or raw.get("lane_key") != scope.lane_key):
+                raise ValueError
+            scope.status = status
+            if isinstance(raw.get("expires_at"), str):
+                scope.expires_at = raw["expires_at"]
+            if queued and status != "queued":
+                # expires_at is admission + 900s. Charge launch time that fell
+                # between the last queued observation and this status response.
+                expires = datetime.fromisoformat(raw["expires_at"])
+                if expires.tzinfo is None:
+                    raise ValueError
+                active_elapsed = max(0, 900 - (expires - datetime.now(timezone.utc)).total_seconds())
+                open_deadline = loop.time() - active_elapsed + BROWSER_OPEN_TIMEOUT
+                turn["deadline"] -= min(loop.time() - last_queued_at, active_elapsed)
+                if outer is not None and not outer.expired():
+                    outer.reschedule(turn["deadline"])
+            with self.session_factory() as db:
+                row = self._owned(db, owner, session_id)
+                data = self._decrypt(row)
+                if (row.status != "running"
+                        or data.get("target") != target
+                        or not takeover_live_allowed(self, db, owner, session_id, data)):
+                    raise AssistantError("takeover_tool_denied")
+            if not queued and status == "queued":
+                raise ValueError
+            if status != "queued" and (turn["deadline"] <= loop.time()
+                                       or open_deadline <= loop.time()):
+                raise TimeoutError()
+            if status == "ready":
+                return raw
+            if status == "opening":
+                queued = False
+                if turn["deadline"] <= loop.time():
+                    raise TimeoutError()
+                async with asyncio.timeout_at(open_deadline):
+                    await asyncio.sleep(BROWSER_QUEUE_POLL_INTERVAL)
+                continue
+            if loop.time() >= queue_deadline:
+                raise AssistantError("browser_unavailable", 504,
+                                     reason="browser_queue_timeout")
+            queued = True
+            last_queued_at = loop.time()
+            await self._wait_for_user(turn, asyncio.Event(),
+                                      min(BROWSER_QUEUE_POLL_INTERVAL,
+                                          max(0, queue_deadline - loop.time())))
 
     async def _run_turn(self, owner, session_id, config):
         error = None
+        error_code = None
         try:
             deadline = asyncio.get_running_loop().time() + config.get(
                 "_assistant_settings", {}).get("turn_timeout_seconds", 180)
-            turn = self._active_turns[session_id] = {"id": str(uuid4()), "deadline": deadline}
+            turn = self._active_turns[session_id] = {
+                "id": str(uuid4()), "deadline": deadline,
+                "_assistant_settings": dict(config.get("_assistant_settings", {})),
+                **{key: config[key] for key in (
+                    "_request_id", "_takeover_action_id", "_takeover_request_id", "_user_message_id",
+                ) if key in config},
+            }
             from app.services.assistant_interactions import apply_turn_defaults
 
             apply_turn_defaults(self, owner, session_id, config.get("_assistant_settings", {}))
@@ -1392,24 +1712,55 @@ class AssistantManager:
             if not asyncio.current_task().cancelling():
                 await self._auto_title(owner, session_id, config, turn["deadline"])
         except asyncio.CancelledError:
+            error_code = "cancelled"
             error = "Assistant turn cancelled. [cancelled]"
-            await self._close_browser(session_id)
+            if not config.get("_takeover_action_id"):
+                await self._close_browser(session_id)
         except GenerationError as exc:
+            error_code = exc.code
             error = "Assistant turn could not complete safely. [" + exc.code + (
                 ":" + exc.reason if exc.reason else ""
             ) + "]"
         except (TimeoutError, httpx.TimeoutException):
+            error_code = "provider_timeout"
             error = "Assistant turn could not complete safely. [provider_timeout]"
         except httpx.RequestError:
+            error_code = "provider_network"
             error = "Assistant turn could not complete safely. [provider_network]"
         except Exception:
+            error_code = "assistant_failed"
             error = "Assistant turn could not complete safely. [assistant_failed]"
         finally:
             try:
+                if config.get("_takeover_action_id"):
+                    try:
+                        await self._close_browser(
+                            session_id, automation_request_id=config.get("_takeover_request_id"))
+                    except asyncio.CancelledError:
+                        # Close has finished; cancellation must not bypass durable finalization.
+                        error_code = "cancelled"
+                        error = "Assistant turn cancelled. [cancelled]"
                 with self.session_factory() as db:
                     approvals = self._finish_pending(db, session_id, "interrupted")
                     if error:
                         self._message(db, session_id, "system", error)
+                    row = db.get(AssistantSession, session_id)
+                    if row is not None:
+                        data = self._decrypt(row)
+                        request_id = config.get("_request_id")
+                        if request_id:
+                            outcomes = data.setdefault("_turn_outcomes", {})
+                            outcomes[request_id] = {
+                                "ok": error_code is None, "code": error_code, "errorcode": error_code,
+                                "request_id": request_id,
+                                "user_message_id": config.get("_user_message_id"),
+                                "action_id": config.get("_takeover_action_id"),
+                            }
+                            data["_turn_outcomes"] = dict(list(outcomes.items())[-32:])
+                        from app.services.assistant_takeover import remove_takeover
+
+                        remove_takeover(data, request_id=request_id)
+                        self._encrypt(row, data)
                     db.execute(update(AssistantSession).where(AssistantSession.id == session_id).values(
                         status="idle", updated_at=datetime.now(timezone.utc),
                     ))
@@ -1488,13 +1839,44 @@ class AssistantManager:
         messages[0] = {**messages[0], "content": messages[0]["content"] + (
             "\n\nCurrent host-enforced turn budgets (override static prompt budget examples only): "
             f"max_parallel_tool_calls={max_calls}, max_tool_calls={tool_limit}, "
-            f"max_model_rounds={round_limit}. Tool calls in a response are dispatched sequentially. "
-            "These limits do not grant authorization or permission to retry uncertain actions."
+            f"max_model_rounds={round_limit}, max_auth_uses_per_turn={values.get('max_auth_uses_per_turn', 3)}. "
+            "Tool calls in a response are dispatched sequentially. These limits do not grant target consent."
         )}
         tools = AssistantTools(self, owner, session_id, target, config=config,
                                turn=self._active_turns.get(session_id))
         definitions = tool_definitions()
+        from app.services.assistant_takeover import takeover_tool_definitions
+
+        definitions = takeover_tool_definitions(self, owner, session_id, definitions)
         names = {item["function"]["name"] for item in definitions}
+        if config.get("_takeover_action_id") and "browser_open" in names:
+            messages[0] = {**messages[0], "content": messages[0]["content"] + (
+                "\n\nCurrent host takeover scope overrides the static FAILURE TAKEOVER live-tool restriction: "
+                "the user explicitly granted same-origin browsing, observations, screenshots (vision models "
+                "only), and the supported single-step features including login, challenge and sign/click. "
+                "Analysis means no saving, NOT no live execution. Disclose that live actions may change the "
+                "site. Use only the bound site's interaction lane/proxy policy without fallback. No arbitrary "
+                "POST tools, workflow full runs, retry_step, permission popups, global/site-settings or template "
+                "mutation are authorized unattended. Autofix may import the exact validated proposal once "
+                "only when that tool is available; configuration-write uncertainty guards still apply. "
+                "Historical uncertainty does not block supported non-post execute_step calls under current "
+                "category consent, but does not grant retry_step permission. Only builtin Feature.category "
+                "is trusted. Auth login/password attempts and retries share the host per-user-turn cap, "
+                "reserved before credentials with failures charged; challenge.2fa is challenge, not auth, "
+                "and keeps OTP private. Permission does not prove no website side effects. Persisted "
+                "site permissions are inherited by subsequent ordinary human turns, not this autonomous "
+                "tool restriction. Report only evidenced actions and results."
+            )}
+        elif target and target.get("_takeover_site_grant") and not config.get("_takeover_action_id"):
+            messages[0] = {**messages[0], "content": messages[0]["content"] + (
+                "\n\nThis is an ordinary human follow-up, not an autonomous takeover turn. The user's "
+                "explicit persisted site permissions remain in the host-confirmed target, independent "
+                "of global auto-authorization defaults and whether future takeover is enabled. Do not "
+                "ask to reauthorize browsing, supported steps, credentials or screenshots already granted. "
+                "Workflow import/run authority is exactly workflow_consent in that target; normal fresh "
+                "consumption approval and category-based auth limits still apply. Do not broaden the URL, trusted "
+                "origins or other permissions without ordinary explicit user authorization."
+            )}
         key = config["api_key"]
         seen = set()
         count = 0
@@ -1554,7 +1936,7 @@ class AssistantManager:
                         raise GenerationError("secret_output")
                     report_usage(output, "conversation")
                 content, calls = self._parse_response(output, names, seen, max_calls=max_calls)
-                from app.services.assistant_interactions import unsafe_model_interaction
+                from app.services.assistant_interactions import secret_input, unsafe_model_interaction
 
                 if any(unsafe_model_interaction(arguments, key) for _, name, arguments in calls
                        if name == "request_user_interaction"):
@@ -1562,7 +1944,10 @@ class AssistantManager:
                 from app.services.assistant_site_config import unsafe_site_config
 
                 if any(unsafe_site_config(arguments, key) for _, name, arguments in calls
-                       if name == "update_site_config"):
+                       if name in {"update_site_config", "create_template_from_site"}):
+                    raise GenerationError("secret_output")
+                if any(secret_input(arguments, key) for _, name, arguments in calls
+                       if name == "update_scheduler_settings"):
                     raise GenerationError("secret_output")
                 if any(_has_secret(arguments, key) for _, _, arguments in calls):
                     raise GenerationError("secret_output")
@@ -1607,7 +1992,7 @@ class AssistantManager:
                     if revision != current.get("_target_revision", 0):
                         # Revocation is independent of compaction. Old pixels must
                         # not survive a target/trust/proxy change in this live turn.
-                        messages = text_projection(messages)
+                        messages = revoke_browser_images(messages)
                     if target != current.get("target") or revision != current.get("_target_revision", 0):
                         target = current.get("target")
                         tools.target = target
@@ -1617,7 +2002,7 @@ class AssistantManager:
                             + _json(self._public_target(target))}
                     image = None
                     image_id = None
-                    if name == "browser_screenshot" and result.get("ok") and "_image" in result:
+                    if name in {"browser_screenshot", "read_artifact_image"} and result.get("ok") and "_image" in result:
                         result = dict(result)
                         image = result.pop("_image")
                         image_id = str(uuid4())
@@ -1670,14 +2055,18 @@ class AssistantManager:
                 # durable history. Interrupted batches never leave orphaned images.
                 with self.session_factory() as db:
                     for image_id, image, result, source_id, capture_revision in batch_images:
-                        provenance = _json({"image_id": image_id, "source_message_id": source_id,
-                                            "url": result.get("url"), "image_url": result["image_url"],
-                                            "width": image["width"], "height": image["height"]})
-                        item = image_message(image, provenance)
+                        historical_image = artifact_provenance(result.get("provenance"))
+                        provenance_data = {"image_id": image_id, "source_message_id": source_id,
+                                             "url": result.get("url"), "image_url": result["image_url"],
+                                             "width": image["width"], "height": image["height"]}
+                        if historical_image:
+                            provenance_data.update(result["provenance"])
+                        item = image_message(image, _json(provenance_data), artifact=historical_image)
                         self._message(db, session_id, "system", "\u622a\u56fe\u8bc1\u636e",
-                                      message_uuid=image_id, context_image=True,
-                                       _image=image, _model_message=item, _target_revision=capture_revision)
-                        if (capture_revision != revision or not target
+                                       message_uuid=image_id, context_image=True,
+                                        _image=image, _model_message=item, _target_revision=capture_revision,
+                                        **({"_image_provenance": result["provenance"]} if historical_image else {}))
+                        if not historical_image and (capture_revision != revision or not target
                                 or target.get("screenshot_consent") is not True):
                             item = {**item, "content": omit_images(item["content"])}
                         messages.append(item)

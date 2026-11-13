@@ -48,6 +48,7 @@ globalThis.__settingsMocks = {
   } },
 };
 const defaults = { max_tool_calls: 20, max_model_rounds: 12, max_parallel_tool_calls: 4,
+  max_auth_uses_per_turn: 3,
   turn_timeout_seconds: 180, max_tokens: null, context_max_tokens: 64000, auto_compact: true, auto_title: true,
   auto_authorize_execution: false, auto_authorize_screenshot: false, auto_authorize_workflow: false };
 const settings = (revision = 0, values = defaults, source = "default") => ({ revision, source, values: { ...values } });
@@ -86,7 +87,8 @@ try {
     const payload = JSON.parse(request.body);
     assert.equal(payload.expected_revision, revision);
     assert.equal(payload.values.max_tokens, expectedTokens);
-    assert.equal(Object.keys(payload.values).length, 11, "PUT sends every setting");
+    assert.deepEqual(Object.keys(payload.values).sort(), Object.keys(defaults).sort(), "PUT sends every setting");
+    assert.equal(payload.values.max_auth_uses_per_turn, Number(ui.draft.max_auth_uses_per_turn));
     await ui.save(); await ui.reset(); await ui.refresh();
     assert.equal(last(), request, "all duplicate operations are blocked synchronously");
     ui.close();
@@ -106,6 +108,8 @@ try {
   assert.equal(ui.canSave.value, false);
   await resolve(settings());
   assert.deepEqual(ui.values.value, defaults);
+  assert.equal(ui.draft.max_auth_uses_per_turn, "3");
+  assert.deepEqual(assistantSettingBounds.max_auth_uses_per_turn, [1, 20]);
    assert.equal(ui.draft.context_max_tokens, "64000", "token budget, independent of output cap");
   assert.equal(ui.inheritTokens.value, true);
   assert.equal(ui.canSave.value, true);
@@ -117,6 +121,8 @@ try {
   assert.equal(ui.canSave.value, false);
    ui.draft.context_max_tokens = "64000";
   ui.draft.max_tool_calls = "21";
+  ui.draft.max_auth_uses_per_turn = "20";
+  assert.equal(ui.view.value.values.max_auth_uses_per_turn, 3, "auth budget draft does not mutate snapshot");
   assert.equal(ui.view.value.values.max_tool_calls, 20, "draft never mutates loaded snapshot");
    ui.draft.auto_compact = false; ui.draft.auto_title = false;
    ui.draft.auto_authorize_execution = true;
@@ -124,6 +130,7 @@ try {
    ui.draft.auto_authorize_workflow = true;
   const changed = await save("123456", 123456);
   assert.equal(changed.max_tool_calls, 21);
+  assert.equal(changed.max_auth_uses_per_turn, 20);
   assert.equal(changed.auto_compact, false);
    assert.equal(changed.auto_title, false);
    assert.equal(changed.auto_authorize_execution, true);
@@ -196,10 +203,12 @@ try {
 
   await reopen(settings(15));
   ui.draft.max_tool_calls = "77";
+  ui.draft.max_auth_uses_per_turn = "9";
   const failed = ui.save();
   last().reject(new ApiError(409, "PRIVATE diagnostics", "assistant_settings_conflict"));
   await failed;
   assert.equal(ui.draft.max_tool_calls, "77");
+  assert.equal(ui.draft.max_auth_uses_per_turn, "9", "save conflict preserves auth budget draft");
   assert.equal(ui.view.value.revision, 15);
   assert.equal(ui.canSave.value, false);
   assert.match(ui.error.value, /assistant_settings_conflict.*草稿已保留/);
@@ -211,13 +220,16 @@ try {
   assert.match(confirmations.at(-1).args[0], /丢弃当前草稿/);
   confirmations.at(-1).reject("cancel"); await cancelledRefresh;
   assert.equal(ui.draft.max_tool_calls, "77");
+  assert.equal(ui.draft.max_auth_uses_per_turn, "9");
   const refreshing = ui.refresh();
   confirmations.at(-1).resolve(); await tick();
   await resolve(settings(16)); await refreshing;
   assert.equal(ui.draft.max_tool_calls, "20");
+  assert.equal(ui.draft.max_auth_uses_per_turn, "3");
   assert.equal(ui.canSave.value, true);
 
   ui.draft.max_tool_calls = "44";
+  ui.draft.max_auth_uses_per_turn = "8";
   const cancelledReset = ui.reset();
   assert.equal(requests.length, count + 1, "reset requires confirmation before POST");
   await ui.reset();
@@ -235,6 +247,7 @@ try {
   assert.equal(last().signal, undefined);
   last().reject(new ApiError(409, "PRIVATE", "assistant_settings_conflict")); await resetting;
   assert.equal(ui.draft.max_tool_calls, "44", "reset conflict preserves draft");
+  assert.equal(ui.draft.max_auth_uses_per_turn, "8", "reset conflict preserves auth budget draft");
   assert.match(ui.error.value, /assistant_settings_conflict/);
   await reopen(settings(17));
   const resetOK = ui.reset(); confirmations.at(-1).resolve(); await tick();
@@ -318,6 +331,9 @@ try {
     "dialog never calls integrations, models, sessions, or websites");
   assert.ok(events.every(event => event.event === "update:modelValue"));
   assert.match(source, /执行预算/);
+  assert.match(source, /key: "max_auth_uses_per_turn", label: "每轮 auth 类步骤使用上限"/);
+  assert.match(source, /默认每轮最多 3 次 auth 类新步骤使用（包括重试）.*按 auth 类总计.*不是每个 feature 分别计算/);
+  assert.match(source, /凭据获取失败或取消的尝试也计入.*其他类别步骤不计入此上限/);
   assert.match(source, /模型与上下文/);
   assert.match(source, /仅对之后发送的新消息生效.*正在运行的任务不变.*不会改变网站目标确认要求/);
   assert.match(source, /v-model="draft.auto_authorize_workflow"[^>]*>默认授权导入保存配置并触发真实完整工作流运行/);

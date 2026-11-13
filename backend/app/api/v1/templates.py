@@ -9,6 +9,7 @@ from app.api.deps import get_crypto, get_current_session, get_db, get_settings, 
 from app.core.config import Settings
 from app.core.crypto import CryptoService
 from app.models.auth import AuthSession
+from app.schemas.template_site_import import TemplateSiteImport
 from app.schemas.workflow import (
     ResolvedWorkflowView,
     TemplateDetail,
@@ -18,6 +19,7 @@ from app.schemas.workflow import (
     WorkflowVersionDetail,
     WorkflowVersionList,
 )
+from app.services.template_site_import import site_import_candidate
 from app.services.workflows import (
     WorkflowConflictError,
     WorkflowNotFoundError,
@@ -57,11 +59,23 @@ def list_templates(service: WorkflowService = Depends(get_service)) -> list[Temp
 @router.post("", response_model=TemplateDetail, status_code=201)
 def create_template(
     payload: TemplateWrite,
+    preserve_local: bool = Query(default=False),
     service: WorkflowService = Depends(get_service),
     _current: AuthSession = Depends(require_csrf),
 ) -> TemplateDetail:
     try:
-        return service.create_template(payload)
+        return service.create_template(payload, _preserve_local=preserve_local)
+    except (WorkflowNotFoundError, WorkflowConflictError, WorkflowValidationError) as exc:
+        _raise(exc)
+
+
+@router.get("/import-from-site/{site_id}", response_model=TemplateSiteImport)
+def import_from_site(
+    site_id: int,
+    service: WorkflowService = Depends(get_service),
+) -> TemplateSiteImport:
+    try:
+        return site_import_candidate(service, site_id)
     except (WorkflowNotFoundError, WorkflowConflictError, WorkflowValidationError) as exc:
         _raise(exc)
 
@@ -81,11 +95,12 @@ def get_template(
 def update_template(
     template_id: int,
     payload: TemplateWrite,
+    preserve_local: bool = Query(default=False),
     service: WorkflowService = Depends(get_service),
     _current: AuthSession = Depends(require_csrf),
 ) -> TemplateDetail:
     try:
-        return service.update_template(template_id, payload)
+        return service.update_template(template_id, payload, _preserve_local=preserve_local)
     except (WorkflowNotFoundError, WorkflowConflictError, WorkflowValidationError) as exc:
         _raise(exc)
 

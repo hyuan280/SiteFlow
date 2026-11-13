@@ -33,6 +33,7 @@ const emailForm = reactive({
   enabled: false,
   notify_success: true,
   notify_manual: true,
+  notify_assistant: true,
   smtp_host: "",
   smtp_port: 587 as number | undefined,
   security: "starttls" as "ssl" | "starttls" | "none",
@@ -45,6 +46,7 @@ const httpForm = reactive({
   enabled: false,
   notify_success: true,
   notify_manual: true,
+  notify_assistant: true,
   url: "",
   method: "POST" as "POST" | "PUT" | "PATCH",
   headers: "",
@@ -213,6 +215,7 @@ function applySettings(data: NotificationSettings): void {
   emailForm.enabled = data.email.enabled;
   emailForm.notify_success = data.email.notify_success;
   emailForm.notify_manual = data.email.notify_manual;
+  emailForm.notify_assistant = data.email.notify_assistant ?? true;
   emailForm.smtp_host = fieldString(data.email.smtp_host);
   emailForm.smtp_port = fieldNumber(data.email.smtp_port, 587);
   const security = fieldString(data.email.security);
@@ -227,6 +230,7 @@ function applySettings(data: NotificationSettings): void {
   httpForm.enabled = data.http.enabled;
   httpForm.notify_success = data.http.notify_success;
   httpForm.notify_manual = data.http.notify_manual;
+  httpForm.notify_assistant = data.http.notify_assistant ?? true;
   httpForm.url = fieldString(data.http.url);
   const method = fieldString(data.http.method).toUpperCase();
   httpForm.method = ["POST", "PUT", "PATCH"].includes(method)
@@ -298,6 +302,7 @@ function emailPayload(): Record<string, unknown> {
     enabled: emailForm.enabled,
     notify_success: emailForm.notify_success,
     notify_manual: emailForm.notify_manual,
+    notify_assistant: emailForm.notify_assistant,
   };
   if (email.smtp_host.editable) payload.smtp_host = emailForm.smtp_host.trim();
   if (email.smtp_port.editable) payload.smtp_port = emailForm.smtp_port ?? null;
@@ -334,6 +339,7 @@ function httpPayload(): Record<string, unknown> {
     enabled: httpForm.enabled,
     notify_success: httpForm.notify_success,
     notify_manual: httpForm.notify_manual,
+    notify_assistant: httpForm.notify_assistant,
   };
   if (http.url.editable) payload.url = httpForm.url.trim();
   if (http.method.editable) payload.method = httpForm.method;
@@ -603,6 +609,15 @@ onMounted(() => {
               </div>
               <el-switch v-model="emailForm.notify_manual" />
             </div>
+            <div class="filter-row filter-row--wide">
+              <div>
+                <strong class="filter-label">接收助手调查通知</strong>
+                <span class="muted filter-hint">
+                  原任务完成通知仍按上方成功和手动筛选发送；仅当任务结束后的助手接管产生结论时，才另发一条简洁调查结果。未发生接管时不会声称已调查。此开关仅影响邮件渠道。
+                </span>
+              </div>
+              <el-switch v-model="emailForm.notify_assistant" />
+            </div>
           </div>
 
           <el-form label-position="top" class="config-form">
@@ -860,6 +875,15 @@ onMounted(() => {
                 </span>
               </div>
               <el-switch v-model="httpForm.notify_manual" />
+            </div>
+            <div class="filter-row filter-row--wide">
+              <div>
+                <strong class="filter-label">接收助手调查通知</strong>
+                <span class="muted filter-hint">
+                  原任务完成通知仍按上方成功和手动筛选发送；仅当任务结束后的助手接管产生结论时，才另发一条简洁调查结果。未发生接管时不会声称已调查。此开关仅影响 HTTP 渠道。
+                </span>
+              </div>
+              <el-switch v-model="httpForm.notify_assistant" />
             </div>
           </div>
 
@@ -1176,6 +1200,10 @@ onMounted(() => {
   border: 1px solid #e7edf5;
   border-radius: 10px;
   background: #fbfcfe;
+}
+
+.filter-row--wide {
+  grid-column: 1 / -1;
 }
 
 .filter-row > div {

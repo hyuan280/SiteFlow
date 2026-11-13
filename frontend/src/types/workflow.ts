@@ -166,6 +166,13 @@ export interface TemplateDetail extends TemplateSummary {
   resolved: ResolvedWorkflow | null;
 }
 
+export interface TemplateSiteImport {
+  parent_id: number | null;
+  steps: Omit<StepView, "feature_version" | "category" | "source">[];
+  groups: GroupView[];
+  signals: SignalView[];
+}
+
 export interface SiteCredential {
   configured: boolean;
   username_masked: string | null;

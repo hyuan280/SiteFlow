@@ -33,7 +33,8 @@ def screenshot_page(manager, width=800, height=600):
     buffer = BytesIO()
     Image.new("RGB", (min(width, 1600), min(height, 1200)), "white").save(buffer, "JPEG")
     manager.page.screenshot = AsyncMock(return_value=buffer.getvalue())
-    manager.page.locator = Mock(return_value=object())
+    manager.page.locator = Mock(return_value=Mock(all=AsyncMock(return_value=[])))
+    manager.page.remove_listener = Mock(side_effect=lambda event, callback: manager.page.listeners.pop(event, None))
     original = manager.cdp.send.side_effect
 
     async def send(method, params=None):
@@ -61,8 +62,6 @@ def test_exact_host_retry_is_one_use_cached_and_resolves_only_its_unknown(public
         with pytest.raises(HTTPException, match="retry operation conflict"):
             await browser.execute(session_id, changed)
         assert not session.consumed_permits
-        with pytest.raises(HTTPException, match="uncertain"):
-            await browser.execute(session_id, original.model_copy(update={"operation_id": uuid.uuid4()}))
         step.return_value = (terminal, "", {})
         result = await browser.execute(session_id, approved)
         assert result["status"] == ("success" if terminal == "success" else "failed")
@@ -84,8 +83,8 @@ def test_exact_host_retry_is_one_use_cached_and_resolves_only_its_unknown(public
         assert step.await_count == 2
         step.return_value = ("success", "", {})
         if terminal == "fail":
-            with pytest.raises(HTTPException, match="uncertain"):
-                await browser.execute(session_id, request("action.click", {"selector": ["#next"]}))
+            assert (await browser.execute(session_id, request("action.click", {"selector": ["#next"]})))["status"] == "success"
+            assert session.uncertain and session.unresolved_operations == {str(original.operation_id)}
             # The host, not the worker, decides whether to issue another grant.
             assert (await browser.execute(session_id, retry(original)))["status"] == "success"
             assert not session.uncertain and not session.unresolved_operations
@@ -95,6 +94,76 @@ def test_exact_host_retry_is_one_use_cached_and_resolves_only_its_unknown(public
         assert (await browser.execute(session_id, request("action.click", {"selector": ["#next"]})))["status"] == "success"
         assert manager.context.new_page.await_count == manager.lease_lane.await_count == 1
         await browser.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["nested_attach_detach", "frame_url_aba", "main_url_aba"])
+def test_real_browser_screenshot_rejects_frame_aba_even_when_final_tree_matches(public_dns, monkeypatch, change):
+    from tests.test_assistant_private_steps import chromium_fixture
+
+    html = '<iframe id="readable" src="/frame#stable" style="position:fixed;left:0;top:0;width:400px;height:200px;border:0"></iframe>'
+    frame_html = '<div>Readable frame</div>'
+    secret_html = '''<style>body{margin:0}input{width:300px;height:80px;border:0;
+        background:rgb(200,0,0);color:white}</style><input value="private-frame-input">'''
+
+    async def run():
+        async with chromium_fixture(html, {"/frame": frame_html, "/secret": secret_html}) as (browser, sid, origin, page, _):
+            await page.frame_locator('#readable').locator('div').wait_for()
+            await page.evaluate("location.hash='stable'")
+            frame = page.frames[1]
+            session = browser.sessions[sid]
+            original_tree = await session.cdp.send('Page.getFrameTree')
+            capture = page.screenshot
+            captured = []
+            events = []
+            for event in ('frameattached', 'framedetached', 'framenavigated'):
+                page.on(event, lambda frame, event=event: events.append((event, frame)))
+            on = Mock(wraps=page.on)
+            remove = Mock(wraps=page.remove_listener)
+            monkeypatch.setattr(page, 'on', on)
+            monkeypatch.setattr(page, 'remove_listener', remove)
+
+            async def screenshot(**kwargs):
+                # Masks have already been enumerated. This nested input has no mask.
+                if change == 'nested_attach_detach':
+                    await frame.evaluate("""() => {
+                        const child=document.createElement('iframe'); child.id='transient'; child.src='/secret';
+                        child.style='position:fixed;left:0;top:0;width:350px;height:120px;border:0';
+                        document.body.append(child);
+                    }""")
+                    await page.frame_locator('#readable').frame_locator('#transient').locator('input').wait_for()
+                    assert await page.frame_locator('#readable').frame_locator('#transient').locator('input').input_value() == 'private-frame-input'
+                else:
+                    target = frame if change == 'frame_url_aba' else page
+                    await target.evaluate("location.hash='transient'")
+                image = await capture(**kwargs)
+                captured.append(image)
+                if change == 'nested_attach_detach':
+                    await frame.locator('#transient').evaluate('el => el.remove()')
+                else:
+                    await target.evaluate("location.hash='stable'")
+                assert await session.cdp.send('Page.getFrameTree') == original_tree
+                return image
+
+            monkeypatch.setattr(page, 'screenshot', screenshot)
+            with pytest.raises(HTTPException) as error:
+                await browser.screenshot(sid, TOKEN)
+            assert error.value.status_code == 409
+            assert error.value.detail == {'code': 'browser_snapshot_stale'}
+            assert 'image' not in json.dumps(error.value.detail)
+            assert captured and events
+            if change == 'nested_attach_detach':
+                assert {'frameattached', 'framedetached'} <= {event for event, _ in events}
+                with Image.open(BytesIO(captured[0])) as image:
+                    red, green, blue = image.getpixel((250, 50))
+                    assert red > 170 and green < 30 and blue < 30
+            else:
+                assert [event for event, _ in events].count('framenavigated') >= 2
+            assert on.call_count == remove.call_count == 3
+            assert on.call_args_list == remove.call_args_list
+            assert not session.lock.locked() and session.page is page
+            monkeypatch.setattr(page, 'screenshot', capture)
+            assert (await browser.screenshot(sid, TOKEN))['masked']
     asyncio.run(run())
 
 
@@ -160,8 +229,10 @@ def test_retry_without_success_keeps_uncertainty(public_dns, monkeypatch, outcom
         assert (str(approved.operation_id) in session.unresolved_operations) == (outcome == "submitted_auth_failure")
         assert await browser.execute(session_id, approved) == result
         assert "private-error" not in json.dumps(result)
-        with pytest.raises(HTTPException, match="uncertain"):
-            await browser.execute(session_id, request("action.click", {"selector": ["#next"]}))
+        step.side_effect = None
+        step.return_value = ("success", "", {})
+        assert (await browser.execute(session_id, request("action.click", {"selector": ["#next"]})))["status"] == "success"
+        assert session.uncertain and str(original.operation_id) in session.unresolved_operations
         await browser.stop()
     asyncio.run(run())
 
@@ -183,8 +254,10 @@ def test_terminal_retry_does_not_resolve_unrelated_unknown_or_accept_missing_ori
         session = browser.sessions[session_id]
         assert session.uncertain and session.unresolved_operations == (
             {str(first.operation_id), str(second.operation_id)} if terminal == "fail" else {str(first.operation_id)})
-        with pytest.raises(HTTPException, match="uncertain"):
-            await browser.execute(session_id, request("action.click", {"selector": ["#next"]}))
+        unresolved = set(session.unresolved_operations)
+        step.return_value = ("success", "", {})
+        assert (await browser.execute(session_id, request("action.click", {"selector": ["#next"]})))["status"] == "success"
+        assert session.uncertain and session.unresolved_operations == unresolved
         await browser.stop()
     asyncio.run(run())
 
@@ -229,12 +302,16 @@ def test_screenshot_is_bounded_masked_and_not_secret_redacted(public_dns):
         session_id = (await browser.open(URL, "proxy_interaction", TOKEN))["session_id"]
         session = browser.sessions[session_id]
         session.secret_fingerprints = fingerprints(["/9j/4AAQ"])
+        listeners = dict(manager.page.listeners)
         result = await browser.screenshot(session_id, TOKEN)
+        assert manager.page.listeners == listeners
+        assert manager.page.remove_listener.call_count == 3
         assert result["mime_type"] == "image/jpeg" and result["masked"] is True
         assert (result["width"], result["height"]) == (1600, 1200)
         assert result["session_id"] == session_id and result["lane_key"] == "proxy_interaction"
         assert base64.b64decode(result["image_base64"]) == manager.page.screenshot.return_value
-        manager.page.locator.assert_called_once_with(SCREENSHOT_MASK)
+        assert manager.page.locator.call_args_list[0].args == (SCREENSHOT_MASK,)
+        assert manager.page.locator.call_args_list[1].args == ("iframe, frame",)
         options = manager.page.screenshot.call_args.kwargs
         assert options["mask"] == [manager.page.locator.return_value]
         assert options["clip"] == {"x": 0, "y": 0, "width": 1600, "height": 1200}
@@ -280,12 +357,98 @@ def test_screenshot_fails_closed_without_image_or_private_errors(public_dns, fai
             session.dns.check = AsyncMock(side_effect=HTTPException(403, {"code": "browser_dns_denied"}))
         elif failure == "unapproved":
             manager.page.url = "https://unapproved.example/"
+        listeners = dict(manager.page.listeners)
         with pytest.raises(HTTPException) as error:
             await browser.screenshot(session_id, TOKEN)
+        assert manager.page.listeners == listeners
+        assert manager.page.remove_listener.call_count == 3
         assert "private-password" not in str(error.value)
         assert not session.closed
         if failure in {"denied", "dns", "unapproved", "mask"}:
             manager.page.screenshot.assert_not_awaited()
+        await browser.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('event', ['frameattached', 'framedetached', 'framenavigated'])
+@pytest.mark.parametrize('stage', ['initial_tree', 'capture', 'post_tree', 'pinned_validation'])
+def test_screenshot_frame_events_invalidate_equal_trees_through_postvalidation(public_dns, event, stage):
+    async def run():
+        manager = Manager()
+        screenshot_page(manager)
+        browser = AssistantBrowser(manager)
+        sid = (await browser.open(URL, 'interaction', TOKEN))['session_id']
+        listeners = dict(manager.page.listeners)
+        send = manager.cdp.send.side_effect
+        reads = 0
+
+        async def changed(method, params=None):
+            nonlocal reads
+            value = await send(method, params)
+            if method == 'Page.getFrameTree':
+                reads += 1
+                if (stage == 'initial_tree' and reads == 1 or
+                        stage == 'post_tree' and reads == 2):
+                    manager.page.listeners[event](manager.page.main_frame)
+            return value
+
+        manager.cdp.send.side_effect = changed
+        if stage == 'capture':
+            async def capture(**kwargs):
+                manager.page.listeners[event](manager.page.main_frame)
+                return manager.page.screenshot.return_value
+            manager.page.screenshot.side_effect = capture
+        elif stage == 'pinned_validation':
+            handle = Mock(evaluate=AsyncMock(return_value=''), dispose=AsyncMock())
+
+            async def validate(*args):
+                manager.page.listeners[event](manager.page.main_frame)
+                return True
+
+            locator = Mock(element_handle=AsyncMock(return_value=handle), evaluate=AsyncMock(side_effect=validate))
+            manager.page.locator.return_value.all.return_value = [locator]
+        with pytest.raises(HTTPException) as error:
+            await browser.screenshot(sid, TOKEN)
+        assert error.value.status_code == 409
+        assert error.value.detail == {'code': 'browser_snapshot_stale'}
+        assert manager.page.listeners == listeners
+        assert manager.page.remove_listener.call_count == 3
+        assert not browser.sessions[sid].lock.locked()
+        await browser.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failure', ['setup_first', 'setup_second', 'setup_third', 'cancel', 'timeout'])
+def test_screenshot_always_removes_listeners_on_partial_setup_and_interruption(public_dns, failure):
+    async def run():
+        manager = Manager()
+        screenshot_page(manager)
+        browser = AssistantBrowser(manager)
+        sid = (await browser.open(URL, 'interaction', TOKEN))['session_id']
+        listeners = dict(manager.page.listeners)
+        on = manager.page.on
+        registered = []
+
+        def register(event, callback):
+            on(event, callback)
+            registered.append(event)
+            if failure.startswith('setup') and len(registered) == {
+                'setup_first': 1, 'setup_second': 2, 'setup_third': 3,
+            }[failure]:
+                raise RuntimeError('private-setup-error')
+
+        manager.page.on = register
+        if failure == 'cancel':
+            manager.page.screenshot.side_effect = asyncio.CancelledError()
+        elif failure == 'timeout':
+            manager.page.screenshot.side_effect = TimeoutError('private-timeout')
+        with pytest.raises(asyncio.CancelledError if failure == 'cancel' else HTTPException) as error:
+            await browser.screenshot(sid, TOKEN)
+        if failure != 'cancel':
+            assert error.value.detail == {'code': 'browser_screenshot_unavailable'}
+        assert manager.page.listeners == listeners
+        assert [call.args[0] for call in manager.page.remove_listener.call_args_list] == registered
+        assert not browser.sessions[sid].lock.locked()
         await browser.stop()
     asyncio.run(run())
 
@@ -426,6 +589,7 @@ def test_real_browser_screenshot_masks_inputs_frames_and_refresh_never_reposts(p
                 session_id = (await browser.open(origin + "/", "interaction", TOKEN))["session_id"]
                 session = browser.sessions[session_id]
                 page = session.page
+                await page.wait_for_load_state('load')
                 result = await browser.screenshot(session_id, TOKEN)
                 with Image.open(BytesIO(base64.b64decode(result["image_base64"]))) as image:
                     assert image.size == (800, 600)

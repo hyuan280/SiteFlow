@@ -19,6 +19,7 @@ const server = await createServer({
       .replace('import { ApiError, apiRequest } from "@/api/client";', 'const { ApiError, apiRequest } = globalThis.__approvalMocks;')
       .replace('import { useAuthStore } from "@/stores/auth";', 'const { useAuthStore } = globalThis.__approvalMocks;')
       .replace('import AssistantSettingsDialog from "@/components/AssistantSettingsDialog.vue";', 'const AssistantSettingsDialog = { render: () => null };')
+      .replace('import AssistantTakeoverDialog from "@/components/AssistantTakeoverDialog.vue";', 'const AssistantTakeoverDialog = { render: () => null };')
       .replace("</script>", `defineExpose({ ${exposed} });\n</script>`);
   } }],
 });

@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from worker.executor import execute_job
 from worker.assistant_browser import (
-    AssistantBrowser, CheckSelectorRequest, InspectRequest, NavigateRequest,
+    AssistantBrowser, CheckSelectorRequest, ClearCookiesRequest, CookieGenerationRequest, InspectRequest, NavigateRequest,
     ObserveRequest, OpenRequest, TokenRequest,
 )
 from worker.assistant_step import ExecuteRequest
@@ -730,9 +730,10 @@ class AssistantRecoveryBodyLimit:
         path = scope.get("path", "")
         action = path.rsplit("/", 1)[-1]
         if (scope["type"] != "http" or not path.startswith("/assistant-browser/")
-                or action not in {"execute", "screenshot", "refresh"}):
+                or action not in {"execute", "screenshot", "refresh", "open-status", "open", "clear-cookies", "cookie-generation"}):
             return await self.app(scope, receive, send)
-        limit = 128 * 1024 if action == "execute" else 4 * 1024
+        limit = (352 * 1024 if action == "open" else
+                 128 * 1024 if action == "execute" else 4 * 1024)
         body = bytearray()
         while True:
             message = await receive()
@@ -799,7 +800,24 @@ def create_app() -> FastAPI:
             payload.url, payload.lane_key, payload.token,
             session_id=str(payload.session_id) if payload.session_id is not None else None,
             trusted_origins=payload.trusted_origins,
+            same_origin_only=payload.same_origin_only,
+            wait_for_lane=payload.wait_for_lane,
+            **{key: (str(payload.cookie_generation) if payload.cookie_generation is not None else None)
+               if key == "cookie_generation" else payload.cookies
+               for key in ("cookies", "cookie_generation") if key in payload.model_fields_set},
         )
+
+    @app.post("/assistant-browser/cookie-generation")
+    async def assistant_browser_cookie_generation(payload: CookieGenerationRequest) -> dict[str, str]:
+        return await app.state.assistant_browser.cookie_generation(payload.url, payload.lane_key)
+
+    @app.post("/assistant-browser/{session_id}/clear-cookies")
+    async def assistant_browser_clear_cookies(session_id: str, payload: ClearCookiesRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.clear_cookies(session_id, payload.token, str(payload.operation_id))
+
+    @app.post("/assistant-browser/{session_id}/open-status")
+    async def assistant_browser_open_status(session_id: str, payload: TokenRequest) -> dict[str, Any]:
+        return await app.state.assistant_browser.open_status(session_id, payload.token)
 
     @app.post("/assistant-browser/{session_id}/observe")
     async def assistant_browser_observe(session_id: str, payload: ObserveRequest) -> dict[str, Any]:

@@ -1523,13 +1523,14 @@ class WorkflowService(WorkflowHistoryMixin):
         )
 
     def validate_draft(
-        self, owner_type: str, payload: SiteWrite | TemplateWrite, owner_id: int | None = None
+        self, owner_type: str, payload: SiteWrite | TemplateWrite, owner_id: int | None = None,
+        *, preserve_local: bool = False,
     ) -> dict:
         from app.services.workflow_drafts import validate_draft
 
         with self.session.no_autoflush:
             try:
-                return validate_draft(self, owner_type, payload, owner_id)
+                return validate_draft(self, owner_type, payload, owner_id, preserve_local=preserve_local)
             except WorkflowError:
                 raise
             except (ValueError, KeyError, TypeError) as exc:
@@ -1550,7 +1551,7 @@ class WorkflowService(WorkflowHistoryMixin):
             )
 
     @atomic_workflow_write
-    def create_template(self, payload: TemplateWrite) -> TemplateDetail:
+    def create_template(self, payload: TemplateWrite, *, _commit: bool = True, _preserve_local: bool = False) -> TemplateDetail:
         self._ensure_name_available(Template, payload.name)
         if payload.parent_id is not None:
             self._get_template(payload.parent_id)
@@ -1564,7 +1565,8 @@ class WorkflowService(WorkflowHistoryMixin):
         self.session.add(template)
         try:
             self.session.flush()
-            self._prepare_local_inputs(OWNER_TEMPLATE, payload, payload.parent_id)
+            self._prepare_local_inputs(OWNER_TEMPLATE, payload, payload.parent_id,
+                                       preserve_positions=_preserve_local)
             self._replace_signals(OWNER_TEMPLATE, template.id, payload.signals)
             self._replace_groups(OWNER_TEMPLATE, template.id, payload.groups)
             self._replace_steps(OWNER_TEMPLATE, template.id, payload.steps)
@@ -1572,7 +1574,8 @@ class WorkflowService(WorkflowHistoryMixin):
             self.resolve_template(template.id)
             self._record_history(template, "create")
             result = self.get_template(template.id)
-            self.session.commit()
+            if _commit:
+                self.session.commit()
         except WorkflowError:
             self.session.rollback()
             raise
@@ -1582,14 +1585,14 @@ class WorkflowService(WorkflowHistoryMixin):
         return result
 
     @atomic_workflow_write
-    def update_template(self, template_id: int, payload: TemplateWrite, *, _restored_from=None, _revision_claimed=False) -> TemplateDetail:
+    def update_template(self, template_id: int, payload: TemplateWrite, *, _restored_from=None, _revision_claimed=False, _commit: bool = True, _preserve_local: bool = False) -> TemplateDetail:
         template = self._get_template(template_id)
         if not _revision_claimed:
             self._cas_revision(template, payload.expected_revision, payload.expected_history_key)
         self._ensure_name_available(Template, payload.name, exclude_id=template_id)
         self._prepare_local_inputs(
             OWNER_TEMPLATE, payload, payload.parent_id, template,
-            preserve_positions=_restored_from is not None,
+            preserve_positions=_restored_from is not None or _preserve_local,
         )
         template.name = payload.name
         template.description = payload.description
@@ -1597,7 +1600,7 @@ class WorkflowService(WorkflowHistoryMixin):
         template.enabled = payload.enabled
         template.updated_at = _utcnow()
         try:
-            self._replace_groups(OWNER_TEMPLATE, template.id, payload.groups, preserve_null=_restored_from is not None)
+            self._replace_groups(OWNER_TEMPLATE, template.id, payload.groups, preserve_null=_restored_from is not None or _preserve_local)
             self._replace_steps(OWNER_TEMPLATE, template.id, payload.steps)
             self.session.flush()
             self._check_removed_signals(OWNER_TEMPLATE, template.id, payload.signals)
@@ -1608,7 +1611,8 @@ class WorkflowService(WorkflowHistoryMixin):
             self._record_history(template, "restore" if _restored_from is not None else "update",
                                  restored_from_revision=_restored_from)
             result = self.get_template(template.id)
-            self.session.commit()
+            if _commit:
+                self.session.commit()
         except WorkflowError:
             self.session.rollback()
             raise

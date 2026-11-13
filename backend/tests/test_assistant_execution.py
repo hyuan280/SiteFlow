@@ -163,6 +163,8 @@ def test_host_execution_permissions(execution, monkeypatch, change, expected):
 
 @pytest.mark.parametrize("feature", [
     "sign.button", "sign.unit3d_claim", "action.click", "challenge.altcha", "challenge.slider",
+    "action.fill", "challenge.2fa", "challenge.turnstile", "challenge.image_captcha",
+    "challenge.grid_captcha", "sign.iframe.image_captcha", "sign.image_quiz",
 ])
 @pytest.mark.parametrize("consent", [False, None, 1])
 def test_selector_actions_require_explicit_sign_consent(execution, feature, consent):
@@ -178,8 +180,7 @@ def test_challenge_actions_with_sign_consent_reach_worker(execution, feature):
 
 
 @pytest.mark.parametrize("feature", [
-    "challenge.turnstile", "challenge.image_captcha", "challenge.grid_captcha", "sign.image_quiz",
-    "action.fill", "flow.result", "flow.jump", "auth.totp_login", "plugin.example", "post.buy_card",
+    "flow.jump", "auth.totp_login", "plugin.example", "post.buy_card",
 ])
 def test_v1_unsupported_features_are_denied_even_if_host_lists_them(execution, feature):
     save_target(execution, {**execution.target, "execution_features": [feature]})
@@ -192,6 +193,7 @@ def test_v1_unsupported_features_are_denied_even_if_host_lists_them(execution, f
     {"step": {}, "operation_id": "not-a-uuid"}, {"step": {}, "operation_id": uuid4()},
     {"step": [], "operation_id": str(uuid4())},
     {**arguments(), "credentials": {"password": PASSWORD}},
+    {**arguments(), "private_runtime": {"totp_code": "123456"}},
     {**arguments(), "site_id": 1}, {**arguments(), "execution": {"allow_sign": True}},
 ])
 def test_arguments_require_string_uuid_and_no_authority_fields(execution, args):
@@ -283,6 +285,13 @@ def test_fully_normalized_supported_steps_satisfy_worker_contract(execution, mon
     from worker.assistant_step import ExecuteRequest, validate_step
 
     bind(execution)
+    if feature == "challenge.2fa":
+        monkeypatch.setattr(execution, "_private_runtime", lambda step: ({"totp_code": "123456"}, ["123456"]))
+    elif feature in {"sign.image_quiz", "challenge.grid_captcha"}:
+        monkeypatch.setattr(execution, "_private_runtime", lambda step: ({"vision": {
+            "base_url": "http://solver.internal/v1", "api_key": "private-solver-key",
+            "model": "fixture-model", "timeout": 20, "supports_vision": True,
+        }}, ["private-solver-key"]))
 
     async def worker(path, payload):
         request = ExecuteRequest.model_validate(payload)
@@ -290,7 +299,9 @@ def test_fully_normalized_supported_steps_satisfy_worker_contract(execution, mon
         return response(execution.manager.browsers[execution.session_id], payload["operation_id"])
 
     execution.manager._worker.side_effect = worker
-    config = {"selector": ["#button"]} if feature == "action.click" else {}
+    config = {"selector": ["#button"]} if feature in {"action.click", "action.fill"} else {}
+    if feature == "challenge.2fa":
+        config = {"service_hint": "Example"}
     assert run(execution, arguments(feature, config))["ok"]
 
 
@@ -497,7 +508,7 @@ def test_static_worker_failures_preserve_existing_page_and_observations(executio
 
 
 @pytest.mark.parametrize("empty_after", [False, True])
-def test_uncertain_outcome_preserves_status_evidence_and_static_no_retry_instruction(execution, empty_after):
+def test_uncertain_outcome_preserves_status_evidence_and_static_category_instruction(execution, empty_after):
     scope = execution.manager.browsers[execution.session_id]
     args = arguments("sign.button")
 
@@ -523,8 +534,8 @@ def test_uncertain_outcome_preserves_status_evidence_and_static_no_retry_instruc
         assert result["after"]["total"] == 0 and result["after"]["url_redacted"] is False
     assert result["logs"] == [
         "Step execution started", "Step execution finished",
-        "Outcome uncertain. Retry detected; host approval will be requested "
-        "when the retry tool is used. Inspect the retained page first.",
+        "Outcome uncertain. Inspect the retained page first. Non-post retries use "
+        "the category policy; auth attempts share the per-turn budget.",
     ]
     assert "untrusted" not in json.dumps(result)
     assert execution.manager.browsers[execution.session_id] is scope

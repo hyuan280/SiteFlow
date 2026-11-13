@@ -17,7 +17,7 @@ from app.schemas.assistant import AuthorizeRetry
 from app.services.assistant import AssistantError, AssistantManager, BrowserScope
 from app.services.assistant_execution import AssistantExecution
 from app.services.assistant_retry import (
-    GRANTS, PENDING, RECORDS, authorize_retry, decide_retry_approval,
+    GRANTS, PENDING, RECORDS, authorize_retry,
     model_retry_status, retry_status, run_authorized_retry,
     valid_grant,
 )
@@ -179,7 +179,7 @@ def test_request_replay_does_not_refresh_expiry_or_issue_new_grant(execution):
 
 
 @pytest.mark.parametrize("source", ["record", "facts", "legacy_message"])
-def test_durable_uncertainty_blocks_new_ids_and_browsers_but_not_readonly(execution, source):
+def test_durable_uncertainty_does_not_block_nonpost_in_new_browser(execution, source):
     args = unknown(execution)
     operation = args["operation_id"]
     if source == "facts":
@@ -198,10 +198,11 @@ def test_durable_uncertainty_blocks_new_ids_and_browsers_but_not_readonly(execut
     fresh._worker = execution.manager._worker
     helper = AssistantExecution(fresh, OWNER, execution.session_id, execution.target)
     mutate(execution, lambda data: None, status="running")
-    assert run(helper, arguments("sign.button"))["code"] == "retry_authorization_required"
-    assert run(helper, arguments("auth.form_login"))["code"] == "retry_authorization_required"
-    fresh._worker.assert_awaited_once()
     succeed(helper)
+    assert run(helper, arguments("sign.button"))["ok"]
+    assert run(helper, arguments("auth.form_login"))["code"] == "credentials_unavailable"
+    if source != "legacy_message":
+        assert load(helper)["_context_safety"][0]["operation_id"] == operation
     assert run(helper, arguments("action.wait"))["ok"]
 
 
@@ -227,7 +228,9 @@ def test_lost_response_persists_unknown_before_failure_and_has_no_default_replay
     execution.manager.browsers[execution.session_id] = BrowserScope(
         OWNER, str(uuid4()), TOKEN, "interaction", "", time.monotonic() + 900,
     )
-    assert run(execution, arguments("sign.button"))["code"] == "retry_authorization_required"
+    succeed(execution)
+    assert run(execution, arguments("sign.button"))["ok"]
+    assert "resolution" not in load(execution)[RECORDS][args["operation_id"]]
     execution.manager._idle(execution.session_id)
     approve(execution, args["operation_id"])
     succeed(execution)
@@ -251,7 +254,7 @@ def test_retry_grant_consumed_before_credentials_and_resolution_failure_never_re
     assert retry(execution, operation)["code"] == "credentials_unavailable"
     assert retry(execution, operation)["code"] == "retry_authorization_required"
     assert calls == [True] and execution.manager._worker.await_count == before
-    assert run(execution, arguments("sign.button"))["code"] == "retry_authorization_required"
+    assert run(execution, arguments("sign.button"))["status"] == "unknown"
     execution.manager._idle(execution.session_id)
     assert execution.manager.detail(OWNER, execution.session_id)["unresolved_operations"][0]["can_authorize"]
     assert approve(execution, operation)["retry_authorizations"][0]["status"] == "approved"
@@ -262,7 +265,7 @@ def test_unknown_retry_keeps_gate_and_can_only_retry_new_operation(execution):
     approve(execution, operation)
     result = retry(execution, operation)
     assert result["status"] == "unknown" and result["retry_of"] == operation
-    assert run(execution, arguments("sign.button"))["code"] == "retry_authorization_required"
+    assert run(execution, arguments("sign.button"))["status"] == "unknown"
     execution.manager._idle(execution.session_id)
     with pytest.raises(AssistantError) as caught:
         approve(execution, operation)
@@ -287,7 +290,7 @@ def test_only_successful_terminal_retry_outcomes_resolve_gate(execution, termina
     assert retry(execution, operation)["status"] == terminal
     succeed(execution)
     result = run(execution, arguments("sign.button"))
-    assert result["ok"] is (terminal == "success")
+    assert result["ok"]
     assert load(execution)[RECORDS][operation]["status"] == "unknown"
 
 
@@ -304,7 +307,7 @@ def test_failed_retry_requires_fresh_explicit_approval_and_preserves_audit(execu
     failed = retry(execution, operation)
     assert failed["status"] == terminal
     old = load(execution)[GRANTS][operation]
-    assert run(execution, arguments("sign.button"))["code"] == "retry_authorization_required"
+    assert run(execution, arguments("sign.button"))["status"] == terminal
     assert retry(execution, operation)["code"] == "retry_authorization_required"
     execution.manager._idle(execution.session_id)
     assert execution.manager.detail(OWNER, execution.session_id)["unresolved_operations"][0]["can_authorize"]
@@ -648,13 +651,8 @@ def test_restart_terminalizes_crashed_retry_and_fresh_browser_can_resume(executi
         })
         mutate(execution, lambda data: None, status="running")
         tools = AssistantTools(fresh, OWNER, execution.session_id, execution.target)
-        retry_task = asyncio.create_task(tools.dispatch("retry_step", {"operation_id": candidate}))
-        async with asyncio.timeout(2):
-            while not load(execution).get(PENDING):
-                await asyncio.sleep(0)
-        approval = load(execution)[PENDING]
-        await decide_retry_approval(fresh, OWNER, execution.session_id, approval["id"], "approve")
-        result = await retry_task
+        result = await tools.dispatch("retry_step", {"operation_id": candidate})
+        assert not load(execution).get(PENDING)
         assert result["ok"] and result["retry_of"] == candidate
         assert len(captured) == 1 and captured[0]["step"] == record["step"]
         final = load(execution)
@@ -687,14 +685,10 @@ def test_child_grant_covers_durable_ancestors_without_resolution_not_unrelated(e
     succeed(execution)
     before = execution.manager._worker.await_count
     result = run(helper, arguments("sign.button"))
+    assert result["ok"] and result["retry_of"] == child
+    assert execution.manager._worker.await_count == before + 1
     if unrelated:
-        assert result["code"] == "retry_authorization_required"
-        assert execution.manager._worker.await_count == before
-        assert load(execution)[GRANTS][child]["status"] == "approved"
         assert load(execution)[RECORDS][unrelated_id]["status"] == "unknown"
-    else:
-        assert result["ok"] and result["retry_of"] == child
-        assert execution.manager._worker.await_count == before + 1
     assert load(execution)[RECORDS][original]["status"] == "unknown"
 
 

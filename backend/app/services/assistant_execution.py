@@ -4,7 +4,7 @@
 site_id is selected, SetTarget must freeze _credential_binding as
 {id, history_key, revision}, with revision taken from Site.config_revision.
 The manager must exclude that binding and the operation ledger from model/public
-context. This service writes only the encrypted assistant session ledger.
+context. Takeover safety metadata is persisted alongside the encrypted ledger.
 """
 
 from __future__ import annotations
@@ -16,16 +16,21 @@ import time
 from urllib.parse import urlsplit
 from uuid import UUID
 
+import httpx
 from sqlalchemy import update
 
+from app.features.base import IMAGE_CAPTCHA_FEATURES, VISION_FEATURES
 from app.features.catalog import FEATURES
 from app.models.assistant import AssistantSession
 from app.models.workflow import Site
 from app.schemas.assistant import public_url
 from app.schemas.workflow import SiteWrite, StepInput
+from app.services.assistant_categories import (
+    Denied as _Denied, auth_budget_context, builtin_category, require_auth_capacity,
+)
 from app.services.assistant_snapshot import POLICY_CODES
 from app.services.assistant_retry import (
-    GRANTS, READ_ONLY, RECORDS, credential_binding, fingerprint,
+    GRANTS, RECORDS, credential_binding, fingerprint,
     uncertain_operations, valid_grant,
 )
 from app.services.assistant_tools import failure, safe_snapshot
@@ -34,6 +39,7 @@ from app.services.bitwarden import BitwardenService
 from app.services.config_ai_generation import _has_secret, _json
 from app.services.credentials import CredentialService
 from app.services.feature_settings import FeatureSettingsService
+from app.services.integrations import IntegrationService, validate_cfbox_url, validate_twofauth_url
 from app.services.login_evidence import project_success_evidence
 from app.services.workflows import _substitute
 
@@ -42,6 +48,9 @@ SUPPORTED_FEATURES = frozenset({
     "flow.open", "action.navigate", "auth.form_login", "auth.password_verify",
     "action.wait", "sign.button", "sign.unit3d_claim", "challenge.altcha",
     "challenge.slider", "action.click",
+    "challenge.2fa", "challenge.turnstile", "challenge.image_captcha",
+    "challenge.grid_captcha", "sign.iframe.image_captcha", "sign.image_quiz",
+    "action.fill", "flow.result",
 })
 _CODES = {
     "success": {"step_succeeded"},
@@ -63,17 +72,13 @@ _LOGS = ["Step execution started", "Step execution finished"]
 _LEDGER = "_execution_operations"
 
 
-class _Denied(Exception):
-    pass
-
-
 def _origin(url):
     return urlsplit(public_url(url))[:2]
 
 
 class AssistantExecution:
     def __init__(self, manager, owner: str, session_id: str, target: dict | None, *,
-                 retry_authorization: dict | None = None, turn=None, invocation=None):
+                 retry_authorization: dict | None = None, turn=None, invocation=None, auth_limit=None):
         self.manager = manager
         self.owner = owner
         self.session_id = session_id
@@ -81,7 +86,9 @@ class AssistantExecution:
         self.retry_authorization = deepcopy(retry_authorization)
         self.turn = turn
         self.invocation = invocation
+        self.auth_limit = auth_limit
         self.operation_id = None
+        self._execution_turn_id = None
         self._reserved = False
 
     def _bound_site(self, db):
@@ -105,7 +112,7 @@ class AssistantExecution:
         return site
 
     def _uncertainty_gate(self, db, data, scope, feature):
-        if feature in READ_ONLY:
+        if builtin_category(feature) != "post":
             return
         from app.services.assistant_run_guard import unresolved_assistant_runs
 
@@ -157,6 +164,24 @@ class AssistantExecution:
             data = manager._decrypt(row)
             if row.status != "running" or data.get("target") != self.target:
                 raise _Denied("execution_authorization_changed")
+            if self._reserved:
+                turn_id, _ = auth_budget_context(
+                    manager, db, self.session_id, data, turn=self.turn, auth_limit=self.auth_limit)
+                if turn_id != self._execution_turn_id:
+                    raise _Denied("execution_authorization_changed")
+            from app.services.assistant_takeover import takeover_live_allowed
+
+            if self.turn and self.turn.get("_takeover_action_id"):
+                active = manager._active_turns.get(self.session_id) or {}
+                if any(self.turn.get(key) != active.get(key) for key in (
+                        "_takeover_action_id", "_takeover_request_id", "_request_id")):
+                    raise _Denied("takeover_tool_denied")
+            if (not takeover_live_allowed(manager, db, self.owner, self.session_id, data,
+                                          execution=True, feature=feature,
+                                          operation_id=self.operation_id if self._reserved else None)
+                    or (self.retry_authorization and ("_takeover" in data or
+                        (manager._active_turns.get(self.session_id) or {}).get("_takeover_action_id")))):
+                raise _Denied("takeover_tool_denied")
             if self.target.get("confirmed") is not True:
                 raise _Denied("target_confirmation_required")
             if self.target.get("execution_consent") is not True:
@@ -166,15 +191,19 @@ class AssistantExecution:
                     not isinstance(key, str) or key not in SUPPORTED_FEATURES for key in allowed
             ) or feature not in allowed or feature not in SUPPORTED_FEATURES):
                 raise _Denied("execution_feature_denied")
-            if ((feature.startswith("sign.") or feature in {
-                    "action.click", "challenge.altcha", "challenge.slider",
-            })
+            category = builtin_category(feature)
+            if ((category in {"sign", "challenge"} or feature in {"action.click", "action.fill"})
                     and self.target.get("allow_sign") is not True):
                 raise _Denied("sign_consent_required")
-            if feature.startswith("auth.") and self.target.get("credential_consent") is not True:
+            if ((category == "auth" or feature == "challenge.2fa")
+                    and self.target.get("credential_consent") is not True):
                 raise _Denied("credential_consent_required")
             _origin(self.target["base_url"])
             self._bound_site(db)
+            if self.retry_authorization and not valid_grant(
+                    data, scope, self.retry_authorization["operation_id"],
+                    self.retry_authorization["id"], self.operation_id if self._reserved else None):
+                raise _Denied("retry_authorization_required")
             if check_uncertain:
                 if self.operation_id in data.get(_LEDGER, []) and not self._reserved:
                     raise _Denied("operation_already_used")
@@ -185,11 +214,15 @@ class AssistantExecution:
         if step.enabled is False or step.condition not in (None, "", "always"):
             raise ValueError()
         feature = FEATURES[step.feature_type]  # Builtins only, never plugin dispatch.
+        protected = {"llm_prompt", "llm_enabled", "fields"}
+        if set(step.config) & protected:
+            raise ValueError()
         feature.validate_override(step.config)
         with self.manager.session_factory() as db:
             settings = FeatureSettingsService(db)
             defaults, _, _ = settings.policy(feature)
-            supplied = {**defaults, **step.config}
+            supplied = {key: value for key, value in {**defaults, **step.config}.items()
+                        if key in feature.config_model.model_fields and key not in protected}
             if step.feature_type in {"flow.open", "action.navigate"}:
                 if "retry_count" in step.config and (
                         type(step.config["retry_count"]) is not int or step.config["retry_count"] != 0):
@@ -197,6 +230,11 @@ class AssistantExecution:
                 supplied["retry_count"] = 0
             feature.config_model.model_validate(supplied, strict=True)
             config = settings.validate(feature, supplied)
+        config = {key: value for key, value in config.items() if key not in protected}
+        if config.get("totp_provider_id", "builtin.twofauth") != "builtin.twofauth":
+            raise ValueError()
+        if config.get("captcha_method", "ddddocr") not in {"ddddocr", "nexusphp_gd5", "vision"}:
+            raise ValueError()
         base_url = self.target["base_url"]
         if "?" not in base_url and "#" not in base_url:
             base_url = SiteWrite(name=self.target["name"], base_url=base_url).base_url
@@ -216,7 +254,9 @@ class AssistantExecution:
                         not isinstance(item, str) or not item.strip() or len(item) > 2048
                         for item in value):
                     raise ValueError()
-            elif isinstance(value, str) and (not value or len(value) > 4096):
+            elif isinstance(value, str) and (len(value) > 4096 or (not value and key not in {
+                    "username_hint", "value", "message", "message_text",
+            })):
                 raise ValueError()
         if step.feature_type == "sign.unit3d_claim" and not config["claim_selector"]:
             raise ValueError()
@@ -251,6 +291,12 @@ class AssistantExecution:
                 raise _Denied("execution_operation_limit")
             scope = self.manager.browsers.get(self.session_id)
             if step is not None:
+                category = builtin_category(step["feature_type"])
+                turn_id, auth_limit = auth_budget_context(
+                    self.manager, db, self.session_id, data, turn=self.turn, auth_limit=self.auth_limit)
+                if category == "auth":
+                    require_auth_capacity(data, turn_id, auth_limit)
+                    data["_execution_turn_id"] = turn_id
                 self._uncertainty_gate(db, data, scope, step["feature_type"])
             if self.retry_authorization:
                 original = self.retry_authorization["operation_id"]
@@ -259,23 +305,34 @@ class AssistantExecution:
                 grant = data[GRANTS][original]
                 if grant["status"] != "approved" or step != grant["step"]:
                     raise _Denied("retry_authorization_required")
+                if grant.get("automatic") and (
+                        grant.get("turn_id") != turn_id or grant.get("invocation") != self.invocation):
+                    raise _Denied("retry_authorization_required")
                 grant.update(status="used", retry_operation_id=operation_id)
             operations.append(operation_id)
             if step is not None:
                 data.setdefault(RECORDS, {})[operation_id] = {
+                    "category": category, "turn_id": turn_id,
                     "step": deepcopy(step), "step_fingerprint": fingerprint(step),
                     "target_revision": data.get("_target_revision", 0),
                     "target_fingerprint": fingerprint(self.target),
                     "origin": list(_origin(self.target["base_url"])),
                     "credential_binding": credential_binding(self.target), "state": "reserved",
+                    **({"takeover_action_id": data["_takeover"]["action_id"]}
+                       if "_takeover" in data else {}),
                     **({"retry_of": self.retry_authorization["operation_id"]}
                        if self.retry_authorization else {}),
                     **({"retry_authorization": deepcopy(grant)} if self.retry_authorization else {}),
                 }
+            from app.services.assistant_takeover import record_takeover_step
+
+            if step is not None:
+                record_takeover_step(db, row, operation_id, data[RECORDS])
             self.manager._encrypt(row, data)
             db.commit()
             if step is not None:
                 self.operation_id = operation_id
+                self._execution_turn_id = turn_id
                 self._reserved = True
 
     def _execution_state(self, state, status=None, code=None):
@@ -307,6 +364,9 @@ class AssistantExecution:
                     data[RECORDS][record["retry_of"]]["resolution"] = {
                         "retry_operation_id": self.operation_id, "status": status, "code": code,
                     }
+            from app.services.assistant_takeover import record_takeover_step
+
+            record_takeover_step(db, row, self.operation_id, data[RECORDS])
             self.manager._encrypt(row, data)
             db.commit()
 
@@ -336,7 +396,82 @@ class AssistantExecution:
                 raise _Denied("credentials_unavailable")
             return values
 
-    def _project(self, raw, scope, operation_id):
+    def _private_runtime(self, step):
+        runtime, secrets = {}, []
+        feature, config = step["feature_type"], step["config"]
+        with self.manager.session_factory() as db:
+            self._bound_site(db)
+            integrations = IntegrationService(db, self.manager.settings, self.manager.crypto)
+            settings = FeatureSettingsService(db)
+            if feature == "challenge.2fa":
+                # Establish a real same-origin account source, never a fabricated job.
+                credentials = self._credentials()
+                secrets.extend(credentials.values())
+                credentials.clear()
+                url = integrations.resolve_twofauth_url().value
+                token = integrations.resolve_twofauth_token().value
+                if not url or not token:
+                    raise _Denied("credentials_unavailable")
+                secrets.extend([url, token])
+                base = validate_twofauth_url(url)
+                with httpx.Client(timeout=20, follow_redirects=False) as client:
+                    headers = {"Authorization": f"Bearer {token}"}
+                    response = client.get(f"{base}/api/v1/twofaccounts", headers=headers)
+                    response.raise_for_status()
+                    body = response.json()
+                    accounts = body if isinstance(body, list) else body.get("data", [])
+                    if not isinstance(accounts, list) or any(not isinstance(a, dict) for a in accounts):
+                        raise _Denied("credentials_unavailable")
+                    username = config.get("username_hint", "").strip().casefold()
+                    if username:
+                        accounts = [a for a in accounts if str(a.get("account") or "").strip().casefold() == username]
+                    hint = config["service_hint"].strip().casefold()
+                    exact = [a for a in accounts if str(a.get("service") or "").strip().casefold() == hint]
+                    matches = exact if len(exact) == 1 else [a for a in accounts if
+                        hint in str(a.get("service") or "").casefold()
+                        or hint in str(a.get("account") or "").casefold()]
+                    if len(matches) != 1:
+                        raise _Denied("credentials_unavailable")
+                    identifier = int(matches[0]["id"])
+                    response = client.get(f"{base}/api/v1/twofaccounts/{identifier}/otp", headers=headers)
+                    response.raise_for_status()
+                    body = response.json()
+                    code = body.get("password") or body.get("otp")
+                    if not isinstance(code, str) or not code.isascii() or not code.isdigit() or not 4 <= len(code) <= 10:
+                        raise _Denied("credentials_unavailable")
+                    runtime["totp_code"] = code
+                    secrets.append(code)
+            if feature == "challenge.turnstile":
+                url = integrations.resolve_cfbox_url().value
+                if url:
+                    runtime["cfbox"] = {"url": validate_cfbox_url(url),
+                                        "api_key": integrations.resolve_cfbox_api_key().value or ""}
+                    secrets.extend(runtime["cfbox"].values())
+            needs_vision = feature in VISION_FEATURES and (
+                feature not in IMAGE_CAPTCHA_FEATURES or config.get("captcha_method") == "vision")
+            behavior = settings.execution_settings(FEATURES[feature])
+            if feature == "flow.result":
+                defaults, _, _ = settings.policy(FEATURES[feature])
+                needs_vision = (behavior.llm_enabled and defaults.get("llm_enabled") is True
+                                and (config["output_value"] or behavior.judgment_scope == "all"))
+                if needs_vision and defaults.get("llm_prompt"):
+                    behavior = behavior.model_copy(update={"llm_prompt": defaults["llm_prompt"]})
+            if needs_vision:
+                vision = integrations.vision_runtime()
+                if not vision:
+                    raise _Denied("provider_unavailable")
+                vision = {key: vision[key] for key in (
+                    "base_url", "api_key", "model", "timeout", "max_tokens", "supports_vision",
+                ) if key in vision}
+                secrets.extend(vision[key] for key in ("base_url", "api_key", "model"))
+                if behavior is not None:
+                    vision["execution_settings"] = behavior.model_dump(mode="json")
+                    secrets.extend(value for key, value in vision["execution_settings"].items()
+                                   if key in {"llm_prompt", "model"} and isinstance(value, str))
+                runtime["vision"] = vision
+        return runtime, secrets
+
+    def _project(self, raw, scope, operation_id, feature=None):
         if (not isinstance(raw, dict) or raw.get("session_id") != scope.session_id
                 or raw.get("lane_key") != scope.lane_key or raw.get("operation_id") != operation_id
                 or not isinstance(raw.get("status"), str) or raw["status"] not in _CODES
@@ -347,8 +482,7 @@ class AssistantExecution:
             source = raw.get(key)
             if not isinstance(source, dict):
                 raise ValueError()
-            if ("url" not in source and source.get("elements") == []
-                    and raw["status"] in {"error", "unknown"}):
+            if source == {"elements": []}:
                 snapshots[key] = {"elements": []}
                 continue
             snapshot = safe_snapshot(source, self.target)
@@ -361,13 +495,15 @@ class AssistantExecution:
         result = {key: value for key, value in source.items()
                   if (key in {"submitted", "verified"} and type(value) is bool)
                   or (key == "count" and type(value) is int and 0 <= value <= 10000)}
+        if feature == "flow.result" and type(source.get("value")) is bool:
+            result["value"] = source["value"]
         evidence = project_success_evidence(source.get("success_evidence"))
         if evidence is not None:
             result["success_evidence"] = evidence
         logs = list(_LOGS)
         if raw["status"] == "unknown":
-            logs.append("Outcome uncertain. Retry detected; host approval will be requested "
-                        "when the retry tool is used. Inspect the retained page first.")
+            logs.append("Outcome uncertain. Inspect the retained page first. Non-post retries "
+                        "use the category policy; auth attempts share the per-turn budget.")
         projected = {"ok": raw["status"] == "success", "operation_id": operation_id,
                      "status": raw["status"], "code": raw["code"], "logs": logs,
                      **snapshots, "result": result}
@@ -400,6 +536,8 @@ class AssistantExecution:
     async def execute(self, arguments: dict) -> dict:
         scope = None
         credentials = None
+        private_runtime = None
+        private_secrets = []
         dispatched = False
         outcome = None
         try:
@@ -416,7 +554,8 @@ class AssistantExecution:
                 return failure("target_confirmation_required")
             feature = arguments["step"].get("feature_type")
             if (self.target.get("authorized") is True and isinstance(feature, str)
-                    and feature.startswith("auth.") and not self.target.get("credential_consent")):
+                    and (builtin_category(feature) == "auth" or feature == "challenge.2fa")
+                    and not self.target.get("credential_consent")):
                 return {**failure("credentials_unavailable"),
                         "notice": "Bind a same-origin saved site with credentials or select Bitwarden; do not provide secrets in chat."}
             if not isinstance(feature, str) or feature not in SUPPORTED_FEATURES:
@@ -427,30 +566,6 @@ class AssistantExecution:
                 step = self._normalize(arguments["step"])
             except Exception:
                 return failure("invalid_step")
-            if self.turn and not self.retry_authorization and feature not in READ_ONLY:
-                from app.services.assistant_retry import eligible_record, run_with_retry_approval
-                from app.services.assistant import AssistantError
-
-                with self.manager.session_factory() as db:
-                    data = self.manager._decrypt(self.manager._owned(db, self.owner, self.session_id))
-                    unresolved = uncertain_operations(self.manager, db, self.session_id, data)
-                    matches = []
-                    for original in sorted(unresolved):
-                        try:
-                            record = eligible_record(self.manager, db, self.owner, self.session_id, data, original)
-                        except AssistantError:
-                            continue
-                        if (record["step_fingerprint"] == fingerprint(step)
-                                and record.get("target_revision") == data.get("_target_revision", 0)
-                                and record.get("target_fingerprint") == fingerprint(self.target)):
-                            matches.append(original)
-                if unresolved:
-                    if len(matches) == 1:
-                        return await run_with_retry_approval(
-                            self.manager, self.owner, self.session_id, matches[0],
-                            turn=self.turn, invocation=self.invocation)
-                    return {**failure("retry_step_mismatch"), "operation_ids": sorted(unresolved),
-                            "message": "Use retry_step with the original operation_id to request host approval; do not change the step."}
             self._authorize(scope, feature)
             self._reserve(operation_id, step)
             if feature.startswith("auth."):
@@ -461,6 +576,14 @@ class AssistantExecution:
                     raise
                 except Exception:
                     return failure("credentials_unavailable")
+            if feature.startswith("challenge.") or feature in VISION_FEATURES or feature == "flow.result":
+                try:
+                    async with asyncio.timeout(30):
+                        private_runtime, private_secrets = await asyncio.to_thread(self._private_runtime, step)
+                except _Denied:
+                    raise
+                except Exception:
+                    return failure("credentials_unavailable" if feature == "challenge.2fa" else "provider_unavailable")
             self._authorize(scope, feature)
             payload = {
                 "token": scope.token, "operation_id": operation_id,
@@ -470,6 +593,11 @@ class AssistantExecution:
             }
             if credentials is not None:
                 payload["credentials"] = dict(credentials)
+            if private_runtime:
+                payload["private_runtime"] = private_runtime
+            if feature == "flow.result" and private_runtime and private_runtime.get("vision"):
+                payload["step"] = deepcopy(step)
+                payload["step"]["config"]["llm_enabled"] = True
             if self.retry_authorization:
                 payload.update(retry_of=self.retry_authorization["operation_id"],
                                retry_authorization=self.retry_authorization["id"])
@@ -479,11 +607,12 @@ class AssistantExecution:
                 raw = await self.manager._worker(f"{scope.session_id}/execute", payload)
             finally:
                 payload.pop("credentials", None)
+                payload.pop("private_runtime", None)
             self._authorize(scope, feature)
             if any(_has_secret(raw, value)
-                   for value in [scope.token, *(credentials or {}).values()] if value):
+                   for value in [scope.token, *(credentials or {}).values(), *private_secrets] if value):
                 raise _Denied("secret_output")
-            projected = self._project(raw, scope, operation_id)
+            projected = self._project(raw, scope, operation_id, feature)
             outcome = (projected["status"], projected["code"])
             if self.retry_authorization:
                 projected["retry_of"] = self.retry_authorization["operation_id"]
@@ -503,6 +632,9 @@ class AssistantExecution:
         finally:
             if credentials is not None:
                 credentials.clear()
+            if private_runtime is not None:
+                private_runtime.clear()
+            private_secrets.clear()
             if self._reserved:
                 status, code = outcome or (
                     ("unknown", "outcome_uncertain") if dispatched

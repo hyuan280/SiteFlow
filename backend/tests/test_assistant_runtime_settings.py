@@ -48,6 +48,9 @@ def batch(size, prefix="batch"):
     json.dumps({"revision": 1, "values": {
         **AssistantSettingsValues().model_dump(), "max_tool_calls": 0,
     }}),
+    json.dumps({"revision": 1, "values": {
+        **AssistantSettingsValues().model_dump(), "max_auth_uses_per_turn": None,
+    }}),
 ])
 def test_invalid_settings_fail_before_message_or_task(runtime_client, provider, raw):
     client = runtime_client
@@ -270,7 +273,8 @@ def test_overlapping_turns_keep_independent_snapshots(runtime_client, provider, 
     send(client, first)
     assert started.wait(2)
     updated = save(client, max_tool_calls=1, max_parallel_tool_calls=1, max_model_rounds=1,
-                   turn_timeout_seconds=90, context_max_tokens=100000, max_tokens=222, auto_compact=True)
+                   turn_timeout_seconds=90, context_max_tokens=100000, max_tokens=222, auto_compact=True,
+                   max_auth_uses_per_turn=7)
     provider[0].append(text("Second complete"))
     send(client, second)
     assert wait(client, second)["messages"][-1]["content"] == "Second complete"
@@ -279,7 +283,9 @@ def test_overlapping_turns_keep_independent_snapshots(runtime_client, provider, 
     assert wait(client, first)["messages"][-1]["content"] == "First complete"
     assert snapshots[first]["max_tool_calls"] == 2 and snapshots[first]["auto_compact"] is False
     assert snapshots[first]["context_max_tokens"] == 24000
+    assert snapshots[first]["max_auth_uses_per_turn"] == 3
     assert snapshots[second] == updated.model_dump()
+    assert snapshots[second]["max_auth_uses_per_turn"] == 7
     assert len(dispatched) == 2
     assert [json.loads(request.content)["max_tokens"] for request in provider[1]] == [111, 222, 111]
     # The next turn in the original session picks up the newly saved settings.

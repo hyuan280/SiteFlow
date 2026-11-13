@@ -7,14 +7,16 @@ import json
 import socket
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from uuid import UUID
 
 from jsonschema import Draft202012Validator
 import pytest
 import httpx
-from sqlalchemy import create_engine, event, insert, select, update
+from sqlalchemy import MetaData, UniqueConstraint, create_engine, delete, event, insert, select, update
 from sqlalchemy.orm import sessionmaker
 
 from app.core.db import Base
+from app.core.crypto import CryptoService
 from app.models.execution import JobArtifact, JobStep, Run, SiteJob
 from app.models.integration import IntegrationConfig
 from app.models.setting import AppSetting
@@ -24,6 +26,7 @@ from app.services.assistant_data import AssistantData, OUTPUT_LIMIT, redact_conf
 from app.services.bitwarden import BitwardenService
 from app.services.integrations import IntegrationService
 from app.services.lanes import LaneService
+from app.services.workflows import WorkflowService
 
 
 PRIVATE = "DO-NOT-EXPOSE-PRIVATE"
@@ -125,10 +128,10 @@ def test_tool_schemas_are_exact_bounded_and_title_free():
         "get_system_status", "list_recent_runs", "get_run_summary",
     ]
     expected = {
-        "list_sites": ({"query", "limit"}, []), "get_site_config": ({"site_id"}, ["site_id"]),
-        "list_templates": (set(), []), "get_template_config": ({"template_id"}, ["template_id"]),
-        "get_system_status": (set(), []), "list_recent_runs": ({"site_id", "limit"}, []),
-        "get_run_summary": ({"run_id"}, ["run_id"]),
+        "list_sites": ({"query", "offset", "limit"}, []), "get_site_config": ({"site_id"}, ["site_id"]),
+        "list_templates": ({"query", "offset", "limit"}, []), "get_template_config": ({"template_id"}, ["template_id"]),
+        "get_system_status": (set(), []), "list_recent_runs": ({"site_id", "offset", "limit"}, []),
+        "get_run_summary": ({"run_id", "offset", "limit"}, ["run_id"]),
     }
     for item in definitions:
         assert set(item) == {"type", "function"}
@@ -143,6 +146,11 @@ def test_tool_schemas_are_exact_bounded_and_title_free():
         assert schema["additionalProperties"] is False
     assert definitions[0]["function"]["parameters"]["properties"]["limit"]["maximum"] == 100
     assert definitions[5]["function"]["parameters"]["properties"]["limit"]["maximum"] == 20
+    for index in (0, 2, 5, 6):
+        properties = definitions[index]["function"]["parameters"]["properties"]
+        assert properties["offset"] == {
+            "type": "integer", "minimum": 0, "maximum": 2**63 - 1,
+        }
     baseline = deepcopy(definitions)
     definitions[0]["function"]["parameters"].clear()
     assert AssistantData.tool_definitions() == baseline
@@ -157,12 +165,29 @@ def test_tool_schemas_are_exact_bounded_and_title_free():
     ("list_sites", {"query": PRIVATE * 20}), ("list_sites", {"query": None}),
     ("list_sites", {"limit": 101}), ("list_sites", {"limit": 0}),
     ("list_recent_runs", {"limit": 21}), ("list_recent_runs", {"limit": True}),
-    ("list_recent_runs", {"site_id": None}), ("list_templates", {"limit": 10}),
+    ("list_recent_runs", {"site_id": None}), ("list_templates", {"limit": 101}),
     ("get_system_status", {"endpoint": PRIVATE}), ("list_sites", []),
 ])
 def test_invalid_arguments_never_query_database(tools, name, args):
     tools.manager.session_factory = Mock(side_effect=AssertionError("No reads"))
     assert asyncio.run(tools.dispatch(name, args)) == {"ok": False, "code": "invalid_arguments"}
+    tools.manager.session_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("name,args,maximum", [
+    ("list_sites", {}, 100), ("list_templates", {}, 100),
+    ("list_recent_runs", {}, 20), ("get_run_summary", {"run_id": 1}, 100),
+])
+@pytest.mark.parametrize("field,value", [
+    *[("offset", value) for value in (True, False, 0.0, 1.5, "0", None, -1, 2**63)],
+    *[("limit", value) for value in (True, False, 1.0, 1.5, "1", None, 0, -1)],
+    ("limit", "above_maximum"),
+])
+def test_paging_arguments_are_strict_before_database_reads(tools, name, args, maximum, field, value):
+    tools.manager.session_factory = Mock(side_effect=AssertionError("No reads"))
+    if value == "above_maximum":
+        value = maximum + 1
+    assert call(tools, name, {**args, field: value}) == {"ok": False, "code": "invalid_arguments"}
     tools.manager.session_factory.assert_not_called()
 
 
@@ -193,14 +218,112 @@ def test_list_caps_and_run_job_summary_truncation(tools):
         db.execute(insert(Run), [{"created_by": "admin"} for _ in range(21)])
         db.execute(insert(SiteJob), [{"run_id": 1, "site_id": 1, "site_name": "First",
                                      "lane": "general", "status": "queued"} for _ in range(101)])
-    for name in ("list_sites", "list_templates"):
-        result = call(tools, name)
-        assert result["ok"] and len(result["items"]) == 100 and result["truncated"]
-    assert len(call(tools, "list_recent_runs")["items"]) == 20
+    for name, total, limit, args, key, truncated_key in (
+        ("list_sites", 103, 100, {}, "items", "truncated"),
+        ("list_templates", 103, 100, {}, "items", "truncated"),
+        ("list_recent_runs", 23, 20, {}, "items", "truncated"),
+        ("get_run_summary", 102, 100, {"run_id": 1}, "jobs", "jobs_truncated"),
+    ):
+        result = call(tools, name, args)
+        assert result["ok"] and len(result[key]) == limit and result[truncated_key]
+        assert (result["offset"], result["limit"], result["next_offset"]) == (0, limit, limit)
+        second = call(tools, name, {**args, "offset": result["next_offset"]})
+        assert second["ok"] and len(second[key]) == total - limit
+        assert second["offset"] == limit and second["limit"] == limit
+        assert second["next_offset"] is None and not second[truncated_key]
+        assert len({row["id"] for row in result[key] + second[key]}) == total
+        for offset in (total, total + 1, 2**63 - 1):
+            empty = call(tools, name, {**args, "offset": offset})
+            assert empty["ok"] and empty[key] == []
+            assert empty["offset"] == offset and empty["limit"] == limit
+            assert empty["next_offset"] is None and not empty[truncated_key]
     summary = call(tools, "get_run_summary", {"run_id": 1})
     assert len(summary["jobs"]) == 100 and summary["jobs_truncated"]
     assert summary["run"]["job_count"] == 102
     assert summary["run"]["job_counts"] == {"failed": 1, "queued": 101}
+    first_job = call(tools, "get_run_summary", {"run_id": 1, "limit": 1})
+    assert [job["id"] for job in first_job["jobs"]] == [1]
+    assert first_job["next_offset"] == 1 and first_job["jobs_truncated"]
+    last_jobs = call(tools, "get_run_summary", {"run_id": 1, "offset": 100, "limit": 2})
+    assert [job["id"] for job in last_jobs["jobs"]] == [102, 103]
+    assert last_jobs["next_offset"] is None and not last_jobs["jobs_truncated"]
+    assert last_jobs["run"] == summary["run"]
+
+
+@pytest.mark.parametrize("name,model", [("list_sites", Site), ("list_templates", Template)])
+def test_name_query_is_case_insensitive_literal_and_pages_filtered_results(tools, name, model):
+    with tools.engine.begin() as db:
+        for index, text in enumerate(("Literal%_one/two-A", "Literal%_one/two-B", "LiteralXXone/two"), 10):
+            values = {"id": index, "name": text}
+            if model is Site:
+                values["base_url"] = "https://example.com"
+            db.execute(insert(model).values(**values))
+    args = {"query": "lITERAL%_ONE/two", "limit": 1}
+    first = call(tools, name, args)
+    assert [item["id"] for item in first["items"]] == [10]
+    assert first["next_offset"] == 1 and first["truncated"]
+    second = call(tools, name, {**args, "offset": first["next_offset"]})
+    assert [item["id"] for item in second["items"]] == [11]
+    assert second["next_offset"] is None and not second["truncated"]
+    tools.manager.crypto.decrypt.assert_not_called()
+
+
+@pytest.mark.parametrize("name,model", [("list_sites", Site), ("list_templates", Template)])
+def test_name_ties_are_ordered_by_id(tools, name, model):
+    # Production names are unique; simulate legacy/imported ties without changing model metadata.
+    metadata = MetaData()
+    for source in (Site.__table__, Template.__table__):
+        source.to_metadata(metadata)
+    table = metadata.tables[model.__tablename__]
+    for constraint in list(table.constraints):
+        if isinstance(constraint, UniqueConstraint) and set(constraint.columns.keys()) == {"name"}:
+            table.constraints.remove(constraint)
+    engine = create_engine("sqlite://")
+    metadata.create_all(engine)
+    tools.manager.session_factory = sessionmaker(engine)
+    try:
+        with engine.begin() as db:
+            for identifier in (3, 1, 2):
+                values = {"id": identifier, "name": "Same"}
+                if model is Site:
+                    values["base_url"] = "https://example.com"
+                db.execute(insert(table).values(**values))
+        pages = [call(tools, name, {"limit": 1, "offset": offset}) for offset in range(3)]
+        assert [page["items"][0]["id"] for page in pages] == [1, 2, 3]
+        assert [page["next_offset"] for page in pages] == [1, 2, None]
+    finally:
+        engine.dispose()
+
+
+def test_recent_run_timestamp_ties_and_site_filter_paginate_stably(tools):
+    with tools.engine.begin() as db:
+        db.execute(update(Run).values(created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        db.execute(insert(SiteJob).values(run_id=2, site_id=1, site_name="First", lane="general"))
+        db.execute(insert(SiteJob).values(run_id=2, site_id=1, site_name="First", lane="general"))
+    first = call(tools, "list_recent_runs", {"site_id": 1, "limit": 1})
+    assert [run["id"] for run in first["items"]] == [2]
+    assert first["next_offset"] == 1 and first["truncated"]
+    second = call(tools, "list_recent_runs", {"site_id": 1, "limit": 1, "offset": 1})
+    assert [run["id"] for run in second["items"]] == [1]
+    assert second["next_offset"] is None and not second["truncated"]
+    assert not call(tools, "list_recent_runs", {"site_id": 1, "offset": 2})["items"]
+
+
+def test_current_history_identity_from_lists_and_config_chains_to_archive(tools):
+    listed = call(tools, "list_sites")["items"][0]
+    current = call(tools, "get_site_config", {"site_id": listed["id"]})["site"]
+    assert UUID(listed["history_key"]).version == 4
+    assert current["history_key"] == listed["history_key"]
+    tools.manager.crypto.decrypt.assert_not_called()
+    crypto = CryptoService(b"a" * 32)
+    with tools.manager.session_factory() as db:
+        WorkflowService(db, tools.manager.settings, crypto).baseline_workflows()
+        service = WorkflowService(db, tools.manager.settings, crypto)
+        versions = service.list_archived_versions(listed["history_key"])
+        assert versions.current_revision == current["config_revision"]
+        archived = service.get_archived_version(listed["history_key"], current["config_revision"])
+        assert archived.history_key == listed["history_key"]
+        assert archived.snapshot.local["name"] == current["name"]
 
 
 @pytest.mark.parametrize("model", [URL, PRIVATE + " with spaces", "model?key=" + PRIVATE])
@@ -392,6 +515,7 @@ def test_status_projects_bitwarden_health_without_secrets_or_endpoints(tools):
     assert result["model"] == "vendor/safe-model"
     assert result["max_tokens"] == 1234
     assert result["supports_vision"] is False
+    assert result["model_config_scope"] == "environment_only"
     integrations = {item["name"]: item for item in result["integrations"]}
     assert set(integrations) == {"proxy", "twofauth", "cfbox", "bitwarden", "vision"}
     assert integrations["vision"]["configured"]
@@ -415,6 +539,23 @@ def test_status_projects_bitwarden_health_without_secrets_or_endpoints(tools):
     tools.manager.crypto.decrypt.assert_not_called()
 
 
+@pytest.mark.parametrize("source", ["env", "db"])
+def test_cfbox_url_alone_is_configured_without_claiming_health(tools, source):
+    with tools.engine.begin() as db:
+        db.execute(delete(IntegrationConfig).where(IntegrationConfig.key == "cfbox.api_key"))
+        if source == "env":
+            db.execute(delete(IntegrationConfig).where(IntegrationConfig.key == "cfbox.url"))
+    tools.manager.settings = tools.manager.settings.model_copy(update={
+        "cfbox_url": "https://cfbox.example" if source == "env" else None, "cfbox_api_key": None,
+    })
+    result = call(tools, "get_system_status")
+    cfbox = next(item for item in result["integrations"] if item["name"] == "cfbox")
+    assert cfbox["configured"] is True
+    assert cfbox["sources"] == {"url": source, "api_key": "unset"}
+    assert cfbox["available"] is None and cfbox["health_checked"] is False
+    tools.manager.crypto.decrypt.assert_not_called()
+
+
 @pytest.mark.parametrize("name,args", [
     ("list_sites", {}), ("get_site_config", {"site_id": 1}), ("list_templates", {}),
     ("get_template_config", {"template_id": 2}), ("list_recent_runs", {}),
@@ -434,6 +575,7 @@ def test_status_db_public_values_unknown_without_decryption_and_worker_failure(t
     result = call(tools, "get_system_status")
     assert result["ok"] and result["model"] is None and result["max_tokens"] is None
     assert result["supports_vision"] is None
+    assert result["model_config_scope"] == "environment_only"
     assert not result["worker_connected"] and result["lanes"] == []
     assert PRIVATE not in json.dumps(result)
     tools.manager.crypto.decrypt.assert_not_called()

@@ -83,10 +83,10 @@ class ConfigAITools:
         self._features = {
             feature.key: feature for feature in FEATURE_LIST
             if feature.generation_hints is not None
-            and not feature.key.startswith(("post.", "plugin."))
-            and feature.key != "action.fill"
+            and not feature.key.startswith("plugin.")
         }
-        if (not isinstance(allowed_features, list) or not 1 <= len(allowed_features) <= 22
+        if (not isinstance(allowed_features, list)
+                or not 1 <= len(allowed_features) <= len(self._features)
                 or any(not isinstance(key, str) for key in allowed_features)
                 or len(set(allowed_features)) != len(allowed_features)
                 or any(key not in self._features for key in allowed_features)):
@@ -108,7 +108,9 @@ class ConfigAITools:
             "allowed_features": list(self._allowed_features),
             "constraints": [
                 "Propose only local steps, groups and signals for one new site without a template.",
-                "Plugins, aliases, post.* and action.fill are unavailable.",
+                "All 23 reviewed built-ins may be selected; plugins, aliases and unknown feature keys are unavailable.",
+                "action.fill accepts explicit nonsecret literals only, never runtime secret substitutes.",
+                "Purchase and resign drafts are proposals only; execution requires fresh per-run approval for the exact bounded consumption scope.",
                 "Protected fields cannot be supplied, including null clearing values.",
                 "Consult every feature schema; full validation is required even with unresolved questions.",
                 "At most 50 steps, 20 groups and 30 signals; tool arguments must fit in 64 KiB.",

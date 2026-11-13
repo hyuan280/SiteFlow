@@ -33,6 +33,148 @@ TARGET = {"purpose": "target", "target": {
     "name": "Example", "base_url": "https://example.com/", "credential_mode": "none"}}
 
 
+@pytest.mark.parametrize("decision", ["approve", "deny", "timeout"])
+def test_global_scheduler_shared_review_without_target(assistant_client, provider, monkeypatch, decision):
+    from app.services.scheduler_settings import SchedulerSettingsService
+
+    client = assistant_client
+    save(client, auto_title=False, auto_authorize_workflow=True)
+    sid = create(client)
+    manager = client.app.state.assistant_manager
+    operation_id = str(uuid4())
+    arguments_ = {"operation_id": operation_id, "patch": {"enabled": False}}
+    if decision == "timeout":
+        monkeypatch.setattr("app.services.assistant_interactions.INTERACTION_TIMEOUT", 0.2)
+    provider[0].extend([
+        tool("get_scheduler_settings", {}, "read"),
+        tool("update_scheduler_settings", arguments_, "update"),
+        tool("update_scheduler_settings", arguments_, "replay"), text("Reported actual result"),
+    ])
+    send(client, sid, content="Disable the global scheduler")
+    item = pending(client, sid)
+    assert item["purpose"] == "scheduler_config"
+    assert item["review"]["scope"] == "global_scheduler"
+    with manager.session_factory() as db:
+        assert SchedulerSettingsService(db, manager.settings).view().enabled
+        revision = manager._decrypt(manager._owned(db, "admin", sid)).get("_target_revision", 0)
+    if decision != "timeout":
+        assert client.post(url(sid, item["id"]), json={"decision": decision}).status_code == 200
+    detail = wait(client, sid)
+    results = [json.loads(m["content"]) for m in detail["messages"]
+               if m.get("tool_name") == "update_scheduler_settings"]
+    assert len(results) == 2
+    assert all(result["ok"] == (decision == "approve") for result in results)
+    assert all("target" not in result for result in results)
+    if decision == "approve":
+        assert results[0]["persisted"] and results[1]["replayed"]
+        assert results[0]["operation_id"] == operation_id
+    else:
+        assert results[0] == results[1]
+        assert results[0]["code"] == "interaction_" + ("denied" if decision == "deny" else "timed_out")
+    with manager.session_factory() as db:
+        assert SchedulerSettingsService(db, manager.settings).view().enabled == (decision != "approve")
+        data = manager._decrypt(manager._owned(db, "admin", sid))
+        assert data.get("_target_revision", 0) == revision and data.get("target") is None
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_cancel_shared_review_commits_before_executor(assistant_client, provider, monkeypatch, decision):
+    from app.models.execution import Run
+
+    client = assistant_client
+    save(client, auto_title=False, auto_authorize_workflow=True)
+    sid = create(client)
+    manager = client.app.state.assistant_manager
+    with manager.session_factory() as db:
+        run = Run(created_by="another-admin", status="running")
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    async def cancel(identifier):
+        assert identifier == run_id
+        with manager.session_factory() as db:
+            assert db.get(Run, run_id).cancel_requested
+            data = manager._decrypt(manager._owned(db, "admin", sid))
+            assert next(iter(data[LEDGER].values()))["status"] == "completed"
+
+    executor_cancel = AsyncMock(side_effect=cancel)
+    monkeypatch.setattr(manager.executor, "cancel", executor_cancel)
+    provider[0].extend([tool("cancel_run", {"run_id": run_id}), text("Cancellation reported")])
+    send(client, sid, content=f"Cancel run {run_id}")
+    item = pending(client, sid)
+    assert item["purpose"] == "run_cancel" and item["review"]["run_id"] == run_id
+    executor_cancel.assert_not_awaited()
+    with manager.session_factory() as db:
+        assert not db.get(Run, run_id).cancel_requested
+    assert client.post(url(sid, item["id"]), json={"decision": decision}).status_code == 200
+    detail = wait(client, sid)
+    result = next(json.loads(m["content"]) for m in detail["messages"] if m.get("tool_name") == "cancel_run")
+    assert result["ok"] == (decision == "approve") and "target" not in result
+    if decision == "approve":
+        executor_cancel.assert_awaited_once_with(run_id)
+        assert result["cancel_requested"] and result["status"] == "running"
+        assert result["worker_cancel_delivered"] and not result["finished"]
+    else:
+        executor_cancel.assert_not_awaited()
+    with manager.session_factory() as db:
+        data = manager._decrypt(manager._owned(db, "admin", sid))
+        assert data.get("_target_revision", 0) == 0 and data.get("target") is None
+
+
+def test_scheduler_completed_subject_does_not_succeed_for_new_operation(assistant_client, provider):
+    from app.services.scheduler_settings import SchedulerSettingsService
+
+    client = assistant_client
+    save(client, auto_title=False)
+    sid = create(client)
+    provider[0].extend([
+        tool("update_scheduler_settings", {"operation_id": str(uuid4()), "patch": {"enabled": enabled}},
+             f"update-{index}") for index, enabled in enumerate((False, True, False))
+    ] + [text("Repeated subject stopped")])
+    send(client, sid, content="Disable then enable the global scheduler")
+    for expected in (False, True):
+        item = pending(client, sid)
+        assert item["review"]["changes"][0]["after"] is expected
+        assert client.post(url(sid, item["id"]), json={"decision": "approve"}).status_code == 200
+    detail = wait(client, sid)
+    results = [json.loads(m["content"]) for m in detail["messages"]
+               if m.get("tool_name") == "update_scheduler_settings"]
+    assert len(results) == 3 and results[0]["ok"] and results[1]["ok"]
+    assert not results[2]["ok"] and results[2]["terminal"]
+    assert results[2]["code"] == "interaction_already_requested"
+    manager = client.app.state.assistant_manager
+    with manager.session_factory() as db:
+        assert SchedulerSettingsService(db, manager.settings).view().enabled
+
+
+@pytest.mark.parametrize("purpose", ["site_config", "consumption", "template_import", "scheduler_config", "run_cancel"])
+def test_internal_interactions_are_not_model_callable(execution, purpose):
+    from app.services.assistant_prompt import tool_definitions
+
+    definition = next(d["function"] for d in tool_definitions()
+                      if d["function"]["name"] == "request_user_interaction")
+    assert purpose not in definition["parameters"]["properties"]["request"]["discriminator"]["mapping"]
+    tools = AssistantTools(execution.manager, OWNER, execution.session_id, None)
+    assert asyncio.run(tools.dispatch("request_user_interaction", {
+        "request": {"purpose": purpose}})) == {"ok": False, "code": "invalid_arguments"}
+    assert not load(execution).get(LEDGER)
+
+
+@pytest.mark.parametrize("value", [KEY, "password=private-value", "Bearer private-value"])
+def test_scheduler_secrets_rejected_before_history(assistant_client, provider, value):
+    client = assistant_client
+    save(client, auto_title=False)
+    sid = create(client)
+    provider[0].append(tool("update_scheduler_settings", {
+        "operation_id": str(uuid4()), "patch": {"cron": value}}))
+    send(client, sid)
+    detail = wait(client, sid)
+    assert "[secret_output]" in detail["messages"][-1]["content"]
+    assert value not in json.dumps(detail)
+    assert not any(m.get("tool_name") == "update_scheduler_settings" for m in detail["messages"])
+
+
 def interaction(request, call_id="interaction"):
     return tool("request_user_interaction", {"request": request}, call_id)
 
@@ -175,17 +317,47 @@ def test_input_secret_and_selection_validation(assistant_client, provider):
     assert wait(client, sid)["target"] is None
 
 
-@pytest.mark.parametrize("interaction_request", [
-    {"purpose": "question", "kind": "input", "title": "Enter your password", "fields": [{"id": "value", "label": "Value"}]},
-    {"purpose": "question", "kind": "input", "title": "验证码", "fields": [{"id": "value", "label": "Value"}]},
-    {"purpose": "target", "target": {**TARGET["target"], "proxy": True}},
-    {"purpose": "authorization", "capability": "execution", "feature_type": "action.fill"},
+@pytest.mark.parametrize("interaction_request,code", [
+    ({"purpose": "question", "kind": "input", "title": "Enter your password", "fields": [{"id": "value", "label": "Value"}]}, "secret_input"),
+    ({"purpose": "question", "kind": "input", "title": "验证码", "fields": [{"id": "value", "label": "Value"}]}, "secret_input"),
+    ({"purpose": "target", "target": {**TARGET["target"], "proxy": True}}, "invalid_arguments"),
+    *[({"purpose": "authorization", "capability": "execution", "feature_type": feature},
+       "execution_feature_denied") for feature in ("flow.jump", "post.buy_card", "plugin.example")],
 ])
-def test_model_cannot_request_secrets_or_arbitrary_patches(execution, interaction_request):
+def test_model_cannot_request_secrets_or_arbitrary_patches(execution, interaction_request, code):
     async def scenario():
         tools = AssistantTools(execution.manager, OWNER, execution.session_id, execution.target)
-        result = await tools.dispatch("request_user_interaction", {"request": interaction_request})
-        assert not result["ok"] and not load(execution).get(PENDING)
+        result = await asyncio.wait_for(tools.dispatch(
+            "request_user_interaction", {"request": interaction_request}), timeout=0.5)
+        assert result == {"ok": False, "code": code}
+        assert not load(execution).get(PENDING) and not load(execution).get(LEDGER)
+        assert not execution.manager._interaction_waiters
+        execution.manager._worker.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("feature", ["action.fill", "challenge.2fa"])
+def test_supported_private_features_request_host_approval(execution, feature):
+    mutate(execution, lambda data: data["target"].update(credential_mode="bitwarden"))
+
+    async def scenario():
+        manager, sid = execution.manager, execution.session_id
+        tools = AssistantTools(manager, OWNER, sid, None)
+        task = asyncio.create_task(tools.dispatch("request_user_interaction", {"request": {
+            "purpose": "authorization", "capability": "execution", "feature_type": feature}}))
+        async with asyncio.timeout(0.5):
+            while not load(execution).get(PENDING):
+                assert not task.done(), task.result()
+                await asyncio.sleep(0)
+        item = load(execution)[PENDING]
+        assert item["review"]["feature_type"] == feature
+        assert feature in item["review"]["execution_features"]
+        assert item["review"]["credential_consent"]
+        await respond_interaction(manager, OWNER, sid, item["id"], InteractionResponse(decision="deny"))
+        assert (await asyncio.wait_for(task, timeout=0.5))["code"] == "interaction_denied"
+        assert not load(execution).get(PENDING)
+        manager._worker.assert_not_awaited()
+
     asyncio.run(scenario())
 
 
@@ -429,7 +601,7 @@ def test_execution_gate_continues_same_call_persists_overall_permission(executio
         assert execution.manager._worker.await_count == 0
         assert item["review"]["feature_type"] == "action.wait"
         assert item["review"]["execution_features"] == sorted(
-            key for key in SUPPORTED_FEATURES if not key.startswith("auth."))
+            key for key in SUPPORTED_FEATURES if not key.startswith("auth.") and key != "challenge.2fa")
         assert not item["review"]["credential_consent"]
         await respond_interaction(execution.manager, OWNER, execution.session_id, item["id"], InteractionResponse(decision="approve"))
         assert (await task)["ok"]
@@ -439,21 +611,25 @@ def test_execution_gate_continues_same_call_persists_overall_permission(executio
     asyncio.run(scenario())
     assert execution.manager._worker.await_count == 2
     assert load(execution)["target"]["execution_features"] == sorted(
-        key for key in SUPPORTED_FEATURES if not key.startswith("auth."))
+        key for key in SUPPORTED_FEATURES if not key.startswith("auth.") and key != "challenge.2fa")
     assert load(execution)["target"]["allow_sign"]
 
 
 @pytest.mark.parametrize("name,args", [
     ("list_features", {}), ("get_feature_schema", {"feature_type": "action.wait"}),
 ])
-def test_catalog_does_not_read_or_decrypt_target(execution, monkeypatch, name, args):
-    def forbidden(*args, **kwargs):
-        pytest.fail("Catalog tools must not read assistant session state")
+def test_catalog_checks_session_without_requiring_target(execution, monkeypatch, name, args):
+    owned = execution.manager._owned
+    checked = []
 
-    monkeypatch.setattr(execution.manager, "_owned", forbidden)
-    monkeypatch.setattr(execution.manager, "_decrypt", forbidden)
+    def authorized_session(*args, **kwargs):
+        checked.append(True)
+        return owned(*args, **kwargs)
+
+    monkeypatch.setattr(execution.manager, "_owned", authorized_session)
     tools = AssistantTools(execution.manager, OWNER, execution.session_id, None)
     assert asyncio.run(tools.dispatch(name, args))["ok"]
+    assert checked
 
 
 @pytest.mark.parametrize("outcome", ["deny", "timeout"])

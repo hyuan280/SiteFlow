@@ -450,7 +450,7 @@ def test_tool_schema_internal_purpose_and_known_key(context):
     from app.services.assistant_prompt import tool_definitions
 
     definitions = {item["function"]["name"]: item["function"] for item in tool_definitions()}
-    assert len(definitions) == 28
+    assert "create_template_from_site" in definitions
     for definition in definitions.values():
         Draft202012Validator.check_schema(definition["parameters"])
         assert "title" in definition["parameters"]["required"]

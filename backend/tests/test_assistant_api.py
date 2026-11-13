@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import threading
 import time
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import httpx
@@ -229,7 +230,8 @@ def test_all_routes_enforce_owner(assistant_client, method, suffix):
         kwargs["json"] = {"content": "hello", "consent_to_send": True, "request_id": str(uuid4())}
     response = getattr(client, method)(f"{ROOT}/{identifier}{suffix}", **kwargs)
     assert response.status_code == 404, response.text
-    assert client.get(ROOT).json() == {"items": []}
+    assert client.get(ROOT).json() == {"items": [], "offset": 0, "limit": 100,
+                                       "next_offset": None, "truncated": False}
 
 
 @pytest.mark.parametrize("suffix,method", [("", "post"), ("/target", "put"),
@@ -744,7 +746,7 @@ def test_browser_and_proposal_flow_no_workflow_writes(assistant_client, provider
     identifier = create(client)
     confirmed = target(client, identifier, base_url="https://EXAMPLE.com:443")
     assert confirmed["target"] == {
-        **{k: v for k, v in TARGET.items() if k != "browser_consent"},
+        **TARGET,
         "run_lane_policy": "auto", "workflow_site_id": None, "workflow_consent": False,
     }
     before = counts(client)
@@ -975,9 +977,9 @@ def test_sse_snapshot_and_heartbeat_are_read_only(assistant_client, monkeypatch)
 
         request.is_disconnected = disconnected
         with manager.session_factory() as db:
-            current = db.scalar(select(AuthSession))
-            monkeypatch.setattr(api, "get_readonly_current_session", lambda *args: current)
-            response = await api.events(UUID(identifier), request, current.username, manager)
+            owner = db.scalar(select(AuthSession.username))
+        monkeypatch.setattr(api, "get_readonly_current_session", lambda *args: SimpleNamespace(username=owner))
+        response = await api.events(UUID(identifier), request, owner, manager)
         chunks = [chunk async for chunk in response.body_iterator]
         assert chunks[0].startswith("event: update\ndata: ")
         assert json.loads(chunks[0].split("data: ", 1)[1])["id"] == identifier

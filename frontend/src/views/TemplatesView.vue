@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { onBeforeRouteLeave, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 
@@ -19,9 +19,11 @@ import type {
   ResolvedWorkflow,
   ResolvedSignalView,
   SignalForm,
+  SiteOption,
   StepForm,
   TemplateDetail,
   TemplateSummary,
+  TemplateSiteImport,
   WorkflowHistoryTarget,
 } from "@/types/workflow";
 import {
@@ -90,6 +92,27 @@ const copyOpen = ref(false);
 const copying = ref(false);
 const templateImportInput = ref<HTMLInputElement | null>(null);
 const templateImporting = ref(false);
+const siteImportOpen = ref(false);
+const siteImportLoading = ref(false);
+const siteOptions = ref<SiteOption[]>([]);
+const preserveImportedLocal = ref(false);
+let editorGeneration = 0;
+let siteImportGeneration = 0;
+let disposed = false;
+
+watch(editorOpen, (open) => {
+  if (!open) {
+    editorGeneration++;
+    siteImportGeneration++;
+    siteImportOpen.value = false;
+    siteImportLoading.value = false;
+  }
+}, { flush: "sync" });
+onBeforeUnmount(() => {
+  disposed = true;
+  editorGeneration++;
+  siteImportGeneration++;
+});
 
 const isEditing = computed(() => editingId.value !== null);
 const title = computed(() => (isEditing.value ? "编辑模板" : "新建模板"));
@@ -441,25 +464,106 @@ async function loadChain(templateId: number | undefined): Promise<TemplateDetail
 }
 
 async function loadParentChain(): Promise<void> {
+  const editor = editorGeneration;
+  const parentId = form.parent_id;
+  const current = () => !disposed && editorOpen.value && editor === editorGeneration &&
+    parentId === form.parent_id;
   if (!form.parent_id) {
     chain.value = [];
     return;
   }
   try {
-    chain.value = await loadChain(form.parent_id);
+    const loaded = await loadChain(parentId);
+    if (current()) chain.value = loaded;
   } catch (cause) {
+    if (!current()) return;
     if (await handleUnauthorized(cause)) return;
     chain.value = [];
   }
 }
 
 function resetEditor(): void {
+  preserveImportedLocal.value = false;
+  editorGeneration++;
+  siteImportGeneration++;
+  siteImportOpen.value = false;
+  siteImportLoading.value = false;
   editingRevision.value = null;
   editingHistoryKey.value = null;
   Object.assign(form, emptyForm());
   editorError.value = "";
   chain.value = [];
   groupsLocked.value = false;
+}
+
+async function openSiteImport(): Promise<void> {
+  if (loadingForm.value || saving.value) return;
+  const generation = ++siteImportGeneration;
+  const editor = editorGeneration;
+  siteImportOpen.value = true;
+  siteImportLoading.value = true;
+  const current = () => !disposed && editorOpen.value && siteImportOpen.value &&
+    generation === siteImportGeneration && editor === editorGeneration;
+  try {
+    const options = await apiRequest<SiteOption[]>("/sites?view=options");
+    if (current()) siteOptions.value = options;
+  } catch (cause) {
+    if (!current()) return;
+    if (!(await handleUnauthorized(cause))) {
+      ElMessage.error(cause instanceof Error ? cause.message : "加载站点失败");
+    }
+  } finally {
+    if (current()) siteImportLoading.value = false;
+  }
+}
+
+async function importFromSite(id: number): Promise<void> {
+  if (loadingForm.value || saving.value) return;
+  const generation = ++siteImportGeneration;
+  const editor = editorGeneration;
+  const baseline = JSON.stringify(form);
+  const current = () => !disposed && editorOpen.value && siteImportOpen.value &&
+    generation === siteImportGeneration && editor === editorGeneration;
+  siteImportLoading.value = true;
+  try {
+    await ElMessageBox.confirm(
+      "将替换当前表单的父模板、步骤、分组和信号；名称、描述和启用状态不变。导入后仍需手动保存。",
+      "从站点导入配置",
+      { confirmButtonText: "导入到表单", cancelButtonText: "取消", type: "warning" },
+    );
+    if (!current()) return;
+    const candidate = await apiRequest<TemplateSiteImport>(`/templates/import-from-site/${id}`);
+    if (!current()) return;
+    const loadedChain = candidate.parent_id ? await loadChain(candidate.parent_id) : [];
+    if (!current()) return;
+    if (JSON.stringify(form) !== baseline) {
+      ElMessage.warning("表单已变化，未覆盖当前修改，请重新导入");
+      return;
+    }
+    if (loadedChain.some((item) => item.id === editingId.value)) {
+      throw new Error("不能导入会造成模板循环继承的站点配置");
+    }
+    form.parent_id = candidate.parent_id ?? undefined;
+    form.steps = candidate.steps.map((step) => stepToForm({
+      ...step, feature_version: 1, category: "", source: null,
+    }));
+    form.groups = candidate.groups.map(groupToForm);
+    form.signals = candidate.signals.map(signalToForm);
+    preserveImportedLocal.value = true;
+    chain.value = loadedChain;
+    interactionStarted.value = true;
+    siteImportOpen.value = false;
+    ElMessage.success("已导入到表单，保存模板后才会生效；源站点未修改");
+  } catch (cause) {
+    if (!current() || cause === "cancel" || cause === "close") return;
+    if (!(await handleUnauthorized(cause))) {
+      ElMessage.error(cause instanceof Error ? cause.message : "从站点导入失败");
+    }
+  } finally {
+    if (generation === siteImportGeneration && editor === editorGeneration && !disposed) {
+      siteImportLoading.value = false;
+    }
+  }
 }
 
 function openCopyTemplate(): void {
@@ -510,8 +614,11 @@ async function openEdit(id: number): Promise<void> {
   resetEditor();
   editorOpen.value = true;
   editingId.value = id;
+  const generation = editorGeneration;
+  const current = () => !disposed && editorOpen.value && generation === editorGeneration;
   try {
     const detail = await apiRequest<TemplateDetail>(`/templates/${id}`);
+    if (!current()) return;
     form.name = detail.name;
     editingRevision.value = detail.version;
     editingHistoryKey.value = detail.history_key;
@@ -519,18 +626,22 @@ async function openEdit(id: number): Promise<void> {
     form.parent_id = detail.parent_id ?? undefined;
     form.enabled = detail.enabled;
     const loadedChain = form.parent_id ? await loadChain(form.parent_id) : [];
+    if (!current()) return;
     chain.value = loadedChain;
     form.steps = detail.steps.map(stepToForm);
     form.groups = detail.groups.map(groupToForm);
     form.signals = detail.signals.map(signalToForm);
     groupsLocked.value = detail.groups_locked && detail.groups.length > 0;
   } catch (cause) {
+    if (!current()) return;
     if (await handleUnauthorized(cause)) return;
     editorError.value = cause instanceof Error ? cause.message : "加载模板失败";
   } finally {
     await nextTick();
+    if (!current()) return;
     loadingForm.value = false;
     await nextTick();
+    if (!current()) return;
     formBaseline.value = JSON.stringify(form);
     interactionStarted.value = false;
   }
@@ -633,7 +744,7 @@ function buildPayload(): Record<string, unknown> {
 }
 
 async function save(): Promise<void> {
-  if (saving.value || loadingForm.value) return;
+  if (saving.value || loadingForm.value || siteImportLoading.value) return;
   editorError.value = "";
   try {
     if (editingId.value !== null && (editingRevision.value === null || !editingHistoryKey.value)) throw new Error("请重新打开模板以加载配置版本和对象身份");
@@ -644,7 +755,8 @@ async function save(): Promise<void> {
   }
   saving.value = true;
   try {
-    const url = editingId.value === null ? "/templates" : `/templates/${editingId.value}`;
+    const path = editingId.value === null ? "/templates" : `/templates/${editingId.value}`;
+    const url = preserveImportedLocal.value ? `${path}?preserve_local=true` : path;
     await apiRequest(url, {
       method: editingId.value === null ? "POST" : "PUT",
       body: JSON.stringify(buildPayload()),
@@ -816,6 +928,12 @@ onMounted(load);
             <strong>模板配置</strong>
             <span class="muted">名称、继承关系和描述</span>
             <el-button
+              size="small"
+              plain
+              :disabled="loadingForm || saving || siteImportLoading"
+              @click="openSiteImport"
+            >从站点导入配置</el-button>
+            <el-button
               v-if="!isEditing"
               size="small"
               plain
@@ -901,6 +1019,15 @@ onMounted(load);
       />
     </el-card>
   </section>
+
+  <CopyConfigDialog
+    v-model="siteImportOpen"
+    title="从站点导入配置"
+    :items="siteOptions.map((site) => ({ id: site.id, label: site.name, description: site.template_name ? `父模板：${site.template_name}` : '无父模板' }))"
+    :loading="siteImportLoading"
+    hint="仅导入本地步骤、分组、信号及父模板引用；不复制站点设置或凭据，不会自动保存。"
+    @confirm="importFromSite"
+  />
 
   <CopyConfigDialog
     v-model="copyOpen"

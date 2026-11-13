@@ -2,6 +2,7 @@ export interface AssistantSettingsValues {
   max_tool_calls: number;
   max_model_rounds: number;
   max_parallel_tool_calls: number;
+  max_auth_uses_per_turn: number;
   turn_timeout_seconds: number;
   max_tokens: number | null;
   context_max_tokens: number;
@@ -22,6 +23,7 @@ export const assistantSettingBounds = {
   max_tool_calls: [1, 200],
   max_model_rounds: [1, 100],
   max_parallel_tool_calls: [1, 8],
+  max_auth_uses_per_turn: [1, 20],
   turn_timeout_seconds: [30, 1800],
   context_max_tokens: [16000, 1000000],
 } as const;

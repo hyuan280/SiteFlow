@@ -46,7 +46,7 @@ class AssistantSecretContext:
     action_started: bool = False
 
     async def resolve(self, step):
-        if (self.used or self.purpose not in {"auth.form_login", "auth.password_verify"}
+        if (self.used or self.purpose not in {"auth.form_login", "auth.password_verify", "challenge.2fa"}
                 or step.get("feature_type") != self.purpose or step.get("step_key") != self.step_key):
             raise RuntimeError("Secret request denied")
         self.used = True

@@ -83,10 +83,18 @@ def records(assistant_client):
     ({"credential_mode": "cookie", "execution_consent": True, "credential_consent": True,
       "execution_features": ["auth.form_login"]}, "credentials_unavailable"),
     ({"credential_mode": "none", "execution_consent": True, "credential_consent": True,
-      "execution_features": ["auth.password_verify"]}, "credentials_unavailable"),
+       "execution_features": ["auth.password_verify"]}, "credentials_unavailable"),
+    ({"execution_consent": True, "execution_features": ["challenge.2fa"], "allow_sign": True},
+     "credential_consent_required"),
+    ({"execution_consent": True, "execution_features": ["challenge.2fa"],
+      "credential_consent": True, "allow_sign": True}, "credential_site_required"),
+    ({"credential_mode": "cookie", "execution_consent": True, "credential_consent": True,
+      "execution_features": ["challenge.2fa"], "allow_sign": True}, "credentials_unavailable"),
     *[({"execution_consent": True, "execution_features": [feature]}, "sign_consent_required")
-      for feature in ("sign.button", "sign.unit3d_claim", "action.click",
-                      "challenge.altcha", "challenge.slider")],
+       for feature in ("sign.button", "sign.unit3d_claim", "action.click",
+                       "challenge.altcha", "challenge.slider", "action.fill",
+                       "challenge.turnstile", "challenge.image_captcha", "challenge.grid_captcha",
+                       "sign.iframe.image_captcha", "sign.image_quiz")],
 ])
 def test_target_cross_field_errors_are_atomic(assistant_client, changes, code):
     client = assistant_client
@@ -156,7 +164,7 @@ def test_saved_site_binding_requires_exact_origin(
         assert records["binding"]["history_key"].encode() not in row.ciphertext
     assert json.loads(history[1]["content"].split(": ", 1)[1]) == public
     exposed = json.dumps([response.json(), history, client.get(ROOT).json()])
-    for value in ("_credential_binding", "history_key", USERNAME, PASSWORD):
+    for value in ("_credential_binding", records["binding"]["history_key"], USERNAME, PASSWORD):
         assert value not in exposed
 
 
@@ -178,15 +186,15 @@ def test_overall_target_grant_freezes_reviewed_features_and_private_binding(
     assert response.status_code == 200, response.text
     public = response.json()["target"]
     features = sorted(key for key in SUPPORTED_FEATURES
-                      if credentials_available or not key.startswith("auth."))
+                      if credentials_available or not (key.startswith("auth.") or key == "challenge.2fa"))
     assert public == {
-        **payload, "base_url": "https://example.com/", "confirmed": True,
+        **payload, "base_url": "https://example.com/", "confirmed": True, "browser_consent": True,
         "execution_consent": True, "allow_sign": True,
         "credential_consent": credentials_available, "execution_features": features,
         "run_lane_policy": "auto", "workflow_site_id": None, "workflow_consent": False,
     }
-    assert {"action.click", "sign.button", "challenge.slider"} <= set(features)
-    assert not any(key.startswith(("post.", "plugin.")) or key == "action.fill"
+    assert {"action.click", "action.fill", "sign.button", "challenge.slider", "flow.result"} <= set(features)
+    assert not any(key.startswith(("post.", "plugin.")) or key == "flow.jump"
                    for key in features)
     private, history = manager._history("admin", identifier)
     assert private == ({**public, "_credential_binding": records["binding"]} if bound else public)
@@ -199,7 +207,7 @@ def test_overall_target_grant_freezes_reviewed_features_and_private_binding(
     assert fresh.detail("admin", identifier)["target"] == public
     assert json.loads(history[1]["content"].split(": ", 1)[1]) == public
     exposed = json.dumps([response.json(), history, client.get(ROOT).json()])
-    for value in ("_credential_binding", "history_key", USERNAME, PASSWORD):
+    for value in ("_credential_binding", records["binding"]["history_key"], USERNAME, PASSWORD):
         assert value not in exposed
     tools = AssistantTools(manager, "admin", identifier, private)
     assert asyncio.run(tools.dispatch("browser_open", {"lane_key": "general"})) == {
@@ -216,7 +224,7 @@ def test_overall_grant_normalizes_legacy_permission_fields(assistant_client):
     assert public["execution_consent"] is True and public["allow_sign"] is True
     assert public["credential_consent"] is False
     assert public["execution_features"] == sorted(
-        key for key in SUPPORTED_FEATURES if not key.startswith("auth.")
+        key for key in SUPPORTED_FEATURES if not key.startswith("auth.") and key != "challenge.2fa"
     )
 
 
@@ -225,10 +233,10 @@ def test_legacy_targets_keep_their_concrete_grants_after_reload(assistant_client
     identifier = create(client)
     original = target(client, identifier, execution_consent=True,
                       execution_features=["action.wait"])["target"]
-    assert original == {key: value for key, value in {
+    assert original == {
         **TARGET, "execution_consent": True, "execution_features": ["action.wait"],
         "run_lane_policy": "auto", "workflow_site_id": None, "workflow_consent": False,
-    }.items() if key != "browser_consent"}
+    }
     manager = client.app.state.assistant_manager
     fresh = AssistantManager(manager.session_factory, manager.settings, manager.crypto)
     fresh.recover()
@@ -241,17 +249,22 @@ def test_legacy_targets_keep_their_concrete_grants_after_reload(assistant_client
 def test_all_recognized_tool_schemas_and_local_fragment_references():
     definitions = tool_definitions()
     names = [item["function"]["name"] for item in definitions]
-    assert len(names) == len(set(names)) == 28
+    assert len(names) == len(set(names)) == 39
+    assert "create_template_from_site" in names
     assert set(names) == {
         "list_features", "get_feature_schema", "validate_workflow_draft",
         "submit_workflow_draft", "browser_open", "browser_observe", "browser_navigate",
+        "clear_bound_site_cookies",
         "browser_inspect", "browser_check_selector",
         "check_site", "execute_step", "list_sites", "get_site_config", "list_templates",
         "get_template_config", "get_system_status", "list_recent_runs", "get_run_summary",
         "get_tool_result", "request_user_interaction",
         "browser_screenshot", "browser_refresh", "retry_step",
         "import_workflow_draft", "run_site", "get_run_results", "get_run_log",
-        "update_site_config",
+        "update_site_config", "create_template_from_site",
+        "get_scheduler_settings", "update_scheduler_settings", "cancel_run",
+        "list_workflow_versions", "get_workflow_version", "list_run_artifacts",
+        "read_artifact_log", "read_artifact_image", "submit_takeover_conclusion",
     }
     for definition in definitions:
         schema = definition["function"]["parameters"]
@@ -389,10 +402,13 @@ def test_general_stopped_status_reaches_model_without_blocking_interaction_brows
     assert next(message for message in model_request["messages"]
                 if message.get("tool_call_id") == "status")["content"] == logs[0]["content"]
     prompt = model_request["messages"][0]["content"]
-    section = prompt.split("BROWSER LANES AND FAILURES:\n", 1)[1].split("\n\n", 1)[0]
-    assert "get_system_status reporting general as stopped is unrelated" in section
-    assert "start the selected interaction lane" in section
-    assert "use the actual returned lane and reason/diagnostics, not speculation" in section
+    section = " ".join(prompt.split("BROWSER LANES AND FAILURES:\n", 1)[1].split("\n\n", 1)[0].split())
+    assert "A stopped general lane does not prevent assistant browsing" in section
+    assert all(phrase in section for phrase in (
+        "Assistant browsing never uses general/proxy_general",
+        "Call browser_open to start the selected lane",
+        "Diagnose failures from the returned lane/reason/diagnostics, not guesses",
+    ))
     worker_requests = [request for request in provider[1]
                        if "/assistant-browser/" in str(request.url)]
     assert len(worker_requests) == 1
@@ -615,30 +631,32 @@ def test_read_template_browser_and_real_auth_execution_keep_credentials_worker_o
     provider[0].extend([
         tool("get_template_config", {"template_id": records["template_id"]}, "template"),
         tool("browser_open", call_id="open"),
-        browser_open_response(worker_ids, "interaction", expires),
-        tool("execute_step", args, "login"),
     ])
     if not stale:
-        provider[0].append(executed)
+        provider[0].extend([browser_open_response(worker_ids, "interaction", expires),
+                            tool("execute_step", args, "login"), executed])
     provider[0].append(text("Inspect login evidence before proceeding"))
     title_provider[0].append(text('{"title":"Inspect saved login"}'))
     send(client, identifier, content="Use the template to inspect this saved site's login")
     detail = wait(client, identifier)
     logs = [item for item in detail["messages"] if item["role"] == "tool"]
-    assert [item["tool_name"] for item in logs] == [
-        "get_template_config", "browser_open", "execute_step",
-    ]
-    assert [item["status"] for item in logs] == ["success", "success", "error" if stale else "success"]
+    assert [item["tool_name"] for item in logs] == (
+        ["get_template_config", "browser_open"] if stale else
+        ["get_template_config", "browser_open", "execute_step"])
+    assert [item["status"] for item in logs] == (["success", "error"] if stale else ["success"] * 3)
     result = json.loads(logs[-1]["content"])
-    assert result["code"] == ("credential_binding_changed" if stale else "step_succeeded")
+    assert result["code"] == ("cookie_binding_changed" if stale else "step_succeeded")
     assert resolved == ([] if stale else [records["site_id"]])
     execute_requests = [request for request in provider[1] if str(request.url).endswith("/execute")]
     assert len(execute_requests) == (0 if stale else 1)
-    assert detail["browser"]["status"] == "ready"
+    if stale:
+        assert detail["browser"] is None
+    else:
+        assert detail["browser"]["status"] == "ready"
     assert detail["title"] == "Inspect saved login"
     assert len(title_provider[1]) == 1
     assert counts(client) == before
-    scope = manager.browsers[identifier]
+    scope = manager.browsers.get(identifier)
     _, history = manager._history("admin", identifier)
     fresh = AssistantManager(manager.session_factory, manager.settings, manager.crypto)
     persisted = fresh.detail("admin", identifier)
@@ -652,11 +670,12 @@ def test_read_template_browser_and_real_auth_execution_keep_credentials_worker_o
             AssistantMessage.session_id == identifier,
         ))]
     model_requests = [request for request in provider[1] if "chat/completions" in str(request.url)]
-    for value in (USERNAME, PASSWORD, scope.token, scope.session_id,
+    for value in (USERNAME, PASSWORD, *((scope.token, scope.session_id) if scope else ()),
                   "_credential_binding", "_execution_operations", records["binding"]["history_key"]):
         assert value not in json.dumps([detail, history, messages])
         assert all(value not in request.content.decode() for request in model_requests + title_provider[1])
-    provider[0].append({"closed": True})
+    if not stale:
+        provider[0].append({"closed": True})
     assert client.post(f"{ROOT}/{identifier}/cancel").status_code == 200
     assert not provider[0]
 

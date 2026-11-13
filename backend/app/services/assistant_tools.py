@@ -43,7 +43,7 @@ class _AssistantWorkflowService(WorkflowService):
 ALLOWED_FEATURES = [
     feature.key for feature in FEATURE_LIST
     if feature.generation_hints is not None
-    and not feature.key.startswith(("post.", "plugin.")) and feature.key != "action.fill"
+    and not feature.key.startswith("plugin.")
 ]
 
 
@@ -60,7 +60,7 @@ class AssistantTools:
         self.target = target
         self.config = config or {}
         self.consulted: set[str] = set()
-        self.turn = turn or {
+        self.turn = turn or manager._active_turns.get(session_id) or {
             "id": str(uuid4()), "deadline": time.monotonic() +
             self.config.get("_assistant_settings", {}).get("turn_timeout_seconds", 180),
         }
@@ -69,17 +69,45 @@ class AssistantTools:
 
     async def dispatch(self, name: str, arguments: dict) -> dict:
         from app.services.assistant_interactions import ensure_permission, request_interaction
+        from app.services.assistant_takeover import takeover_tool_allowed
+        from app.services.assistant import AssistantError
 
+        try:
+            decision = takeover_tool_allowed(self, name, arguments)
+        except AssistantError as exc:
+            return failure("tool_result_unavailable" if name == "get_tool_result" else exc.code)
+        if decision is not True:
+            return decision
         if self.interaction_blocked:
             return {**failure("prerequisite_missing"), "terminal": True, "blocking": True}
+        if name == "clear_bound_site_cookies":
+            from app.services.assistant_cookies import clear_bound_site_cookies
+
+            return await clear_bound_site_cookies(self, arguments)
+        if name == "submit_takeover_conclusion":
+            from app.services.assistant_takeover_conclusions import submit_conclusion
+
+            return await submit_conclusion(self, arguments)
+        from app.services import assistant_operations, assistant_scheduler
+
+        if name in {item["function"]["name"] for item in assistant_scheduler.tool_definitions()}:
+            return await assistant_scheduler.dispatch(self, name, arguments)
+        if name in {item["function"]["name"] for item in assistant_operations.tool_definitions()}:
+            return await assistant_operations.dispatch(self, name, arguments)
         if name == "update_site_config":
             from app.services.assistant_site_config import request_site_config
 
             return await request_site_config(self, arguments)
+        if name == "create_template_from_site":
+            from app.services.assistant_templates import dispatch
+
+            return await dispatch(self, name, arguments)
         if name == "request_user_interaction":
             if not isinstance(arguments, dict) or set(arguments) != {"request"}:
                 return failure("invalid_arguments")
-            if isinstance(arguments["request"], dict) and arguments["request"].get("purpose") == "site_config":
+            if isinstance(arguments["request"], dict) and arguments["request"].get("purpose") in {
+                "site_config", "consumption", "template_import", "scheduler_config", "run_cancel", "cookie_clear",
+            }:
                 return failure("invalid_arguments")
             result = await request_interaction(self, arguments["request"])
             request = arguments["request"]
@@ -122,7 +150,13 @@ class AssistantTools:
         if name in {"import_workflow_draft", "run_site", "get_run_results", "get_run_log"}:
             from app.services.assistant_workflows import AssistantWorkflows
 
-            workflows = AssistantWorkflows(self.manager, self.owner, self.session_id, self.target)
+            workflows = AssistantWorkflows(
+                self.manager, self.owner, self.session_id, self.target, turn=self.turn,
+                auth_limit=self.config.get("_assistant_settings", {}).get("max_auth_uses_per_turn"))
+            if name == "run_site":
+                from app.services.assistant_consumption import run_with_consumption_approval
+
+                return await run_with_consumption_approval(self, workflows)
             result = await workflows.dispatch(name, arguments)
             self.target = workflows.target
             return result
@@ -133,7 +167,8 @@ class AssistantTools:
                 return failure("invalid_arguments")
             return await run_with_retry_approval(
                 self.manager, self.owner, self.session_id, arguments["operation_id"],
-                turn=self.turn, invocation={"turn_id": self.turn["id"], **self.call_context})
+                turn=self.turn, invocation={"turn_id": self.turn["id"], **self.call_context},
+                auth_limit=self.config.get("_assistant_settings", {}).get("max_auth_uses_per_turn"))
         if name == "get_tool_result":
             if (not isinstance(arguments, dict) or set(arguments) - {"message_id", "offset", "limit"}
                     or type(arguments.get("message_id")) is not int or arguments["message_id"] < 1
@@ -151,6 +186,7 @@ class AssistantTools:
             return await AssistantExecution(
                 self.manager, self.owner, self.session_id, self.target,
                 turn=self.turn, invocation={"turn_id": self.turn["id"], **self.call_context},
+                auth_limit=self.config.get("_assistant_settings", {}).get("max_auth_uses_per_turn"),
             ).execute(arguments)
         from app.services.assistant_data import AssistantData
 
@@ -205,7 +241,8 @@ class AssistantTools:
             if name == "browser_navigate":
                 try:
                     value = arguments.get("path", arguments.get("url"))
-                    if (not isinstance(value, str) or not value or len(value) > 2048
+                    maximum = 2048 if "path" in arguments else 4096
+                    if (not isinstance(value, str) or not value or len(value) > maximum
                             or contains_redaction(value)):
                         raise ValueError
                     if "path" in arguments:

@@ -17,7 +17,7 @@ from worker.assistant_browser import AssistantBrowser
 
 
 @pytest.mark.parametrize("failure", ["executor", "postcheck", "snapshot", "snapshot_timeout", "evidence_budget"])
-def test_failure_evidence_diagnostics_cache_and_no_retry(public_dns, monkeypatch, failure):
+def test_failure_evidence_cache_and_auth_category_continuation(public_dns, monkeypatch, failure):
     async def run():
         manager = Manager()
         browser = AssistantBrowser(manager)
@@ -71,10 +71,40 @@ def test_failure_evidence_diagnostics_cache_and_no_retry(public_dns, monkeypatch
         assert session.failure is None
         assert await browser.execute(session_id, payload) == result
         mock.assert_awaited_once()
-        with pytest.raises(HTTPException) as error:
-            await browser.execute(session_id, payload.model_copy(update={"operation_id": uuid.uuid4()}))
-        assert error.value.status_code == 409
         monkeypatch.setattr(browser, "_collect", original_collect)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def followup(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            kwargs["secret_payload"]["_assistant_secret_context"].action_started = True
+            return await step(*args, **kwargs)
+
+        mock.side_effect = followup
+        fresh = request("auth.password_verify", {
+            "password_selector": ["#p"], "submit_selector": ["#s"],
+        }, credentials={"password": "password-private"})
+        pending = asyncio.create_task(browser.execute(session_id, fresh))
+        try:
+            await entered.wait()
+            with pytest.raises(HTTPException, match="Browser operation in progress"):
+                await browser.execute(session_id, fresh)
+            with pytest.raises(HTTPException, match="Browser session busy"):
+                await browser.execute(session_id, fresh.model_copy(update={"operation_id": uuid.uuid4()}))
+            assert await browser.execute(session_id, payload) == result
+        finally:
+            release.set()
+            continued = await pending
+        if failure == "snapshot_timeout":
+            session.deadline = time.monotonic() + 60
+        assert continued["status"] == (
+            "success" if failure in {"snapshot", "evidence_budget"} else "unknown")
+        assert continued["operation_id"] == str(fresh.operation_id)
+        assert await browser.execute(session_id, fresh) == continued
+        assert await browser.execute(session_id, payload) == result
+        assert mock.await_count == 2
+        assert session.uncertain and str(payload.operation_id) in session.unresolved_operations
+        assert session.operations[str(payload.operation_id)][1] == result
         assert "warnings" not in await browser.observe(session_id, TOKEN)
         assert "private" not in json.dumps(result)
         manager.page.close.assert_not_awaited()
@@ -112,7 +142,10 @@ def test_operation_preserves_failure_arriving_during_evidence(public_dns, monkey
     asyncio.run(run())
 
 
-def test_real_chromium_query_login_and_same_origin_action_lifecycle(public_dns, caplog):
+def test_real_chromium_query_login_and_action_category_continuation(public_dns, caplog, monkeypatch):
+    run_step = AsyncMock(wraps=executor._run_step)
+    monkeypatch.setattr(executor, "_run_step", run_step)
+
     async def run():
         from playwright.async_api import async_playwright
 
@@ -183,8 +216,17 @@ def test_real_chromium_query_login_and_same_origin_action_lifecycle(public_dns, 
                     payload.site_origin = origin
                     payload.step["timeout_seconds"] = 2
                     first = len(seen)
+                    executions = run_step.await_count
                     result = await browser.execute(session_id, payload)
+                    assert run_step.await_count == executions + 1
                     assert result["status"] == ("success" if allowed else "unknown"), (script, result)
+                    if page.url.startswith(origin):
+                        assert result["after"]["elements"], result
+                        assert "warnings" not in await browser.observe(session_id, TOKEN)
+                    else:
+                        assert result["diagnostics"]["evidence_errorcode"] == "browser_url_denied"
+                        with pytest.raises(HTTPException):
+                            await browser.observe(session_id, TOKEN)
                     if allowed:
                         assert result["after"]["elements"] and result["after"]["url"].split("#")[0] == origin + "/home"
                         posts = [row for row in seen[first:] if row[0] == "POST"]
@@ -193,19 +235,40 @@ def test_real_chromium_query_login_and_same_origin_action_lifecycle(public_dns, 
                     else:
                         assert result["diagnostics"]["reason"] == reason, (script, result)
                         assert not any(row[0] == "POST" for row in seen[first:])
-                        with pytest.raises(HTTPException) as error:
-                            await browser.execute(session_id, payload.model_copy(update={"operation_id": uuid.uuid4()}))
-                        assert error.value.status_code == 409
+                        assert await browser.execute(session_id, payload) == result
+                        assert run_step.await_count == executions + 1
+                        await browser.navigate(session_id, TOKEN, url)
+                        await page.evaluate("""() => {
+                            window.continuationClicks = 0;
+                            const button = document.createElement('button');
+                            button.id = 'continue'; button.type = 'button'; button.textContent = 'Continue';
+                            button.onclick = () => window.continuationClicks++;
+                            document.body.append(button);
+                        }""")
+                        fresh = request("action.click", {"selector": ["#continue"]})
+                        fresh.site_origin = origin
+                        fresh.step["timeout_seconds"] = 2
+                        continued = await browser.execute(session_id, fresh)
+                        assert continued["status"] == "success", (script, continued)
+                        assert continued["operation_id"] == str(fresh.operation_id)
+                        assert await browser.execute(session_id, fresh) == continued
+                        assert await browser.execute(session_id, payload) == result
+                        assert run_step.await_count == executions + 2
+                        assert await page.evaluate("continuationClicks") == 1
+                        assert session.uncertain and str(payload.operation_id) in session.unresolved_operations
+                        assert session.operations[str(payload.operation_id)][1] == result
+                        assert not any(row[0] == "POST" for row in seen[first:])
                     assert await browser.execute(session_id, payload) == result
+                    assert run_step.await_count == executions + (1 if allowed else 2)
                     assert browser.sessions[session_id].page is page and not session.closed
-                    if page.url.startswith(origin):
-                        assert result["after"]["elements"], result
-                        assert "warnings" not in await browser.observe(session_id, TOKEN)
-                        assert "warnings" not in await browser.observe(session_id, TOKEN)
-                    else:
-                        assert result["diagnostics"]["evidence_errorcode"] == "browser_url_denied"
-                        with pytest.raises(HTTPException):
-                            await browser.observe(session_id, TOKEN)
+                    assert "warnings" not in await browser.observe(session_id, TOKEN)
+                    assert not session.executing and not session.writes_authorized
+                    assert await page.evaluate("""async () => {
+                        try { await fetch('/late', {method:'POST', body:'private-body'}); return false; }
+                        catch { return true; }
+                    }""")
+                    assert not any(row[1] == "/late" for row in seen[first:])
+                    assert "warnings" not in await browser.observe(session_id, TOKEN)
                     assert all("password-private" not in row[1] and "alice-private" not in row[1] for row in seen)
                     assert "password-private" not in json.dumps(result) and "alice-private" not in json.dumps(result)
                     assert "fixture.example" not in caplog.text and "password-private" not in caplog.text

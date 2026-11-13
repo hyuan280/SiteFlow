@@ -9,6 +9,7 @@ SchedulerMode = Literal["cron", "interval", "random"]
 
 
 class SchedulerSettingsView(BaseModel):
+    revision: int = 0
     enabled: bool
     enabled_source: str
     mode: SchedulerMode
@@ -25,6 +26,7 @@ class SchedulerSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool | None = None
+    expected_revision: int | None = Field(default=None, ge=0)
     mode: SchedulerMode
     cron: str = Field(default="", max_length=128)
     interval_seconds: int = Field(default=3600, ge=60, le=2592000)

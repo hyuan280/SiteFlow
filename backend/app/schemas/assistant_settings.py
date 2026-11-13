@@ -13,6 +13,7 @@ class AssistantSettingsValues(_SettingsModel):
     max_tool_calls: int = Field(default=20, ge=1, le=200)
     max_model_rounds: int = Field(default=12, ge=1, le=100)
     max_parallel_tool_calls: int = Field(default=4, ge=1, le=8)
+    max_auth_uses_per_turn: int = Field(default=3, ge=1, le=20)
     turn_timeout_seconds: int = Field(default=180, ge=30, le=1800)
     # None inherits the global model limit; zero omits the provider parameter.
     max_tokens: int | None = Field(default=None, ge=0, le=9007199254740991)

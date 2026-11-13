@@ -19,6 +19,7 @@ from sqlalchemy import select
 from app.api.v1 import config_ai
 from app.core.auth import CSRF_COOKIE, SESSION_COOKIE
 from app.core.config import Settings
+from app.features.catalog import FEATURE_LIST
 from app.models.auth import AuthSession
 from app.models.integration import IntegrationConfig
 from app.schemas.config_ai import GenerateSiteDraftRequest, GenerationResult
@@ -160,13 +161,23 @@ def test_disabled_returns_503_without_resolving_runtime_or_generating(client, mo
 
 
 @pytest.mark.parametrize("features", [
-    ["unknown-private-feature"], ["plugin.private.feature"], ["action.fill"],
-    ["post.buy_card"], ["post.resign_dialog"], ["sign.iframe_form"], ["action.wait", "post.buy_card"],
+    ["unknown-private-feature"], ["plugin.private.feature"], ["sign.iframe_form"],
+    ["auth.totp_login"], ["action.wait", "plugin.private.feature"],
 ])
 def test_invalid_feature_selection_precedes_runtime(client, mocked_generation, features):
     _post(client, _payload(allowed_features=features), 422, "invalid_selection")
     for mock in mocked_generation:
         mock.assert_not_called()
+
+
+def test_all_23_builtins_pass_selection_without_changing_proposal_contract(client, mocked_generation):
+    features = [feature.key for feature in FEATURE_LIST]
+    assert len(features) == 23
+    assert _post(client, _payload(allowed_features=features)).json() == PROPOSAL
+    runtime, generate = mocked_generation
+    runtime.assert_called_once_with()
+    generate.assert_awaited_once()
+    assert generate.await_args.args[1].allowed_features == features
 
 
 @pytest.mark.parametrize("changes", [

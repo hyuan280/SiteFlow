@@ -4,11 +4,19 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy import event
 
+from app.models.setting import AppSetting
 from app.models.execution import Run, SiteJob
 from app.models.workflow import Site, WorkflowStep
 from app.services.execution import ExecutionService
 from app.services.scheduler import Scheduler
+from app.schemas.scheduler import SchedulerSettingsUpdate
+from app.services.scheduler_settings import (
+    CRON_KEY, REVISION_KEY, SchedulerConflictError, SchedulerSettingsService,
+    SchedulerValidationError,
+)
 from tests.helpers import login_client, make_settings
 from app.main import create_app
 
@@ -319,3 +327,88 @@ def test_scheduler_does_not_submit_when_all_sites_succeeded(client) -> None:
         assert scheduler._trigger(session, current) == []
         assert session.query(Run).count() == 1
     assert executor.submitted == []
+
+
+def test_revision_optional_cas_noop_and_runtime_timing(client):
+    endpoint = "/api/v1/scheduler-settings"
+    assert client.get(endpoint).json()["revision"] == 0
+    payload = {"mode": "interval", "interval_seconds": 600}
+    first = client.put(endpoint, json=payload).json()
+    assert first["revision"] == 1
+    repeated = client.put(endpoint, json={**payload, "expected_revision": 1}).json()
+    assert repeated["revision"] == 1
+    assert repeated["next_run_at"] == first["next_run_at"]
+    assert client.put(endpoint, json={**payload, "expected_revision": 0}).status_code == 409
+    with client.app.state.session_factory() as db:
+        service = SchedulerSettingsService(db, client.app.state.settings)
+        before = service.binding()
+        service.set_next_run(datetime.now(timezone.utc) + timedelta(hours=2))
+        assert service.binding() == before
+    # Shipped clients need not send a revision.
+    assert client.put(endpoint, json={**payload, "interval_seconds": 900}).json()["revision"] == 2
+
+
+def test_preview_is_pure_and_composed_writes_rollback(client):
+    factory, settings = client.app.state.session_factory, client.app.state.settings
+    with factory() as db:
+        statements = []
+        engine = db.get_bind()
+        def record(_conn, _cursor, statement, *_args):
+            statements.append(statement)
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            service = SchedulerSettingsService(db, settings)
+            candidate = service.preview(SchedulerSettingsUpdate(
+                mode="random", cron=" 0   10 * * * ", ranges=["9:00-10:00", "09:00-10:00"]))
+            assert candidate.cron == "0 10 * * *" and candidate.ranges == ["09:00-10:00"]
+            service.binding()
+            service.view()
+            assert not any(s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+                           for s in statements)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        assert service.update(candidate, _commit=False).revision == 1
+        db.rollback()
+    with factory() as db:
+        assert db.get(AppSetting, REVISION_KEY) is None
+        assert db.get(AppSetting, CRON_KEY) is None
+
+
+@pytest.mark.parametrize("cron", ["* * * * * *", "@daily", "0 0 31 2 *", "bad"])
+def test_scheduler_rejects_nonstandard_or_impossible_cron(client, cron):
+    response = client.put("/api/v1/scheduler-settings", json={"mode": "cron", "cron": cron})
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("ranges", [["9:0-10:00"], ["10:00-09:00"], ["09:00:00-10:00"],
+                                   ["24:00-25:00"], ["09:00-10:00-extra"]])
+def test_scheduler_rejects_invalid_ranges(client, ranges):
+    with client.app.state.session_factory() as db:
+        with pytest.raises(SchedulerValidationError):
+            SchedulerSettingsService(db, client.app.state.settings).preview(
+                SchedulerSettingsUpdate(mode="random", ranges=ranges))
+
+
+@pytest.mark.parametrize("existing_revision", [False, True])
+def test_legacy_writer_load_then_cas_does_not_overwrite_concurrent_edit(
+    client, monkeypatch, existing_revision,
+):
+    factory, settings = client.app.state.session_factory, client.app.state.settings
+    payload = SchedulerSettingsUpdate(mode="interval", interval_seconds=600)
+    if existing_revision:
+        with factory() as db:
+            SchedulerSettingsService(db, settings).update(payload)
+    with factory() as db:
+        service = SchedulerSettingsService(db, settings)
+        preview = service.preview
+        def concurrent(value):
+            with factory() as other:
+                SchedulerSettingsService(other, settings).update(
+                    payload.model_copy(update={"interval_seconds": 900}))
+            return preview(value)
+        monkeypatch.setattr(service, "preview", concurrent)
+        with pytest.raises(SchedulerConflictError):
+            service.update(payload.model_copy(update={"interval_seconds": 1200}))
+    with factory() as db:
+        view = SchedulerSettingsService(db, settings).view()
+        assert view.interval_seconds == 900 and view.revision == 1 + int(existing_revision)

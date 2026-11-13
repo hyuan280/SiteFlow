@@ -325,7 +325,7 @@ def test_execution_unknown_never_loses_operation_or_no_retry():
         assert len(context._json(compacted)) <= budget
         assert compacted["operation_id"] == "operation-123"
         assert compacted["status"] == "unknown" and compacted["code"] == "outcome_uncertain"
-        assert compacted["no_retry"] is True and "Do not retry" in compacted["retry_notice"]
+        assert compacted["no_retry"] is True and "category policy" in compacted["retry_notice"]
         assert compacted["before"]["snapshot_id"] == "snapshot-1"
         assert compacted["after"]["url"] == "https://example.com/page"
         assert compacted["result"] == result["result"]

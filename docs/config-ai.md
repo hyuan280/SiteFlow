@@ -22,8 +22,11 @@ generation endpoint and shared discovery, guide, tools and model settings remain
 available; removing the UI does not remove assistant capabilities.
 In this endpoint there is no persisted chat, existing-site or template editing,
 template inheritance, public standalone tool dispatcher, MCP server, saving,
-scheduling, browser interaction or workflow execution. Plugin features, aliases,
-`post.*` (including `post.resign_dialog`) and `action.fill` are blocked even when explicitly selected. The generic
+scheduling, browser interaction or workflow execution. All **23 reviewed builtins**
+can be selected for authoring, including `action.fill`, `post.buy_card`,
+`post.resign`, `post.resign_click` and `post.resign_dialog`. Plugin features,
+aliases and unknown keys remain blocked. Authoring purchase/resign steps grants
+no execution or consumption authority. The generic
 guide and schemas also describe inheritance and editing semantics for future
 integrations; those descriptions do not enable them in this endpoint.
 
@@ -45,8 +48,8 @@ after tab closure or SSE disconnect and requires explicit cancellation. Its SSE
 sends full snapshots, not provider tokens (`stream: false`); request UUID replay
 does not rerun a turn, and the UI never automatically resends messages. Assistant
 tool titles are short operation/reason summaries, not private chain-of-thought.
-It shares the reviewed static builtin metadata and draft validator, still excluding
-plugins, `post.*` and `action.fill`, not arbitrary administrator/plugin metadata.
+It shares the reviewed static builtin metadata and draft validator for all 23
+builtins, not arbitrary administrator/plugin metadata; plugins remain excluded.
 The proposal alone has no save/run authority. Separately authorized assistant
 tools can import a saved proposal and fully test its bound site; see the
 assistant guide for those permissions. Its separately authorized live steps
@@ -54,23 +57,248 @@ also perform real business operations, as described below.
 Its limits differ from the single-request budgets below; use
 [the assistant guide](ai-assistant.md).
 
+The current catalog contains **23 reviewed builtins** and the ordinary assistant defines
+**38 tools**, with one additional takeover-only conclusion tool (**39 registered**);
+takeover sessions expose a restricted subset. Catalog/schema availability follows current code and server policy,
+not historical test counts, and does not guarantee production-site compatibility
+or business success.
+
 ### Persistent Assistant Differences
 
 These capabilities belong only to `/assistant`, **not** `/config-ai/generate`:
 
 - New session creation directly sends `{}`, with no creation dialog or model call. The server writes a fixed initial assistant greeting and the default title. Only successful main turns among the first three accepted user messages may trigger a separate, small, tool-free title request using the same configured model. Failed/cancelled user turns still consume that window; title failure preserves the title and is not retried. Manual rename permanently locks automatic updates. Title lock/revision/attempt fields use existing encrypted JSON, requiring no column migration; old sessions missing those fields are treated as locked. The title request has at most 10 seconds within the remaining 180-second turn budget, not an extra budget.
-- `list_sites`, `get_site_config`, `list_templates`, `get_template_config`, `list_recent_runs`, `get_run_summary` and `get_system_status` return non-secret site/template metadata, sanitized local/resolved workflows and signals, run/job metadata, integration configuration sources and lane status. Inline fill/static-field values and sensitive config keys are omitted; URL credentials/query/fragment are stripped. This is a dedicated projection, not the raw administrator preview and not generic free-text DLP. It provides no arbitrary SQL, shell, JavaScript, files, keys, raw run logs or screenshot artifacts.
-- Host target settings bind the origin, credential mode, proxy and optional saved `site_id`. The user confirms one unified `authorized: true` grant in the host UI; the API derives `execution_consent`, the frozen reviewed `execution_features`, credential-source-dependent `credential_consent`, and `allow_sign` for signing, generic clicks, ALTCHA and sliders. Old targets retain only their saved permissions until the user reconfirms; neither an upgrade nor a retry expands the initial scope. Model text, chat approval, DOM, feature schemas and step conditions cannot grant permissions. Extra `trusted_origins` authorize navigation/observation only, never cross-origin execution or secret use.
-- Manual stored-account tests require a persisted site with exactly the same origin (scheme, host and effective port). The API freezes its ID, history identity and configuration revision and rechecks them before execution; changes require reconfirmation. Bitwarden can privately resolve credentials for an unsaved new target using full-domain matching, not inherited root/custom matching, with explicit credential authorization. Cookie mode uses manual login in a separate user-controlled tab on the same lane, followed by assistant navigation/reload; it does not import stored Cookie values for auth tests. `cookie` and `none` cannot authorize auth features.
-- The reviewed live list is exactly `flow.open`, `action.navigate`, `action.wait`, `auth.form_login`, `auth.password_verify`, `sign.button`, `sign.unit3d_claim`, `action.click`, `challenge.altcha`, `challenge.slider`. It is narrower than the proposal catalog. No live image-captcha, Turnstile, 2FA, iframe sign, purchase/resign, plugin, arbitrary fill or screenshot-recognition integration exists yet. Unsupported challenges need manual handling, not an assumed success.
-- `execute_step` runs one enabled, unconditional step on the existing current page, not workflow conditions/groups/jumps. Activity is bounded to 90 seconds, the shorter step timeout and remaining browser TTL/turn budget. Navigation retry is forced to zero; no automatic step retries occur. The page stays open afterward. Results contain static logs, safe flags and before/after **structured DOM state snapshots, not PNG screenshots**, HTML or raw runtime logs. Real sign-in/check-in submits to the website and requires explicit authorization; submission is not proof of success.
+- `list_sites`, `get_site_config`, `list_templates`, `get_template_config`, `list_recent_runs`, `get_run_summary` and `get_system_status` return non-secret site/template metadata, sanitized local/resolved workflows and signals, run/job metadata, integration configuration sources and lane status. Inline fill/static-field values and sensitive config keys are omitted; URL credentials/query/fragment are stripped. This is a dedicated projection, not the raw administrator preview and not generic free-text DLP. These metadata tools do not return raw logs or screenshot pixels; separate historical artifact tools below do. No tool permits arbitrary SQL, shell, JavaScript, file paths or secret retrieval.
+- Site list/detail metadata includes `history_key` (in `_SITE_FIELDS`), as does template metadata, for UUID-based historical discovery. `list_sites` / `list_templates` accept name `query`, `offset` (default 0), and `limit` 1-100 (default 100), ordered by name/id ascending. `list_recent_runs` accepts offset and limit 1-20 (default 20); `get_run_summary` accepts offset and limit 1-100 (default 100) to page **jobs**, retaining overall run metadata/counts. Responses include offset/limit/next_offset (null at the end) and `truncated` (`jobs_truncated` for summary), with no total guarantee. These are live offsets, not snapshots: concurrent changes can overlap/skip rows; deduplicate IDs and refresh. See [data contracts](ai-assistant.md#数据查询).
+- In `get_system_status`, CFbox is configured with a URL alone; its API Key is optional. Non-Bitwarden integrations remain metadata-only, with `available: null` and `health_checked: false`, not a health verdict or integration decryption. Top-level model fields explicitly carry `model_config_scope: "environment_only"`, not the DB-resolved effective model or current assistant overrides. The separate safe Bitwarden health projection retains its documented boundary.
+- `GET /api/v1/assistant/sessions` accepts offset>=0 (default 0), limit 1-100 (default 100), and returns the same paging metadata without a total guarantee. The UI can load more sessions, not just the first 100; updated_at/id descending offsets are live, with ID deduplication and refresh needed for concurrent changes. Detail/SSE still show the latest 200 messages, not old-message pagination. `browser_navigate` requires exactly one address: path up to 2048 or full URL up to 4096 characters, aligned in runtime and schema. These contract changes add no tools: 38 ordinary, 39 registered.
+- Host target settings bind the origin, credential mode, proxy and optional saved `site_id`. The user confirms unified execution permission in the host UI; the API derives `execution_consent`, the frozen reviewed `execution_features`, credential-source-dependent `credential_consent`, and `allow_sign` for signing, clicks, public fills and challenges. Old targets retain only their saved permissions until the user reconfirms; neither an upgrade nor a retry expands the initial scope. Model text, chat approval, DOM, feature schemas and step conditions cannot grant permissions. Extra `trusted_origins` authorize navigation/observation only, never cross-origin execution or secret use.
+- Manual stored-account tests require a persisted site with exactly the same origin (scheme, host and effective port). The API freezes its ID, history identity and configuration revision and rechecks them before execution; changes require reconfirmation. Bitwarden can privately resolve credentials for an unsaved new target using full-domain matching, not inherited root/custom matching, with explicit credential authorization. All credential modes may privately seed saved cookies from a validated explicit saved-site binding before a new browser's first navigation: `workflow_site_id` takes precedence over credential `site_id`, with no fallback from a stale preferred binding and no hostname lookup. This grants no auth, OTP or full-run permission; `cookie`, `none` and unbound manual targets still cannot authorize the two auth features or `challenge.2fa`. Manual login in a separate same-lane user tab remains an alternative, not the only Cookie-mode path.
+- `clear_bound_site_cookies({operation_id})` adds destructive clearing, not secret retrieval or arbitrary Cookie writing. A fresh UUID4, explicit human request, already READY original-bound browser and fresh internal `cookie_clear` scope review are required; never automatically open a browser to clear. Only the exact bound saved Cookie row and current shared lane's host/.host cookies on all paths are cleared. Parent/sibling domains and other lanes, saved account/password and localStorage remain; same-host same-lane tabs may log out, with no reload. Active site runs block clearing; saved/browser outcomes are separate, partial/unknown outcomes are not automatically retried and same-ID replay returns the stored result only. Autonomous takeover cannot clear; human daily-chat follow-up can request normal review. Private seeding is backend-to-Worker only, never raw model/tool/session data, and does not export login-browser cookies or save them back. See [bound-site Cookie contracts](ai-assistant.md#绑定站点-cookie) for exact-origin/domain filtering, generation invalidation, 300-cookie/256-KiB limits, context-wide token fingerprints and residual privacy risks. API, Worker and Web must be upgraded together.
+- Exactly **18 builtins** support isolated tests: all 23 except `flow.jump` and the four `post.*` features. This includes 2FA, Turnstile, character/grid captcha, iframe image-captcha sign and image quiz, plus public `action.fill` and boolean-only `flow.result`. See the [complete list](ai-assistant.md#单步验证). Isolated post execution is **not implemented**, because it needs real SiteJob consumption checkpoints, not because the user denied permission; use a saved full workflow. Plugins remain unavailable.
+- `execute_step` runs one enabled, unconditional step on the existing current page, not workflow conditions/groups/jumps. Activity is bounded to 90 seconds, the shorter step timeout and remaining browser TTL/turn budget. Navigation retry is forced to zero; no automatic step redispatch occurs. Results contain sanitized status and available before/after **structured DOM state snapshots, not PNG screenshots**, HTML or raw runtime logs. CAPTCHA handling does not impose a summary-only evidence rule. Real sign-in/check-in submits to the website and requires explicit authorization; submission is not proof of success.
+- All `challenge.*`, `sign.iframe.image_captcha` and `sign.image_quiz` use host-configured providers/runtime handling. TOTP is limited to `builtin.twofauth`, requires credential consent and a bound, credential-ready same-origin manual site or Bitwarden source. Actual OTP/2FA authentication codes, TOTP seeds, passwords, cookies, tokens, host-private prompts and API/provider keys remain private: never request or echo them. Image CAPTCHA OCR text and solver answers are not secrets merely because they solve a CAPTCHA. A user's “它不是秘密” can clarify a CAPTCHA answer, never declassify actual OTPs or credentials. A configured solver/vision provider may process challenge images; this is not a claim that no model processes them or permission to retrieve raw provider responses.
+- CAPTCHA handling does **not lock the browser**: observe/inspect, selector checks, separately consented screenshots (including UI preview), navigation and authorized follow-up single steps remain available on the same page without reopening. Sequential CAPTCHA/login/signing tests do not require a saved full run merely because they include a CAPTCHA. All DOM/selector evidence still omits input values. Screenshots mask input controls in the main page and readable same-origin frames, and conservatively mask other frames in full. Visible page text may reflect a CAPTCHA answer, which is acceptable; masking is not complete pixel-level secret redaction, and visible personal information or other secrets may remain. Existing authorization, origin, uncertainty and operation-ledger rules still apply.
+- Private isolated Turnstile requires explicit observation trust for `https://challenges.cloudflare.com` and one unique visible supported Cloudflare challenge iframe on the current assistant page (HTTPS, `/cdn-cgi/challenge-platform/` path). Worker pins its original node, source, document and bounds and rechecks before action. CFbox coordinates must fall inside and hit that pinned target; non-challenge coordinates cause no action. This is page-scoped challenge handling, not arbitrary full-page coordinate clicking, a full-page-challenge substitute, desktop/X11 or another-tab authority. Observation trust does not authorize sending account credentials to Cloudflare.
+- Private provider responses echoing known provider keys are rejected rather than filled into the website or used for action. Secret input revalidates original targets after focus, then validates/inserts atomically to prevent focus handlers from redirecting input to replacement nodes. These controls are not generic DLP or a production success guarantee.
+- `action.fill` accepts explicit public nonsecret literals only, never passwords, account credentials, cookies, tokens or OTP/TOTP authentication codes; host field/content checks still apply, and image CAPTCHA answers are distinct from OTPs. Isolated `flow.result` returns the configured boolean without model judgment; false is a failed step result, not proof the website operation failed, and must not be changed to true to hide failure. Full-workflow result judgment retains host policy; its runtime connection, prompts and provider keys are host-supplied privately to Worker. The assistant receives safe boolean results/status only, never raw model answers, judgment reasons or keys.
 - API-resolved stored secrets go privately to the Worker, never to model messages, chat or proposals. Worker capability validation binds the original unique visible input/submit nodes to the same original form, same-origin action/formaction and current window; password targets must be editable password inputs. It revalidates before secret use. A form need not declare POST: existing page JS may prevent native GET submission and POST to another compliant path on the original origin. There is no per-form POST endpoint approval or model-authored JS. GET/HEAD remain the default; POST opens only during an authorized non-read-only step, never for navigation/wait. Cross-origin POST, PUT/DELETE and known secrets in any request URL remain blocked. Afterward POST closes and original-origin restrictions remain, even for trusted observation origins. No SSO/trusted-URL expansion is granted.
-- The API persists a stable operation UUID before dispatch/credential release and rejects reuse; the Worker binds it to the complete request fingerprint and returns only in-progress/cached terminal state on replay. Unknown, timeout, cancellation or a lost response is not proof of no submission: inspect read-only first, never change UUIDs to bypass uncertainty. Reopening a browser does not clear the gate and is not a mandatory retry step. Limits are 20 operations per browser and a persistent 256-ID ledger per chat session, unaffected by target changes or browser reopening.
-- When the user explicitly requests a retry, the model calls `retry_step` with the original `operation_id` and public `title`, not a changed step or private authority. A non-read-only `execute_step` whose normalized step exactly matches one eligible uncertain original under the current binding is also intercepted by the host into this approval flow. A changed/ambiguous step is not executed; `retry_step_mismatch` directs the model to the original ID. The host **pauses that same tool invocation**, keeps the turn/tool `running`, and publishes safe `pending_approval` metadata through detail/SSE. The running dialog lets the owner approve, deny or stop the turn. Approval requires login/ownership/CSRF and immediately resumes the original invocation to execute the exact stored normalized step once; no new user message or second model execution call is needed. The model must not refuse the request or ask for a new message after approval.
-- Approval waits at most **180 seconds** independently of the remaining active turn budget. Human event-wait time pauses the outer turn timeout and advances its deadline by the elapsed waiting duration; approval processing, model requests and execution still consume the active budget (default 180 seconds). An already exhausted turn cannot open a new prompt. Denial returns `retry_denied`, expiry `retry_approval_timeout`, and invalidated authority/binding `retry_approval_invalidated`, all without execution. Decisions/results for the same original operation are cached per turn, so repeated calls do not spam dialogs or dispatch twice. Stop/shutdown still cancels immediately; restart cancels pending approvals with no automatic execution/resume. A later turn may request fresh approval only when the user explicitly asks again.
-- Optional legacy idle preauthorization remains available through **允许重试一次**, issuing a five-minute, browser-bound, single-use grant for the stored step. This idle action alone does not execute/send a message; a later `retry_step` can consume it. It is not the main flow or a required prerequisite to running approval. Five minutes bounds grant admission, not approval waiting or extra turn time; an admitted, consumed retry can return after expiry if bindings remain valid. The host consumes authority before credential release/dispatch and rechecks original origin, browser/target revision, credential binding and current permissions. There is no always-retry permission; broad initial scope, cross-origin and secret boundaries remain unchanged.
-- Only a linked, actually dispatched terminal `success` retry clears its uncertainty gate, not proof that the original failed. Failure, missing elements or approval alone do not resolve the original outcome; a still-unknown retry needs approval for that new uncertain record. Original history/ledger/safety facts persist. Historical `no_retry: true` and current `requires_host_approval: true` mean **no autonomous repeat; host approval required**, not a permanent ban. Current host authorization/resolution is authoritative, never chat or summary claims.
+- The API persists a stable operation UUID before dispatch/credential release and rejects reuse; the Worker binds it to the complete request fingerprint and returns only in-progress/cached terminal state on replay. Unknown, timeout, cancellation or a lost response is not proof of no submission: inspect read-only within current permissions without exposing input values, never change UUIDs to bypass uncertainty. CAPTCHA handling does not require reopening; reopening does not clear uncertainty. Limits are 20 operations per browser and a persistent 256-ID ledger per chat session, unaffected by target changes or browser reopening.
+- Only code-owned builtin `Feature.category` is trusted: `flow`, `auth`, `challenge`, `sign`, `action`, `post`. Key prefixes, descriptions, model arguments and plugin metadata confer no category authority. Plugins may declare these six values, but remain unavailable to the assistant: metadata is unverified and dangerous actual implementations need separate review.
+- Assistant isolated steps and saved full runs share the originating real user turn's `max_auth_uses_per_turn` for auth login/password-verification attempts and retries: default **3**, strict integer **1-20**. Each attempt is reserved before credential resolution and failures are charged. Full runs charge once when each new runtime auth credential lease is issued, not again on redemption; conditionally skipped steps are free. Loop re-entry and executor restart/fallback attempts requesting new leases charge again. Background runs retain their originating turn and frozen limit even after chat ends or a new user turn begins; internal model rounds, browser reopening and target changes do not reset it. A new auth-containing `run_site` checks remaining capacity before dispatch without precharging every configured step; exhaustion at runtime denies further auth leases with `auth_budget_exhausted`, not unlimited full-workflow auth loops. Result reads and same-run replays are free; ordinary manual/scheduled jobs are outside this assistant quota. `challenge.2fa` is challenge, not auth-budgeted; its OTP remains private and credential consent remains required.
+- Supported same-original-origin flow/challenge/sign/action single steps remain permitted with current host consent despite historical unknown outcomes. In ordinary chats, `retry_step` takes only the original `operation_id` and public `title`; the host automatically issues one-use exact-stored-step authority and executes with a fresh UUID, **without a UI approval prompt**. Auth retries charge another shared use. Current target/browser/credential bindings, authorization, duplicate-operation checks and secret boundaries remain enforced; no step edits or post isolated execution.
+- Legacy idle **允许重试一次** and retry-approval APIs remain for compatibility and optional manual use, not a prerequisite or evidence that all retries require approval. Legacy grants remain five-minute, browser-bound and single-use; creating one alone does not execute. Legacy pending approval waits at most 180 seconds, denial/timeout/cancellation grants nothing, and restart does not resume execution.
+- Original unknown history/ledger/safety provenance persists; unrelated success never clears it, and retry success does not prove the original failed. Current category policy and linked host resolutions take precedence over historical `no_retry` / `requires_host_approval` prose. Configuration-write/import and full-run uncertainty guards are unchanged. Category permission is user policy, **not proof of no website side effects**: physical clicks, navigation and scripts can still change the website, not only post features.
 - Successful assistant draft validation/submission also returns `required_site_settings` next to the proposal: `credential_mode`, `credential_provider_id`, `lane_policy` and a notice. Users must apply these host-confirmed provider/proxy settings separately to reproduce the tested environment; workflow arrays do not carry credentials or Cookie values.
+
+### Template, Scheduler And History Tools
+
+The nine additional assistant tools are `create_template_from_site`,
+`get_scheduler_settings`, `update_scheduler_settings`, `cancel_run`,
+`list_workflow_versions`, `get_workflow_version`, `list_run_artifacts`,
+`read_artifact_log` and `read_artifact_image`. They are **not** added to the four
+tools of `/config-ai/generate`. All assistant calls also require a public `title`.
+
+Manual template editing has **从站点导入配置**: select a site and confirm replacing
+the current form's local `steps`, `groups`, `signals` and `parent_id` (mapped from
+the source `template_id`). It does not flatten resolved inheritance, copy site
+metadata/credentials, change the source, save automatically or execute anything.
+The destination form's name, description and enabled state remain unchanged;
+review, validate and save separately. The read-only candidate endpoint is
+`GET /api/v1/templates/import-from-site/{site_id}`. Active/uncertain source jobs,
+invalid/empty workflows and cyclic inheritance prevent import.
+
+At an explicit user request, `create_template_from_site` instead saves after an
+exact host review. Its source is only the saved, host-bound `workflow_site_id`,
+never the credential `site_id` or an arbitrary model-supplied source ID. Arguments
+are `operation_id`, `name`, optional `description`, and optional
+`destination_template_id`, `expected_revision`, `expected_history_key`. Existing
+destination replacement requires both current revision and history UUID. It
+replaces the complete local arrays and parent, not a merge, preserving destination
+name/description/enabled. It never copies site settings/secrets, changes the
+source or runs a workflow. A valid configured source without active or uncertain
+jobs **does not require a successful assistant full run**. Global authorization
+never bypasses review. The host freezes source/destination snapshots and ancestor
+dependencies, rechecks them on approval and uses conditional updates and CAS;
+drift, denial or timeout writes nothing. History and encrypted action receipt
+commit together. Exact UUID/request replays return the receipt while the source
+binding remains valid, rather than saving twice.
+
+Replacement must retain every original **resolved** group identity, name and
+relative order, and every original resolved step identity, group and relative
+order, including inherited items. The backend checks this at preparation and
+apply; incompatible source content is rejected, never implicitly merged back.
+Existing step configuration may change, and new groups/steps may be inserted
+anywhere. Numeric `position` and `step_anchor` values may change as long as the
+original relative order remains intact. The public review contains the exact
+source-local `steps`/`groups`/`signals` arrays and parent, plus `before` containing
+the previous destination's **local** arrays and parent (`null` for creation), not
+flattened resolved workflows. The UI expands the full candidate and keyed
+before/after differences; protected configuration fails closed, not as hidden
+markers. Legacy persisted approvals without `before` report an unavailable
+baseline rather than guessing. Manual editor import behavior is unchanged. See
+[saving a template from a site](ai-assistant.md#从站点保存模板).
+
+`get_scheduler_settings` reads **global** settings, source/environment lock,
+revision, timezone and next-run time without a target. Only an explicit global
+scheduling request permits `update_scheduler_settings({operation_id, patch})`.
+Its nonempty sparse patch allows only `enabled`, `mode` (cron/interval/random),
+five-field `cron` (up to 128 characters), `interval_seconds` (strict integer
+60-2592000) and `ranges` (up to 20 same-day HH:MM-HH:MM ranges). Omission preserves,
+null/unknown fields and no actual change are rejected. Every exact patch requires
+authenticated host review, regardless of automatic authorization. Any scheduling
+environment override locks editing of the global schedule; timezone is
+environment-only and is not writable here. A timezone override alone does not
+lock the other fields. The host freezes revision/raw configuration/environment,
+rechecks locks and uses revision CAS with an encrypted receipt. Dynamic
+`next_run_at` is excluded from the binding, so ordinary timer advancement does not
+invalidate approval; a saved change recalculates it. Exact operation replays do
+not write again; stale bindings, denial and timeout do not apply changes.
+
+`cancel_run({run_id})` requires an explicit request and exact host-built run review,
+not generic workflow consent. It can address historical/current UI-accessible
+runs, not just conversation-created runs. Approval commits cancellation before
+calling the real shared `executor.cancel` for a still-active run. Queued runs are
+atomically canceled; running runs receive a cancellation request. Report actual
+`status`, `cancel_requested`, `finished` and `worker_cancel_delivered`:
+**requested/delivered is not proof the worker stopped** and does not undo effects.
+Terminal runs return their current state. Stopping the chat turn is separate and
+does not cancel a submitted run or clear uncertainty.
+
+`list_workflow_versions({history_key, offset, limit})` and
+`get_workflow_version({history_key, revision})` read sanitized current/archived
+history by UUID, including local/resolved configuration, dependencies and feature
+snapshots, without restoring anything. `list_run_artifacts({run_id, job_id?,
+offset, limit})` lists database artifact IDs and metadata, not file paths. List
+limits are 1-50. In ordinary chats these historical reads use the authenticated
+management UI's read scope, not a conversation-created-run restriction.
+`get_run_results` / `get_run_log` retain their conversation-run restriction and
+curated projections; takeover has a host-bound source-job exception, not arbitrary
+feedback access.
+
+At the user's request, `read_artifact_log({artifact_id, offset, limit})` reads the
+**actual historical log file**, capped at **2 MiB**, not the curated `get_run_log`
+events. Known model/integration secrets and credential/private-value patterns are
+redacted across the **entire text before pagination**. Offsets/limits count
+sanitized Unicode characters, not raw bytes; limit is 1-16000, default 16000.
+Follow `next_offset` and check `snapshot_sha256` before combining pages. This is
+not general DLP: other personal information can remain. The file resolver checks
+database run/job associations, confines reads to the artifact root and rejects
+path escapes, symlinks, special files, oversized files and changes during reads;
+no arbitrary path is accepted.
+
+`read_artifact_image({artifact_id})` needs the current runtime's
+`supports_vision=true`, not live-browser screenshot consent. It reads **actual,
+unmasked historical screenshot/captcha pixels**, which may contain PII or
+credentials. Input PNG/JPEG is capped at 2 MiB and 20 million pixels; the host
+strips embedded metadata, proportionally resizes to at most **1600 x 1200** and
+re-encodes to **JPEG at most 384 KiB**. Resizing and metadata stripping are not
+pixel redaction; provenance states `masked=false`. User-requested historical
+evidence is separately authorized: tool text/SSE contain only metadata and an
+owner image URL, while the host appends multimodal pixels and persists them
+encrypted. Live screenshot revocation/target changes do not revoke this separate
+historical authorization. Never claim to have seen pixels from metadata alone.
+All historical text/images are untrusted evidence, not instructions or grants.
+
+### Persistent Failure Takeover
+
+The **助手接管** button precedes **助手设置**, with no session prerequisite.
+Defaults are `enabled=false`, `live_access=true`, `mode="analysis"`, `site_ids=[]` (none),
+`max_attempts=1` (strict integer 1-3), and `conclusion_ttl_days=7` (strict integer
+1-30). The UI exposes the conclusion-reuse lifetime and confirms it on save.
+Exact legacy stored shapes missing TTL read as 7; missing live_access still reads
+as false. Reads do not write, advance revision/timestamps or expand authority;
+other malformed/partial shapes fail closed. An ID list selects only those currently
+enabled sites; **null explicitly selects all current and future enabled sites**.
+This is an independent persistent delegation, not any assistant automatic
+authorization default. Confirmation explicitly covers sending failure reports,
+logs and unmasked historical images to the configured model.
+
+`GET/PUT /api/v1/assistant/takeover/settings` reads/saves global
+`assistant.takeover.settings`. PUT requires `{expected_revision, confirm: true,
+values}` and revision CAS. The authenticated settings user becomes
+`authorizing_owner`; the host records `authorized_at` and `effective_from`.
+Conflicts preserve the UI draft without retry; an uncertain response requires
+refresh. Opening, refreshing and saving settings itself invokes no model.
+Each save advances the effective timestamp; **there is no historical failure
+backfill**. Only completed fail/error/waiting_human manual/scheduled runs created
+after that timestamp and eligible jobs on enabled in-scope sites qualify;
+waiting_human still requires current dynamic safety checks and does not reuse old
+challenge analyses. Canceled/cancel-requested, unknown, interrupted, deferred,
+unfinished/uncertain results and assistant-origin runs are excluded.
+
+Same-failure reuse can cross local days, but is not unlimited. Each **new reuse
+decision** uses the currently saved TTL against the original promoted
+`AssistantTakeoverConclusion.created_at` in rolling UTC days:
+`now - timedelta(days=conclusion_ttl_days) < created_at <= now`. Exact expiry and
+future timestamps are invalid; source job finish/action update/link/chat dates
+do not determine age.
+Reuse never renews age. After expiry, the next eligible new source follows normal
+investigation; expiry does not backfill, requeue existing reused actions or delete
+records. Existing history/reused projections and frozen notifications remain
+readable regardless of age, subject to existing integrity checks. Changing TTL
+uses the unchanged policy-save CAS/revision/effective_from behavior, not a separate
+retroactive update. See [same-failure reuse](ai-assistant.md#相同失败去重).
+
+With persisted `live_access` and current host scope, either mode may browse and
+perform supported same-origin non-post single steps under category policy and
+the shared auth cap, despite historical unknown outcomes. Without live access,
+neither mode can browse or execute. `analysis` forbids configuration saves, not
+website side effects. Autonomous `retry_step` is currently denied; permitted new
+`execute_step` calls do not make that retry tool available.
+
+Analysis can inspect source evidence and propose a validated draft but never
+save. Autofix can import one validated saved proposal into **only the existing
+bound source site's workflow** when the actual failed dispatch snapshot still
+matches current identity/revision/attempt/lane/configuration/dependencies/policy
+and no active or uncertain work exists. Missing/stale snapshots downgrade to
+analysis. It cannot fully rerun, cancel, create sites,
+change credentials, site metadata, templates or global settings; **it never
+automatically runs the saved fix**. Artifact reads are restricted to the source
+run/job, and global mutation defaults are suppressed.
+
+Every tool and import transaction rechecks persisted owner, policy revision,
+scope and source authority; disabling or changing policy revokes old-revision
+authority, without undoing committed writes or withdrawing already-sent data.
+The 1-3 attempts bound model analysis, not business execution retries. Unknown
+dispatch outcomes are not blindly retried. On restart, a dispatched action with
+an exact accepted user message in a valid same-owner session remains eligible
+for completion-only recovery from persisted evidence; no model or site action
+is replayed. Without that binding, the restart fallback remains updated with an
+import receipt, otherwise unknown. See [conclusions and recovery](ai-assistant.md#结论与通知)
+for typed-outcome checks and atomic finalization. The dialog shows the
+current owner's latest 20 audit records and links to their sessions;
+`GET /api/v1/assistant/takeover/actions?limit=100` returns only the current owner's
+records (limit 1-100). Updated means saved, not successfully tested; completed
+analysis is not proof of a business fix. See the [assistant guide](ai-assistant.md)
+for full contracts and the complete 38-tool ordinary list (39 registered).
+
+Assistant full saved runs support all 23 builtins. Each actual new dispatch with
+enabled `post.buy_card`, `post.resign`, `post.resign_click` or `post.resign_dialog`
+requires a fresh owner review dialog for EACH enabled post step, including
+conditional steps. All step dialogs must be approved before the full workflow
+starts; each approval covers that step's listed dates and bounded internal
+clicks, with no popup per date or internal click. Global
+auto-authorization cannot bypass it. The host binds the exact saved workflow,
+configuration/policy fingerprint, all eligible past dates (up to a 365-day window),
+timezone/day, bounded purchase quantity and a **positive `max_price`**. Quantity
+is an integer 0-365; 0 auto-fills pending need minus inventory, still with a
+reviewed maximum quantity/spend. Approval is one-use and rechecked before dispatch;
+runtime dates and capabilities are private host data, not model parameters.
+These consuming assistant runs have no automatic fallback/restart/retry attempts.
+Same-configuration/proposal replay returns the original run ID without another
+prompt or submission. Unknown full-run outcomes cannot be replayed through
+another tool; permitted non-post single steps do not resolve the full-run or
+configuration-write guards.
+
+This gate covers assistant invocations only, not a new gate on normal manual or
+scheduled runs, which retain existing policy. Import preserves an existing site's
+enabled/scheduler state, so importing post steps into an already-enabled site can
+affect later scheduled execution; review that impact before import. New sites
+remain disabled. Generic clicks/navigation can have unknown business effects:
+the prompt prohibits using them or fills/loops to bypass consumption review,
+but this is not a guarantee that every website consumption action is detected.
+See [purchase/resign review](ai-assistant.md#购买与补签审核).
 
 The public assistant API adds `PUT /api/v1/assistant/sessions/{uuid}/title` with
 `{title}` and returns `title`, `title_locked`, `title_revision` in session views.
@@ -78,7 +306,7 @@ Its `PUT /sessions/{uuid}/target` accepts required name/base URL/mode/proxy and
 literal unified `authorized: true`; optional `site_id` defaults to null,
 `trusted_origins` to `[]`, and separate `screenshot_consent` to false. The server
 derives execution/credential/side-effect permissions; legacy granular fields
-remain for existing callers, not the main UI flow. Running retry decisions use
+remain for existing callers, not the main UI flow. Legacy running retry decisions use
 `POST /sessions/{uuid}/retry-approvals/{approval_id}/decision` with
 `{"decision":"approve"}` or `{"decision":"deny"}`. Detail/SSE `pending_approval`
 contains only `id`, `operation_id`, `feature_type`, `status`, `created_at`,
@@ -141,7 +369,7 @@ The `GenerateSiteDraftRequest` contract forbids unknown fields, including inside
 | `requirements` | Required text, 1-8000 characters |
 | `evidence` | Optional text, at most 16000 characters; defaults to `""` |
 | `consent_to_send` | Required literal JSON `true`; `1` and `"true"` are not consent |
-| `allowed_features` | Required explicit selection of 1-22 unique canonical feature keys, each permitted by generation policy |
+| `allowed_features` | Required explicit selection of 1-23 unique canonical builtin feature keys, each permitted by generation policy |
 
 The host binds the new site's name/base URL and the feature selection. Neither
 the request nor tool arguments accept owner IDs, revision/history preconditions,
@@ -418,7 +646,7 @@ The tools response includes `version: 1`, `execution_enabled: false`, `tools`,
 that the internal generation tools are unimplemented: they execute only inside
 an enabled, authenticated/CSRF-authorized new-site generation request.
 The feature list response contains `version`, compact `features` and
-`plugin_policy`. The initial directory includes all 22 reviewed builtins only;
+`plugin_policy`. The directory includes all 23 reviewed builtins only;
 plugin features and plugin captcha methods, descriptions and enum annotations
 are excluded. Catalog presence is not a connectivity or credential check.
 
@@ -435,9 +663,10 @@ execution settings are never exported. Code-owned schemas are used directly to
 avoid dynamic plugin metadata injection. Defaults/examples are stripped from all
 schema positions. Hidden, read-only, write-only, password-format and model
 judgment control fields are withheld. This is an authoring subset, not field-level
-authorization: the internal dispatcher applies the narrower generation policy
-and rejects protected changes. GET discovery is broader than the generation
-allowlist; catalog presence does not authorize `post.*` or `action.fill`.
+authorization: the internal dispatcher enforces the explicit host selection,
+reviewed provider/field restrictions and rejects protected changes. All 23
+builtins may be selected for authoring, including `post.*` and public nonsecret
+`action.fill`; catalog presence grants no execution or consumption authority.
 An unavailable key returns a generic 404; malformed policy returns a generic 422
 without reflecting its stored values.
 
@@ -450,10 +679,11 @@ annotations or plugin schemas trusted or secret-free.
 
 ## Replacement And Inheritance
 
-The following are shared workflow/protocol semantics for future editing and
-template integrations, **not current generation capabilities**. Today's endpoint
-accepts no existing local state or template binding and proposes only a new
-site's local arrays.
+The following are shared workflow/protocol semantics, **not capabilities of
+`/config-ai/generate`**. That endpoint accepts no existing local state or template
+binding and proposes only a new site's local arrays. The persistent assistant's
+existing-site import and site-to-template tools are separate implemented paths
+with host-held bindings, exact reviews and CAS as described above.
 
 A proposal is the complete desired **local** `steps`, `groups` and `signals`, not
 a PATCH and not the resolved workflow. Preserve unchanged local entries. Empty
@@ -497,13 +727,14 @@ and model-authored freeform strings can still contain sensitive material. Review
 and manually redact them; do not assume schema validation or static diagnostics
 make arbitrary input safe.
 
-A future UI must show the local draft, explanation, unresolved questions and side
-effects for explicit human review. Clicks and navigation can have side effects;
-purchase and resign/retroactive-check-in features remain blocked, not merely
-approval-gated in this implementation. A separate user-confirmed save must
+A future standalone UI must show the local draft, explanation, unresolved questions
+and side effects for explicit human review. Clicks and navigation can have side
+effects; purchase/resign authoring is allowed here, but this endpoint never saves
+or executes any feature. Assistant purchase/resign execution is full-run-only with
+fresh bounded consumption review. A separate user-confirmed save must
 preserve host-owned metadata/secrets and revalidate current dependencies.
 Validation does not lock dependencies, authorize execution or guarantee a later
-save. Future existing-site/template editing also needs host-held target,
+save. Existing-site/template integrations need host-held target,
 revision/history preconditions and protected-value preservation/removal rules,
 including hidden values inside replaced collections and nested config. Never
 blindly overlay a model payload onto `SiteWrite` or `TemplateWrite`.
@@ -573,8 +804,9 @@ catalog. No external Agent or MCP skills are required by this backend loop.
 
 No runtime secrets or freeform secret values belong in a proposal, including
 `action.fill.value`, static form fields, URLs, prompts, labels, explanations and
-questions. Use runtime credential features for authentication and keep provider
-results out of model context. Redacting known secret strings is not complete DLP;
+questions. Use runtime credential features for authentication and keep secret
+provider results out of model context; image CAPTCHA OCR/solver answers are not
+blanket-classified as secrets. Redacting known secret strings is not complete DLP;
 schema validation and prompt instructions do not replace host-side controls.
 
 ## Verification Scope

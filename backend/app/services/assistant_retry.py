@@ -1,7 +1,7 @@
 """Encrypted, host-issued one-use authority to repeat an uncertain execution.
 
-Only authenticated user decisions issue grants. Model tools request approval and
-wait in the original invocation; they never supply private execution authority.
+Non-post builtin retries receive exact host-issued authority within the category
+policy. Explicit user approval APIs remain available for persisted grants.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, update
 
 from app.models.assistant import AssistantMessage, AssistantSession
+from app.services.assistant_categories import Denied, auth_budget_context, builtin_category
 from app.services.assistant_tools import failure
 from app.services.config_ai_generation import _strict_json
 
@@ -26,7 +27,7 @@ GRANTS = "_retry_authorizations"
 PENDING = "_pending_retry_approval"
 DECISIONS = "_retry_approval_decisions"
 APPROVAL_TIMEOUT = 180
-READ_ONLY = frozenset({"flow.open", "action.navigate", "action.wait"})
+READ_ONLY = frozenset({"flow.open", "action.navigate", "action.wait", "flow.result"})
 
 
 def fingerprint(value):
@@ -44,8 +45,9 @@ def credential_binding(target):
     )}
 
 
-def uncertain_operations(manager, db, session_id, data):
+def uncertain_operations(manager, db, session_id, data, *, decode=None):
     """Use the full durable history, not the current context window or browser."""
+    decode = decode if decode is not None else manager._decrypt
     records = data.get(RECORDS, {})
     uncertain = {operation for operation, record in records.items()
                  if record.get("state") == "dispatched" or record.get("status") == "unknown"}
@@ -54,7 +56,7 @@ def uncertain_operations(manager, db, session_id, data):
     for message in db.scalars(select(AssistantMessage).where(
         AssistantMessage.session_id == session_id, AssistantMessage.role == "tool",
     )):
-        value = manager._decrypt(message)
+        value = decode(message)
         if value.get("tool_name") not in {"execute_step", "retry_step"}:
             continue
         try:
@@ -335,7 +337,7 @@ async def decide_retry_approval(manager, owner, sid, approval_id, decision):
     return detail
 
 
-async def run_with_retry_approval(manager, owner, sid, operation_id, *, turn, invocation):
+async def run_with_retry_approval(manager, owner, sid, operation_id, *, turn, invocation, auth_limit=None):
     from app.services.assistant import AssistantError
 
     try:
@@ -359,7 +361,16 @@ async def run_with_retry_approval(manager, owner, sid, operation_id, *, turn, in
             preapproved = bool(grant and not grant.get("invocation")
                                and valid_grant(data, scope, operation, grant["id"]))
             record = eligible_record(manager, db, owner, sid, data, operation)
-            if not preapproved:
+            automatic = builtin_category(record["step"]["feature_type"]) != "post"
+            if automatic:
+                turn_id, _ = auth_budget_context(
+                    manager, db, sid, data, turn=turn, auth_limit=auth_limit)
+                if grant and grant.get("automatic") and valid_grant(data, scope, operation, grant["id"]):
+                    return failure("retry_authorization_required")
+                grant = issue_grant(data, scope, operation, record["step"], automatic=True,
+                                    turn_id=turn_id, invocation=deepcopy(invocation))
+                manager._encrypt(row, data)
+            elif not preapproved:
                 remaining = turn["deadline"] - asyncio.get_running_loop().time()
                 if data.get(PENDING):
                     return failure("retry_approval_already_pending")
@@ -385,8 +396,26 @@ async def run_with_retry_approval(manager, owner, sid, operation_id, *, turn, in
                     data[PENDING] = approval
                 manager._encrypt(row, data)
             db.commit()
+        if automatic:
+            try:
+                return await run_authorized_retry(
+                    manager, owner, sid, operation, invocation=invocation, turn=turn, auth_limit=auth_limit)
+            finally:
+                # A denied/cancelled admission must not leave reusable authority.
+                with manager.session_factory() as db:
+                    db.execute(update(AssistantSession).where(
+                        AssistantSession.id == sid, AssistantSession.owner == owner,
+                    ).values(updated_at=AssistantSession.updated_at))
+                    db.expire_all()
+                    row = manager._owned(db, owner, sid)
+                    data = manager._decrypt(row)
+                    current = data.get(GRANTS, {}).get(operation, {})
+                    if current.get("id") == grant["id"] and current.get("status") == "approved":
+                        current["status"] = "expired"
+                        manager._encrypt(row, data)
+                        db.commit()
         if preapproved:
-            return await run_authorized_retry(manager, owner, sid, operation)
+            return await run_authorized_retry(manager, owner, sid, operation, turn=turn, auth_limit=auth_limit)
         event = asyncio.Event()
         manager._approval_waiters[approval_id] = event
         while True:
@@ -412,7 +441,8 @@ async def run_with_retry_approval(manager, owner, sid, operation_id, *, turn, in
                 if status not in {"pending", "approved"}:
                     return deepcopy(approval["result"])
             if status == "approved":
-                result = await run_authorized_retry(manager, owner, sid, operation, invocation=invocation)
+                result = await run_authorized_retry(manager, owner, sid, operation, invocation=invocation,
+                                                    turn=turn, auth_limit=auth_limit)
                 with manager.session_factory() as db:
                     row = running_row(manager, db, owner, sid)
                     data = manager._decrypt(row)
@@ -426,8 +456,8 @@ async def run_with_retry_approval(manager, owner, sid, operation_id, *, turn, in
             await manager._wait_for_user(turn, event, min(0.25, max(
                 0.001, approval["expires_epoch"] - time.time())))
             event.clear()
-    except AssistantError as exc:
-        return failure(exc.code)
+    except (AssistantError, Denied) as exc:
+        return failure(exc.code if isinstance(exc, AssistantError) else str(exc))
     finally:
         if approval_id:
             manager._approval_waiters.pop(approval_id, None)
@@ -479,7 +509,8 @@ async def authorize_retry(manager, owner, sid, payload) -> dict:
             return detail
 
 
-async def run_authorized_retry(manager, owner, sid, operation_id, *, invocation=None) -> dict:
+async def run_authorized_retry(manager, owner, sid, operation_id, *, invocation=None, turn=None,
+                               auth_limit=None) -> dict:
     from app.services.assistant_execution import AssistantExecution
 
     try:
@@ -502,4 +533,5 @@ async def run_authorized_retry(manager, owner, sid, operation_id, *, invocation=
     return await AssistantExecution(
         manager, owner, sid, target,
         retry_authorization={"operation_id": operation, "id": capability},
+        turn=turn, invocation=invocation, auth_limit=auth_limit,
     ).execute({"operation_id": str(uuid4()), "step": step})

@@ -33,12 +33,12 @@ _SENSITIVE = re.compile(
     r"inline|staticfields|fieldvalues|formfields|^fields$|^values?$|^raw$|^body$|^payload$", re.I,
 )
 _SITE_FIELDS = (
-    "id", "name", "base_url", "enabled", "template_id", "lane_policy",
+    "id", "history_key", "name", "base_url", "enabled", "template_id", "lane_policy",
     "support_resign", "resign_max_days", "bitwarden_enabled", "credential_provider_id",
     "checkin_after", "timezone", "config_revision", "created_at", "updated_at",
 )
 _TEMPLATE_FIELDS = (
-    "id", "name", "parent_id", "enabled", "version", "created_at", "updated_at",
+    "id", "history_key", "name", "parent_id", "enabled", "version", "created_at", "updated_at",
 )
 _RUN_FIELDS = ("id", "mode", "trigger", "status", "created_at", "started_at", "finished_at")
 _JOB_FIELDS = (
@@ -179,23 +179,28 @@ class AssistantData:
     @staticmethod
     def tool_definitions() -> list:
         identifier = {"type": "integer", "minimum": 1, "maximum": 9223372036854775807}
+        offset = {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}
+        limit = {"type": "integer", "minimum": 1, "maximum": 100}
         definitions = []
         for name, description, properties, required in (
-            ("list_sites", "List current sites; optional name query. No credentials.",
+            ("list_sites", "Page sites by name.",
              {"query": {"type": "string", "maxLength": 200},
-              "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, []),
-            ("get_site_config", "Read a site's sanitized local/resolved workflow and signals.",
+              "offset": dict(offset), "limit": dict(limit)}, []),
+            ("get_site_config", "Sanitized site config.",
              {"site_id": dict(identifier)}, ["site_id"]),
-            ("list_templates", "List current templates (at most 100).", {}, []),
-            ("get_template_config", "Read a template's sanitized local/resolved workflow and signals.",
+            ("list_templates", "Page templates by name.",
+             {"query": {"type": "string", "maxLength": 200},
+              "offset": dict(offset), "limit": dict(limit)}, []),
+            ("get_template_config", "Sanitized template config.",
              {"template_id": dict(identifier)}, ["template_id"]),
-            ("get_system_status", "Read integration metadata, cached/shallow Bitwarden health and lane status.",
+            ("get_system_status", "System status; model fields environment-only, not DB.",
              {}, []),
-            ("list_recent_runs", "List recent run metadata; optionally filter by site.",
+            ("list_recent_runs", "Page recent runs by site.",
              {"site_id": dict(identifier),
+              "offset": dict(offset),
               "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, []),
-            ("get_run_summary", "Read run/job metadata, never logs, messages, artifacts or results.",
-             {"run_id": dict(identifier)}, ["run_id"]),
+            ("get_run_summary", "Run/job metadata page.",
+             {"run_id": dict(identifier), "offset": dict(offset), "limit": dict(limit)}, ["run_id"]),
         ):
             definitions.append({"type": "function", "function": {
                 "name": name, "description": description,
@@ -240,21 +245,20 @@ class AssistantData:
             return {"ok": False, "code": "data_unavailable"}
 
     def _read(self, db, name, args):
-        if name == "list_sites":
-            statement = select(*(getattr(Site, field) for field in _SITE_FIELDS))
+        if name in {"list_sites", "list_templates"}:
+            model, fields = (Site, _SITE_FIELDS) if name == "list_sites" else (Template, _TEMPLATE_FIELDS)
+            statement = select(*(getattr(model, field) for field in fields))
             if args.get("query"):
                 query = args["query"]
                 # Search names, never raw URL userinfo/query/fragment secrets.
-                statement = statement.where(Site.name.icontains(query, autoescape=True))
-            limit = args.get("limit", 100)
-            rows = db.execute(statement.order_by(Site.name, Site.id).limit(limit + 1)).mappings().all()
+                statement = statement.where(model.name.icontains(query, autoescape=True))
+            offset, limit = args.get("offset", 0), args.get("limit", 100)
+            rows = db.execute(statement.order_by(model.name, model.id)
+                              .offset(offset).limit(limit + 1)).mappings().all()
             return {"ok": True, "items": [dict(row) for row in rows[:limit]],
+                    "offset": offset, "limit": limit,
+                    "next_offset": offset + len(rows[:limit]) if len(rows) > limit else None,
                     "truncated": len(rows) > limit}
-        if name == "list_templates":
-            rows = db.execute(select(*(getattr(Template, field) for field in _TEMPLATE_FIELDS))
-                              .order_by(Template.name, Template.id).limit(101)).mappings().all()
-            return {"ok": True, "items": [dict(row) for row in rows[:100]],
-                    "truncated": len(rows) > 100}
         if name in {"get_site_config", "get_template_config"}:
             kind = "site" if name == "get_site_config" else "template"
             identifier = args[f"{kind}_id"]
@@ -301,19 +305,26 @@ class AssistantData:
                 statement = statement.where(select(SiteJob.id).where(
                     SiteJob.run_id == Run.id, SiteJob.site_id == args["site_id"],
                 ).exists())
+            offset, limit = args.get("offset", 0), args.get("limit", 20)
             rows = db.execute(statement.order_by(Run.created_at.desc(), Run.id.desc())
-                              .limit(args.get("limit", 20))).mappings()
-            return {"ok": True, "items": [self._run_summary(db, dict(row)) for row in rows]}
+                              .offset(offset).limit(limit + 1)).mappings().all()
+            return {"ok": True, "items": [self._run_summary(db, dict(row)) for row in rows[:limit]],
+                    "offset": offset, "limit": limit,
+                    "next_offset": offset + len(rows[:limit]) if len(rows) > limit else None,
+                    "truncated": len(rows) > limit}
         row = db.execute(select(*(getattr(Run, field) for field in _RUN_FIELDS))
                          .where(Run.id == args["run_id"])).mappings().first()
         if row is None:
             raise WorkflowNotFoundError("Run not found")
         summary = self._run_summary(db, dict(row))
+        offset, limit = args.get("offset", 0), args.get("limit", 100)
         jobs = db.execute(select(*(getattr(SiteJob, field) for field in _JOB_FIELDS))
                           .where(SiteJob.run_id == row["id"])
-                          .order_by(SiteJob.id).limit(101)).mappings().all()
-        return {"ok": True, "run": summary, "jobs": [dict(job) for job in jobs[:100]],
-                "jobs_truncated": len(jobs) > 100}
+                          .order_by(SiteJob.id).offset(offset).limit(limit + 1)).mappings().all()
+        return {"ok": True, "run": summary, "jobs": [dict(job) for job in jobs[:limit]],
+                "offset": offset, "limit": limit,
+                "next_offset": offset + len(jobs[:limit]) if len(jobs) > limit else None,
+                "jobs_truncated": len(jobs) > limit}
 
     @staticmethod
     def _run_summary(db, row):
@@ -343,9 +354,9 @@ class AssistantData:
                 is_set = (value is not None
                           if field in {"supports_vision", "max_tokens"} else bool(value))
                 sources[field] = "env" if is_set else "db" if f"{name}.{field}" in present else "unset"
-            required = ("url",) if name == "proxy" else (
+            required = ("url",) if name in {"proxy", "cfbox"} else (
                 ("base_url", "api_key", "model") if name == "vision" else
-                ("url", "api_key") if name == "cfbox" else ("url", "token")
+                ("url", "token")
             )
             integrations.append({
                 "name": name, "configured": all(sources[field] != "unset" for field in required),
@@ -359,6 +370,7 @@ class AssistantData:
         return {"ok": True, "config_ai_enabled": bool(settings.config_ai_enabled),
                 "integrations": integrations, "health_checked": False,
                 "health_scope": ["bitwarden"],
+                "model_config_scope": "environment_only",
                 "model": safe_model, "supports_vision": settings.vision_supports_vision,
                 "max_tokens": settings.vision_max_tokens}
 

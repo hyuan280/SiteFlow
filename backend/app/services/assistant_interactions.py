@@ -135,18 +135,22 @@ def bind_sites(db, target):
 
 
 def grant(target, capability, *, features=None):
+    from app.services.assistant_categories import builtin_category
     from app.services.assistant_execution import SUPPORTED_FEATURES
 
     if capability == "execution":
         credentials = target.get("credential_mode") == "bitwarden" or (
             target.get("credential_mode") == "manual" and target.get("site_id") is not None)
         features = set(SUPPORTED_FEATURES if features is None else features)
-        features = {key for key in features if credentials or not key.startswith("auth.")}
+        features &= SUPPORTED_FEATURES
+        features = {key for key in features if credentials or not (
+            builtin_category(key) == "auth" or key == "challenge.2fa")}
         target["execution_consent"] = True
         target["execution_features"] = sorted(features)
-        target["credential_consent"] = credentials and any(key.startswith("auth.") for key in features)
-        target["allow_sign"] = any(key.startswith("sign.") or key in {
-            "action.click", "challenge.altcha", "challenge.slider"} for key in features)
+        target["credential_consent"] = credentials and any(
+            builtin_category(key) == "auth" or key == "challenge.2fa" for key in features)
+        target["allow_sign"] = any(builtin_category(key) in {"sign", "challenge"} or key in {
+            "action.click", "action.fill"} for key in features)
     else:
         target[capability + "_consent"] = True
 
@@ -190,10 +194,30 @@ def prepare(db, request, data, values, *, tools=None):
 
     args = request.model_dump()
     purpose = request.purpose
+    if purpose == "cookie_clear":
+        from app.services.assistant_cookies import prepare_cookie_clear
+
+        return prepare_cookie_clear(db, tools, request, data)
+    if purpose == "scheduler_config":
+        from app.services.assistant_scheduler import prepare_scheduler_update
+
+        return prepare_scheduler_update(db, tools, request, data)
+    if purpose == "run_cancel":
+        from app.services.assistant_operations import prepare_run_cancel
+
+        return prepare_run_cancel(db, tools, request, data)
+    if purpose == "template_import":
+        from app.services.assistant_templates import prepare_template_import
+
+        return prepare_template_import(db, tools, request, data)
     if purpose == "site_config":
         from app.services.assistant_site_config import prepare_site_config
 
         return prepare_site_config(db, tools, request, data)
+    if purpose == "consumption":
+        from app.services.assistant_consumption import prepare_consumption
+
+        return prepare_consumption(db, tools, request, data)
     target = data.get("target")
     public = {"kind": "authorization", "purpose": purpose, "options": [], "fields": [],
               "multiple": False, "review": {}}
@@ -258,7 +282,9 @@ def prepare(db, request, data, values, *, tools=None):
             if request.capability == "execution":
                 if request.feature_type is not None and request.feature_type not in SUPPORTED_FEATURES:
                     raise AssistantError("execution_feature_denied", 422)
-                if (request.feature_type or "").startswith("auth.") and not (
+                from app.services.assistant_categories import builtin_category
+
+                if request.feature_type and (builtin_category(request.feature_type) == "auth" or request.feature_type == "challenge.2fa") and not (
                     target.get("credential_mode") == "bitwarden" or (
                         target.get("credential_mode") == "manual" and target.get("site_id"))):
                     raise AssistantError("credentials_unavailable", 422)
@@ -391,7 +417,7 @@ async def request_interaction(tools, arguments):
                 if previous:
                     return deepcopy(previous["result"])
             if ledger_key in ledger:
-                if request.purpose == "site_config" and ledger[ledger_key]["status"] == "completed":
+                if request.purpose in {"site_config", "template_import", "scheduler_config"} and ledger[ledger_key]["status"] == "completed":
                     return terminal("already_requested")
                 return deepcopy(ledger[ledger_key].get("result") or terminal("already_requested"))
             if request.purpose == "trusted_origins":
@@ -472,6 +498,26 @@ async def request_interaction(tools, arguments):
 
                             site_result = apply_site_config(db, tools, data, args)
                             dispose = True
+                        elif purpose == "consumption":
+                            from app.services.assistant_consumption import apply_consumption
+
+                            apply_consumption(db, tools, data, args)
+                        elif purpose == "template_import":
+                            from app.services.assistant_templates import apply_template_import
+
+                            site_result = apply_template_import(db, tools, data, args)
+                        elif purpose == "scheduler_config":
+                            from app.services.assistant_scheduler import apply_scheduler_update
+
+                            site_result = apply_scheduler_update(db, tools, data, args)
+                        elif purpose == "run_cancel":
+                            from app.services.assistant_operations import apply_run_cancel
+
+                            site_result = apply_run_cancel(db, tools, data, args)
+                        elif purpose == "cookie_clear":
+                            from app.services.assistant_cookies import apply_cookie_clear
+
+                            site_result = apply_cookie_clear(db, tools, data, args)
                         if target != previous_target or purpose == "site_config":
                             invalidate_retry_authority(data)
                         if purpose in {"target", "trusted_origins", "proxy", "site_config"}:
@@ -479,7 +525,9 @@ async def request_interaction(tools, arguments):
                             data.pop("_context_summary", None)
                             data.pop("_workflow_proposal_id", None)
                         result = {"ok": True, "purpose": purpose, **item["response"], **site_result}
-                        if purpose != "question":
+                        if purpose == "cookie_clear":
+                            result = {"ok": True, "purpose": purpose, **site_result}
+                        if purpose not in {"question", "scheduler_config", "run_cancel", "cookie_clear"}:
                             result["target"] = manager._public_target(target)
                         finish(data, item, "completed", result)
                 manager._encrypt(row, data)

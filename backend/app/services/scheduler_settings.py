@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -19,6 +22,8 @@ INTERVAL_KEY = "scheduler_interval_seconds"
 RANGES_KEY = "scheduler_ranges_json"
 NEXT_RUN_KEY = "scheduler_next_run_at"
 TIMEZONE_APPLIED_KEY = "scheduler_timezone_applied"
+REVISION_KEY = "scheduler_config_revision"
+CONFIG_KEYS = (ENABLED_KEY, MODE_KEY, CRON_KEY, INTERVAL_KEY, RANGES_KEY)
 
 DEFAULT_MODE: SchedulerMode = "cron"
 DEFAULT_CRON = "0 10 * * *"
@@ -33,9 +38,17 @@ class SchedulerLockedError(RuntimeError):
     pass
 
 
+class SchedulerConflictError(RuntimeError):
+    pass
+
+
 def validate_ranges(values: list[str]) -> list[str]:
     cleaned: list[str] = []
     for item in values:
+        if not isinstance(item, str) or not re.fullmatch(
+            r"\d{1,2}:\d{2}-\d{1,2}:\d{2}", item.strip(), flags=re.ASCII
+        ):
+            raise SchedulerValidationError("Range must be HH:MM-HH:MM")
         text = item.strip()
         try:
             start_text, end_text = text.split("-", 1)
@@ -49,6 +62,7 @@ def validate_ranges(values: list[str]) -> list[str]:
             raise SchedulerValidationError("随机调度范围分钟必须在 00-59 之间")
         if end_h * 60 + end_m <= start_h * 60 + start_m:
             raise SchedulerValidationError("随机调度范围的结束时间必须晚于开始时间")
+        text = f"{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}"
         if text not in cleaned:
             cleaned.append(text)
     return cleaned
@@ -173,7 +187,8 @@ class SchedulerSettingsService:
         self.settings = settings
 
     def _load(self, key: str, default):
-        row = self.session.get(AppSetting, key)
+        row = self.session.scalar(select(AppSetting).where(AppSetting.key == key).execution_options(
+            populate_existing=True))
         if row is None:
             return default
         try:
@@ -205,6 +220,7 @@ class SchedulerSettingsService:
         return bool(self._load(ENABLED_KEY, True))
 
     def view(self) -> SchedulerSettingsView:
+        revision = self._load(REVISION_KEY, 0)
         mode = self._load(MODE_KEY, DEFAULT_MODE)
         cron = self._load(CRON_KEY, DEFAULT_CRON)
         interval = self._load(INTERVAL_KEY, DEFAULT_INTERVAL)
@@ -240,6 +256,7 @@ class SchedulerSettingsService:
             except ValueError:
                 next_run_at = None
         return SchedulerSettingsView(
+            revision=revision,
             enabled=enabled,
             enabled_source=enabled_source,
             mode=mode,
@@ -251,8 +268,7 @@ class SchedulerSettingsService:
                 if self._env_configured()
                 else (
                     "db"
-                    if self.session.get(AppSetting, MODE_KEY)
-                    or self.session.get(AppSetting, ENABLED_KEY)
+                    if any(self.session.get(AppSetting, key) for key in CONFIG_KEYS)
                     else "default"
                 )
             ),
@@ -261,42 +277,106 @@ class SchedulerSettingsService:
             next_run_at=next_run_at if enabled else None,
         )
 
-    def update(self, payload: SchedulerSettingsUpdate) -> SchedulerSettingsView:
+    def binding(self) -> dict:
+        """Freeze configuration, including unversioned/raw edits, but not runtime timing."""
+        with self.session.no_autoflush:
+            revision = self._load(REVISION_KEY, 0)
+            raw = dict(self.session.execute(select(AppSetting.key, AppSetting.value_json).where(
+                AppSetting.key.in_(CONFIG_KEYS))).all())
+        return {"revision": revision, "raw": {key: raw.get(key) for key in CONFIG_KEYS},
+                "environment": {name: getattr(self.settings, name) for name in (
+                    "scheduler_enabled", "scheduler_mode", "scheduler_cron",
+                    "scheduler_interval_seconds", "scheduler_ranges", "scheduler_timezone")}}
+
+    def preview(self, payload: SchedulerSettingsUpdate) -> SchedulerSettingsUpdate:
+        """Validate and canonicalize without flushing, reserving, or writing settings."""
         if self._env_configured():
             raise SchedulerLockedError("调度设置已由环境变量锁定")
         ranges = validate_ranges(payload.ranges)
-        if payload.mode == "cron":
-            if not payload.cron.strip():
-                raise SchedulerValidationError("定时调度需要填写 cron 表达式")
-            if not croniter.is_valid(payload.cron):
-                raise SchedulerValidationError("cron 表达式无效")
+        cron = " ".join(payload.cron.split()).upper()
+        if (cron and (len(cron.split()) != 5 or not croniter.is_valid(cron))) or (
+            payload.mode == "cron" and not cron
+        ):
+            raise SchedulerValidationError("Invalid five-field cron expression")
+        if cron:
+            try:
+                croniter(cron, datetime.now(self._zone())).get_next(datetime)
+            except (ValueError, TypeError, OverflowError):
+                raise SchedulerValidationError("Cron has no valid next occurrence") from None
         if payload.mode == "interval" and payload.interval_seconds < 60:
             raise SchedulerValidationError("间隔调度不能少于 60 秒")
         if payload.mode == "random" and not ranges:
             raise SchedulerValidationError("随机调度至少需要一个时间范围")
-        self._upsert(MODE_KEY, payload.mode)
-        self._upsert(CRON_KEY, payload.cron.strip())
-        self._upsert(INTERVAL_KEY, payload.interval_seconds)
-        self._upsert(RANGES_KEY, ranges)
+        return payload.model_copy(update={"cron": cron, "ranges": ranges})
+
+    def update(self, payload: SchedulerSettingsUpdate, *,
+               expected_revision: int | None = None, _commit: bool = True,
+               fields: set[str] | None = None) -> SchedulerSettingsView:
+        # Even legacy clients use the revision observed before loading their write.
+        current = self.view()
+        expected = expected_revision if expected_revision is not None else payload.expected_revision
+        if expected is None:
+            expected = current.revision
+        if expected != current.revision:
+            raise SchedulerConflictError("scheduler_revision_conflict")
+        payload = self.preview(payload)
+        values = {MODE_KEY: payload.mode, CRON_KEY: payload.cron,
+                  INTERVAL_KEY: payload.interval_seconds, RANGES_KEY: payload.ranges}
         if payload.enabled is not None:
-            self._upsert(ENABLED_KEY, bool(payload.enabled))
-        enabled = payload.enabled if payload.enabled is not None else self._enabled()
-        if not enabled:
-            self._delete(NEXT_RUN_KEY)
-        else:
-            next_run = next_run_at_for(
-                payload.mode,
-                payload.cron.strip(),
-                payload.interval_seconds,
-                ranges,
-                tz=self._zone(),
-            )
-            if next_run is None:
-                self._delete(NEXT_RUN_KEY)
+            values[ENABLED_KEY] = payload.enabled
+        if fields is not None:
+            keys = {"enabled": ENABLED_KEY, "mode": MODE_KEY, "cron": CRON_KEY,
+                    "interval_seconds": INTERVAL_KEY, "ranges": RANGES_KEY}
+            values = {keys[name]: values[keys[name]] for name in fields}
+        raw = self.binding()["raw"]
+        try:
+            changed = any(raw[key] is None or json.loads(raw[key]) != value
+                          for key, value in values.items())
+        except (ValueError, TypeError):
+            changed = True
+        try:
+            revision_row = self.session.scalar(select(AppSetting.value_json).where(
+                AppSetting.key == REVISION_KEY))
+            if revision_row is None:
+                if expected != 0:
+                    raise SchedulerConflictError("scheduler_revision_conflict")
+                self.session.add(AppSetting(key=REVISION_KEY, value_json=str(int(changed))))
+                self.session.flush()
             else:
-                self._upsert(NEXT_RUN_KEY, next_run.astimezone(timezone.utc).isoformat())
-        self.session.commit()
-        return self.view()
+                result = self.session.execute(update(AppSetting).where(
+                    AppSetting.key == REVISION_KEY, AppSetting.value_json == str(expected)
+                ).values(value_json=str(expected + int(changed)),
+                         updated_at=datetime.now(timezone.utc)),
+                    execution_options={"synchronize_session": False})
+                if result.rowcount != 1:
+                    raise SchedulerConflictError("scheduler_revision_conflict")
+            if changed:
+                for key, value in values.items():
+                    self._upsert(key, value)
+                effective_change = any(getattr(current, name) != getattr(payload, name)
+                                       for name in ("mode", "cron", "interval_seconds", "ranges")
+                                       if fields is None or name in fields)
+                effective_change |= payload.enabled is not None and payload.enabled != current.enabled
+                if effective_change or self._load(NEXT_RUN_KEY, None) is None:
+                    enabled = payload.enabled if payload.enabled is not None else current.enabled
+                    next_run = next_run_at_for(payload.mode, payload.cron, payload.interval_seconds,
+                                               payload.ranges, tz=self._zone()) if enabled else None
+                    if next_run is None:
+                        self._delete(NEXT_RUN_KEY)
+                    else:
+                        self._upsert(NEXT_RUN_KEY, next_run.astimezone(timezone.utc).isoformat())
+            self.session.flush()
+            if _commit:
+                self.session.commit()
+            return self.view()
+        except (IntegrityError, OperationalError) as exc:
+            if _commit:
+                self.session.rollback()
+            raise SchedulerConflictError("scheduler_revision_conflict") from exc
+        except SchedulerConflictError:
+            if _commit:
+                self.session.rollback()
+            raise
 
     def set_next_run(self, value: datetime | None) -> None:
         if value is None:

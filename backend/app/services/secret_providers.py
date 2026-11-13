@@ -6,6 +6,7 @@ import logging
 import secrets
 import threading
 import time
+from uuid import uuid4
 
 import httpx
 import grpc
@@ -82,7 +83,7 @@ class SecretProviders:
     def digest(token):
         return hashlib.sha256(token.encode()).hexdigest()
 
-    def register(self, job, site, steps):
+    def register(self, job, site, steps, *, reserve_auth=None):
         token = secrets.token_urlsafe(32)
         allowed = {}
         resign_steps = set()
@@ -100,7 +101,7 @@ class SecretProviders:
                 allowed[step.step_key] = (step.feature_type, provider, options)
         with self.lock:
             self.leases = {key: value for key, value in self.leases.items() if value[0] != job.id}
-            self.jobs[job.id] = (self.digest(token), site.id, job.attempt, time.monotonic() + self.settings.execution_timeout, allowed, frozenset(resign_steps))
+            self.jobs[job.id] = (self.digest(token), site.id, job.attempt, time.monotonic() + self.settings.execution_timeout, allowed, frozenset(resign_steps), reserve_auth)
         return token
 
     def authorize_resign(self, token, job_id, site_id, step_key, session):
@@ -188,6 +189,16 @@ class SecretProviders:
                     raise SecretDenied() from None
             if lease is None:
                 value = secrets.token_urlsafe(32)
+                if run.trigger == "assistant":
+                    from app.services.assistant_categories import Denied, builtin_category
+
+                    try:
+                        if builtin_category(step[0]) == "auth":
+                            if grant[6] is None:
+                                raise SecretDenied("execution_authorization_changed")
+                            grant[6](step_key, step[0], str(uuid4()))
+                    except Denied as exc:
+                        raise SecretDenied(str(exc)) from None
                 with self.lock:
                     if self.jobs.get(job_id) is not grant:
                         raise SecretDenied()

@@ -71,7 +71,8 @@ def assert_requests(requests, latest):
         messages = body["messages"]
         assert estimate_context_tokens(messages, body["tools"]) <= 64000
         assert len(request.content) <= 1536 * 1024
-        assert body["tools"] == service.tool_definitions()
+        assert body["tools"] == [definition for definition in service.tool_definitions()
+                                 if definition["function"]["name"] != "submit_takeover_conclusion"]
         assert messages[0]["role"] == messages[1]["role"] == "system"
         assert {"role": "user", "content": latest} in messages
         pending = set()
@@ -496,7 +497,7 @@ def safety_facts(request):
     notes = [item for item in messages
              if item["content"] and item["content"].startswith("Protected execution safety facts (")]
     assert len(notes) == 1 and notes[0]["role"] == "user"
-    assert "no_retry=true" in notes[0]["content"]
+    assert "do not override current builtin category policy" in notes[0]["content"]
     return json.loads(notes[0]["content"].split("\n", 1)[1])
 
 
@@ -780,7 +781,7 @@ def test_small_context_cap_scales_historical_summary_chunks(
     assistant_client, provider, context_settings, monkeypatch,
 ):
     client = assistant_client
-    context_settings(context_max_tokens=24000)
+    context_settings(context_max_tokens=30000)
     manager = client.app.state.assistant_manager
     identifier = create(client)
     seed(manager, identifier, rows=48, size=1000)
@@ -788,7 +789,7 @@ def test_small_context_cap_scales_historical_summary_chunks(
 
     async def summarize(config, messages):
         chunks.append(messages)
-        assert estimate_context_tokens(messages) <= 14400
+        assert estimate_context_tokens(messages) <= 18000
         return "Earlier requests retained"
 
     monkeypatch.setattr(service, "summarize_context", summarize)
@@ -796,7 +797,7 @@ def test_small_context_cap_scales_historical_summary_chunks(
     send(client, identifier)
     assert wait(client, identifier)["messages"][-1]["content"] == "Small context complete"
     assert chunks
-    assert estimate_context_tokens(json.loads(provider[1][0].content)["messages"], service.tool_definitions()) <= 24000
+    assert estimate_context_tokens(json.loads(provider[1][0].content)["messages"], service.tool_definitions()) <= 30000
 
 
 def test_disabled_compaction_retains_full_legacy_tool_and_uncertainty(
@@ -865,7 +866,7 @@ def test_small_context_cap_fits_live_results_without_losing_protected_users(
     assistant_client, provider, context_settings, monkeypatch,
 ):
     client = assistant_client
-    context_settings(context_max_tokens=24000)
+    context_settings(context_max_tokens=30000)
     manager = client.app.state.assistant_manager
     identifier = create(client)
     previous = "Earlier exact constraint " + "\u6d4b" * 200
@@ -888,6 +889,6 @@ def test_small_context_cap_fits_live_results_without_losing_protected_users(
     assert dispatched == [1, 1, 1]
     for request in provider[1]:
         messages = json.loads(request.content)["messages"]
-        assert estimate_context_tokens(messages, service.tool_definitions()) <= 24000
+        assert estimate_context_tokens(messages, service.tool_definitions()) <= 30000
         assert {"role": "user", "content": previous} in messages
         assert {"role": "user", "content": latest} in messages

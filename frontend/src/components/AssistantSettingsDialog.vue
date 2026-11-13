@@ -14,6 +14,7 @@ const auth = useAuthStore();
 const router = useRouter();
 const view = ref<AssistantSettingsView | null>(null);
 const draft = reactive({ max_tool_calls: "", max_model_rounds: "", max_parallel_tool_calls: "",
+  max_auth_uses_per_turn: "",
   turn_timeout_seconds: "", max_tokens: "", context_max_tokens: "", auto_compact: false, auto_title: false,
   auto_authorize_execution: false, auto_authorize_screenshot: false, auto_authorize_workflow: false });
 const inheritTokens = ref(true);
@@ -30,6 +31,7 @@ const budgetFields = [
   { key: "max_tool_calls", label: "工具调用次数" },
   { key: "max_model_rounds", label: "模型轮数" },
   { key: "max_parallel_tool_calls", label: "每轮并行工具调用数" },
+  { key: "max_auth_uses_per_turn", label: "每轮 auth 类步骤使用上限" },
   { key: "turn_timeout_seconds", label: "单轮超时（秒）" },
 ] as const;
 const values = computed<AssistantSettingsValues | null>(() => {
@@ -204,6 +206,7 @@ onBeforeUnmount(invalidate);
           <el-input v-model="draft[field.key]" inputmode="numeric" :aria-label="field.label" />
         </el-form-item>
       </div>
+      <p class="muted">默认每轮最多 3 次 auth 类新步骤使用（包括重试），按 auth 类总计，不是每个 feature 分别计算。凭据获取失败或取消的尝试也计入；其他类别步骤不计入此上限。此设置不授予新权限，也不改变步骤分类。</p>
       <h3>模型与上下文</h3>
       <el-form-item label="模型输出上限 max_tokens">
         <div class="token-controls">

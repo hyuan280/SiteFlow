@@ -1160,13 +1160,15 @@ async def _run_turnstile(
     xdisplay: Desktop | None,
     lane_key: str,
     log: Callable[[str, str], None] | None = None,
+    private: Any = None,
 ) -> tuple[str, str, dict[str, Any]]:
     wait_seconds = max(1, min(120, int(config.get("wait_seconds") or 15)))
     diagnostics: dict[str, Any] = {"state": "unknown", "phase": "page_check"}
     try:
         async with asyncio.timeout(wait_seconds):
             return await _run_turnstile_detection(
-                page, config, cfbox, cancel, xdisplay, lane_key, log, diagnostics
+                page, config, cfbox, cancel, xdisplay, lane_key, log, diagnostics,
+                **({"private": private} if private is not None else {}),
             )
     except TimeoutError:
         if log:
@@ -1183,6 +1185,7 @@ async def _run_turnstile_detection(
     lane_key: str,
     log: Callable[[str, str], None] | None = None,
     diagnostics: dict[str, Any] | None = None,
+    private: Any = None,
 ) -> tuple[str, str, dict[str, Any]]:
     note = log or (lambda _level, _message: None)
     if not cfbox or not cfbox.get("url"):
@@ -1355,6 +1358,8 @@ async def _run_turnstile_detection(
                 return "fail", "需要 X fallback，但车道没有 display", {}
             try:
                 diagnostics["phase"] = "screenshot"
+                if private is not None:
+                    await private.pin_challenge()
                 if use_x_fallback and xdisplay:
                     image = await xdisplay.screenshot()
                     fallback_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
@@ -1566,7 +1571,10 @@ async def _run_turnstile_detection(
                             x_click_count += 1
                             click_mode = "x"
                         else:
-                            await page.mouse.click(x, y)
+                            if private is not None:
+                                await private.click_challenge(x, y)
+                            else:
+                                await page.mouse.click(x, y)
                             page_click_count += 1
                             if page_click_started_at is None:
                                 page_click_started_at = time.monotonic()
@@ -1831,6 +1839,7 @@ async def _refresh_captcha_image(
     refresh_selectors: list[str],
     image_selectors: list[str],
     log: Callable[[str, str], None],
+    private: Any = None,
 ) -> tuple[Any, bytes] | None:
     try:
         old_bytes = await image.screenshot(type="png", timeout=PAGE_TIMEOUT_MS)
@@ -1850,7 +1859,12 @@ async def _refresh_captcha_image(
         log("INFO", "未配置验证码刷新选择器，尝试点击验证码图片")
         target = image
     try:
-        await target.click(timeout=PAGE_TIMEOUT_MS)
+        if private is not None:
+            if target is not image:
+                target = await private.target(scope, refresh_selectors, "click")
+            await private.mutate(target)
+        else:
+            await target.click(timeout=PAGE_TIMEOUT_MS)
         log("INFO", "已点击验证码刷新元素")
     except Exception as exc:
         log("WARN", f"刷新验证码失败：{type(exc).__name__}: {str(exc)[:200]}")
@@ -1948,6 +1962,7 @@ async def _read_captcha(
     vision: dict[str, Any] | None = None,
     capture: Callable[[bytes, str], Awaitable[None]] | None = None,
     plugin_runtimes: dict[str, dict[str, Any]] | None = None,
+    private: Any = None,
 ) -> tuple[str, str, str, dict[str, Any]]:
     image_selectors = list(config.get("image_selector") or [])
     refresh_selectors = list(config.get("refresh_selector") or [])
@@ -2006,10 +2021,14 @@ async def _read_captcha(
     async def select_method(
         image_value: bytes,
     ) -> tuple[str, float | None, int | None]:
+        if private is not None:
+            await private.validate_origin()
         if method == "ddddocr":
             text_value, confidence = await asyncio.to_thread(
                 _classify_captcha, image_value
             )
+            if private is not None:
+                private.register_secret(text_value)
             _log_captcha_result(log, "ddddocr", text_value, confidence)
             return text_value, confidence, None
         if method == "vision":
@@ -2034,12 +2053,16 @@ async def _read_captcha(
                 vision,
                 execution_settings.get("llm_prompt") or DEFAULT_PROMPT,
             )
+            if private is not None:
+                private.register_secret(text_value)
             _log_captcha_result(log, "视觉模型", text_value)
             return text_value, None, None
         if method == "nexusphp_gd5":
             text_value, margin = await asyncio.to_thread(
                 _recognize_nexusphp_gd5, image_value
             )
+            if private is not None:
+                private.register_secret(text_value)
             _log_captcha_result(log, "nexusphp_gd5", text_value)
             log("INFO", f"nexusphp_gd5 模板匹配余量：{margin}")
             return text_value, None, margin
@@ -2122,7 +2145,8 @@ async def _read_captcha(
     if issue is not None:
         log("WARN", f"{method_label} 验证码识别结果不可用：{issue}")
         refreshed_image = await _refresh_captcha_image(
-            scope, image, refresh_selectors, image_selectors, log
+            scope, image, refresh_selectors, image_selectors, log,
+            **({"private": private} if private is not None else {}),
         )
         if refreshed_image is None:
             return (
@@ -2509,6 +2533,7 @@ async def _run_image_quiz(
     log: Callable[[str, str], None],
     vision: dict[str, Any] | None,
     capture: Callable[[bytes, str], Awaitable[None]] | None = None,
+    private: Any = None,
 ) -> tuple[str, str, dict[str, Any]]:
     if not vision or not all(
         vision.get(key) for key in ("base_url", "model", "api_key")
@@ -2535,6 +2560,15 @@ async def _run_image_quiz(
         form, error = await _read_quiz_form(page, config, log)
         if form is None:
             return "unknown", error, {"url": page.url}
+        private_rows = []
+        if private is not None:
+            # Pin all choices before provider inference; never rebind a selected answer.
+            for _, locator, _ in form["option_rows"]:
+                handle = await locator.element_handle()
+                original_form = await handle.evaluate_handle("el => el.form || null")
+                private.targets.append((locator, handle, original_form, "choice"))
+                await private.validate_target(handle)
+                private_rows.append(handle)
         if capture is not None:
             try:
                 await capture(form["image"], "图片答题截图")
@@ -2559,6 +2593,10 @@ async def _run_image_quiz(
                 vision,
                 custom_prompt,
             )
+            if private is not None:
+                if type(selected) is not int or not 1 <= selected <= len(form["options"]):
+                    raise ValueError()
+                private.register_secret(form["options"][selected - 1])
             log(
                 "INFO",
                 f"视觉模型选择第 {selected} 项：{_short(form['options'][selected - 1])}",
@@ -2573,7 +2611,13 @@ async def _run_image_quiz(
                     "视觉模型多次无法确定图片答题答案，需要人工处理",
                     {"reason": "vision_unclear", "attempts": attempt + 1},
                 )
-            if not await _refresh_quiz(page, config, log):
+            if private is not None:
+                if not config.get("refresh_selector"):
+                    return "waiting_human", "", {}
+                refresh = await private.target(page, config["refresh_selector"], "click")
+                await private.mutate(refresh)
+                await page.wait_for_timeout(2000)
+            elif not await _refresh_quiz(page, config, log):
                 return (
                     "waiting_human",
                     "视觉模型无法确定图片答题答案，且无法刷新题目，需要人工处理",
@@ -2600,11 +2644,23 @@ async def _run_image_quiz(
             if message is None:
                 log("WARN", "未找到图片答题留言框，继续提交答案")
             else:
-                await message.fill(message_text, timeout=PAGE_TIMEOUT_MS)
+                if private is not None:
+                    target = await private.target(page, message_selectors, "fill")
+                    await private.mutate(target, value=message_text)
+                else:
+                    await message.fill(message_text, timeout=PAGE_TIMEOUT_MS)
                 log("INFO", "已填写图片答题留言")
         selected_row = form["option_rows"][selected - 1]
         try:
-            await selected_row[1].click(timeout=PAGE_TIMEOUT_MS)
+            if private is not None:
+                target = private_rows[selected - 1]
+                current = (await target.input_value() if await target.evaluate("el => el.tagName === 'INPUT'")
+                           else await target.inner_text()).strip()
+                if current != selected_row[0]:
+                    raise RuntimeError("Private answer changed")
+                await private.mutate(private_rows[selected - 1])
+            else:
+                await selected_row[1].click(timeout=PAGE_TIMEOUT_MS)
         except Exception as exc:
             return (
                 "unknown",
@@ -2623,7 +2679,11 @@ async def _run_image_quiz(
             )
             if submit is not None:
                 try:
-                    await submit.click(timeout=PAGE_TIMEOUT_MS)
+                    if private is not None:
+                        target = await private.target(page, submit_selectors, "submit")
+                        await private.mutate(target)
+                    else:
+                        await submit.click(timeout=PAGE_TIMEOUT_MS)
                 except Exception as exc:
                     return (
                         "unknown",
@@ -3518,6 +3578,8 @@ async def _purchase_cards(
         await goto(count_url if config.get("card_count_url") else shop_url)
         baseline = await wait_cards()
         result.update(cards_before=baseline, cards_after=baseline)
+        if baseline is not None and baseline < 0:
+            raise ValueError("Negative inventory cannot define a bounded purchase quantity")
         if baseline is None:
             raise ValueError(f"在 {verify_seconds:g}s 内未找到补签卡数量，请检查补签卡库存地址、数量选择器和正则第一捕获组")
         if pending_count is not None:
@@ -3793,6 +3855,7 @@ async def _run_resign(
     action_name = str(config.get("ajax_action") or "attendanceRetroactive")
     date_param = str(config.get("ajax_date_param") or "params[date]")
     success: list[dict[str, Any]] = []
+    unconfirmed: list[dict[str, Any]] = []
     for value in to_retro:
         try:
             raw = await page.evaluate(
@@ -3810,17 +3873,17 @@ async def _run_resign(
                 {"url": endpoint, "dateParam": date_param, "date": value, "action": action_name},
             )
         except Exception as exc:
-            failed.append({"date": value, "message": f"{type(exc).__name__}: {exc}"})
+            unconfirmed.append({"date": value, "message": "Resign submission outcome uncertain"})
             log("WARN", f"补签 {value} 请求失败：{type(exc).__name__}: {exc}")
-            continue
+            break
         status_code = int((raw or {}).get("status") or 0)
         text = str((raw or {}).get("text") or "")
         if status_code >= 400:
-            failed.append(
+            unconfirmed.append(
                 {"date": value, "message": f"HTTP {status_code}: {text[:200]}"}
             )
             log("WARN", f"补签 {value} 返回 HTTP {status_code}")
-            continue
+            break
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
@@ -3834,8 +3897,9 @@ async def _run_resign(
             already_signed.append({"date": value, "message": message or "已经签到"})
             log("INFO", f"{value} 已经签到，视为已处理")
         else:
-            failed.append({"date": value, "message": message or "补签失败"})
+            unconfirmed.append({"date": value, "message": message or "补签结果未知"})
             log("WARN", f"补签失败：{value} {message}")
+            break
     cards_after = max(0, cards_before - len(success))
     data = {
         "url": page.url,
@@ -3844,11 +3908,14 @@ async def _run_resign(
             "success": success,
             "already_signed": already_signed,
             "failed": failed,
+            "unconfirmed": unconfirmed,
             "remaining": remaining,
             "cards_before": cards_before,
             "cards_after": cards_after,
         },
     }
+    if unconfirmed:
+        return "waiting_human", "\u8865\u7b7e\u63d0\u4ea4\u7ed3\u679c\u672a\u77e5\uff0c\u8bf7\u4eba\u5de5\u6838\u9a8c", {**data, "outcome_uncertain": True}
     if failed:
         return (
             "fail",
@@ -3990,6 +4057,14 @@ async def _run_step(
                     secret_payload.setdefault("_result_secret_fingerprints", set()).add(
                         (len(value), hashlib.sha256(value.encode("utf-8")).hexdigest())
                     )
+
+    from worker.assistant_private import private_context, run_private_step
+    private = private_context(secret_payload)
+    if private is not None and feature in {
+        "action.fill", "challenge.turnstile", "challenge.image_captcha",
+        "sign.iframe.image_captcha", "challenge.grid_captcha", "sign.image_quiz",
+    }:
+        return await run_private_step(private, step, vision, cfbox, lane_key)
 
     if feature.startswith("plugin."):
         return await _run_plugin_step(
@@ -4376,7 +4451,18 @@ async def _run_step(
         if secret_payload is not None:
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
         try:
-            await code_input.fill(code, timeout=PAGE_TIMEOUT_MS)
+            from worker.secret_client import validate_assistant_submission
+            from worker.browser_input import hold_page_input
+            async with hold_page_input(page):
+                await validate_assistant_submission(secret_payload, page, step)
+                if private is not None:
+                    target = await private.target(page, list(config.get("code_selector") or []), "code")
+                    if config.get("submit_selector"):
+                        await private.target(page, list(config["submit_selector"]), "submit")
+                    await private.mutate(target, value=code)
+                else:
+                    await code_input.fill(code, timeout=PAGE_TIMEOUT_MS)
+                await validate_assistant_submission(secret_payload, page, step, ("code",))
         except Exception:
             raise RuntimeError("Sensitive TOTP fill failed") from None
         submit_selectors = list(config.get("submit_selector") or [])
@@ -4397,7 +4483,9 @@ async def _run_step(
             return "fail", "未找到动态验证码提交按钮", {"reason": "selector_not_found", "field": "submit_selector"}
         if secret_payload is not None:
             require_site_origin(page.url, secret_payload["base_url"], secret_payload.get("trusted_urls", []))
-        await submit.click(timeout=PAGE_TIMEOUT_MS)
+        async with hold_page_input(page):
+            await validate_assistant_submission(secret_payload, page, step, ("code",))
+            await submit.click(timeout=PAGE_TIMEOUT_MS)
         note("INFO", f"动态验证码已提交（长度 {len(code)}）")
         success = list(config.get("success_selector") or [])
         if success and await _find_locator(
@@ -4566,7 +4654,7 @@ async def execute_job(
 
         async def track_progress(progress: dict[str, Any]) -> None:
             nonlocal last_progress
-            if any(row.get("feature_type") in CHECKPOINT_RESIGN_FEATURES and
+            if payload.get("assistant_consumption_plan") is not None or any(row.get("feature_type") in CHECKPOINT_RESIGN_FEATURES and
                    isinstance(row.get("data", {}).get("resign"), dict)
                    for row in progress.get("steps", [])):
                 last_progress = copy.deepcopy(progress)
@@ -4574,6 +4662,10 @@ async def execute_job(
                 await on_step(progress)
 
         def interrupted_result(status: str, message: str) -> dict[str, Any]:
+            if payload.get("assistant_consumption_plan") is not None:
+                return {**copy.deepcopy(last_progress), "status": "unknown",
+                        "message": "Consumption run interrupted; verify before a fresh request",
+                        "reason": "outcome_uncertain"}
             if not last_progress:
                 return {"status": status, "message": message, "steps": []}
             partial = copy.deepcopy(last_progress)
@@ -4620,6 +4712,64 @@ async def _execute_admitted_job(
 ) -> dict[str, Any]:
     lane_key = str(payload.get("lane_key") or "general")
     steps = payload.get("steps") or []
+    # Code-owned builtin categories prevent a payload label from hiding a post handler.
+    builtin_categories = {
+        feature: category for category, features in {
+            "flow": ("flow.open", "flow.jump", "flow.result"),
+            "auth": ("auth.form_login", "auth.password_verify"),
+            "challenge": ("challenge.2fa", "challenge.turnstile", "challenge.altcha",
+                          "challenge.slider", "challenge.image_captcha", "challenge.grid_captcha"),
+            "sign": ("sign.button", "sign.iframe.image_captcha", "sign.image_quiz", "sign.unit3d_claim"),
+            "action": ("action.navigate", "action.click", "action.fill", "action.wait"),
+            "post": ("post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog"),
+        }.items() for feature in features
+    }
+    consumption_handlers = {"post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog"}
+    plan = payload.get("assistant_consumption_plan")
+    consumption_steps: set[str] = set()
+    if payload.get("assistant_run") is True:
+        consuming = [step for step in steps if step.get("enabled", True)
+                     and (step.get("category") == "post"
+                          or builtin_categories.get(step.get("feature_type")) == "post")]
+        if consuming or plan is not None:
+            try:
+                from zoneinfo import ZoneInfo
+
+                review = plan["review"]
+                approved = {item["step_key"]: item for item in review["steps"]}
+                consumption_steps = {step["step_key"] for step in consuming}
+                dates = review["dates"]
+                if (not consuming or len(consumption_steps) != len(consuming)
+                        or len(approved) != len(review["steps"]) or set(approved) != consumption_steps
+                        or payload.get("attempt") != 1 or len(dates) > 365
+                        or dates != sorted(set(dates))
+                        or dates != payload.get("resign_pending_dates")
+                        or review["today"] != payload.get("resign_today")
+                        or review["today"] != datetime.now(ZoneInfo(review["timezone"])).date().isoformat()
+                        or any(datetime.strptime(day, "%Y-%m-%d").date().isoformat() != day
+                               or day >= review["today"] for day in dates)):
+                    raise ValueError
+                for step in consuming:
+                    item = approved[step["step_key"]]
+                    if (step["feature_type"] not in consumption_handlers
+                            or step.get("category", builtin_categories[step["feature_type"]]) != "post"
+                            or item["feature_type"] != step["feature_type"]):
+                        raise ValueError
+                    if step["feature_type"] == "post.buy_card":
+                        config = step.get("config") or {}
+                        quantity, price = config.get("purchase_quantity", 0), config.get("max_price")
+                        maximum = quantity or len(dates)
+                        if (type(quantity) is not int or not 0 <= quantity <= 365
+                                or type(price) is not int or price <= 0
+                                or item["purchase_quantity"] != quantity
+                                or item["maximum_quantity"] != maximum
+                                or item["max_price"] != price
+                                or item["maximum_spend"] != maximum * price):
+                            raise ValueError
+            except (ValueError, TypeError, KeyError):
+                return {"status": "fail", "message": "Consumption approval plan missing or changed",
+                        "steps": [], "reason": "assistant_configuration_changed"}
+    consumed_steps: set[str] = set()
     signal_rows = payload.get("signals") or []
     signals = {
         str(item.get("signal_key")): item
@@ -4882,6 +5032,15 @@ async def _execute_admitted_job(
                     await emit_progress()
 
                 feature = str(step.get("feature_type") or "")
+                if payload.get("assistant_run") is True and step.get("step_key") in consumption_steps:
+                    key = str(step.get("step_key") or "")
+                    if (key in consumed_steps or
+                            plan["review"]["today"] != datetime.now(ZoneInfo(plan["review"]["timezone"])).date().isoformat()):
+                        job_status, job_message = "waiting_human", "Consumption step cannot execute twice; request fresh approval"
+                        results[-1] = _step_result(step, job_status, job_message, started=started)
+                        await emit_progress()
+                        break
+                    consumed_steps.add(key)
                 # Opt in only for host-tagged assistant runs. A raised error after
                 # dispatch cannot prove that a business action was not applied.
                 assistant_side_effect = payload.get("assistant_run") is True and (
@@ -4927,7 +5086,10 @@ async def _execute_admitted_job(
                         data["cause"] = "execution_timeout"
                 except asyncio.CancelledError:
                     partial = results[-1].get("data", {}) if feature in CHECKPOINT_RESIGN_FEATURES else {}
-                    job_status = "waiting_human" if "resign" in partial else "canceled"
+                    job_status = ("unknown" if plan is not None and assistant_side_effect else
+                                  "waiting_human" if "resign" in partial else "canceled")
+                    if job_status == "unknown":
+                        partial = {**partial, "reason": "outcome_uncertain"}
                     results[-1] = _step_result(step, job_status, "已取消", started=started, data=partial)
                     job_message = "执行已取消"
                     job_artifacts.log("WARN", f"step {step.get('step_key')} canceled")
@@ -4961,6 +5123,9 @@ async def _execute_admitted_job(
                             and not (assistant_side_effect and status == "unknown")):
                         status = "waiting_human"
                 purchase = data.get("buy_card") if isinstance(data, dict) else None
+                if plan is not None and status in {"restart", "fallback_interaction"}:
+                    status, message = "unknown", "Consumption run cannot retry or switch lanes; verify and request fresh approval"
+                    data = {**data, "reason": "outcome_uncertain"}
                 if feature == "post.buy_card" and isinstance(purchase, dict) and (
                     purchase.get("payment_attempted") or purchase.get("bought", 0)
                 ):

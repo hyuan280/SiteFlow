@@ -11,6 +11,7 @@ from app.api.v1 import (
     analytics,
     artifacts as artifacts_api,
     assistant,
+    assistant_takeover,
     config_ai,
     features,
     health,
@@ -37,14 +38,20 @@ from app.features.plugin_registry import clear_plugin_registry, refresh_plugin_r
 from app.services.artifacts import ArtifactCleanupRunner
 from app.services.execution import ExecutionService
 from app.services.executor import ExecutionManager
+from app.services.run_notification_dispatch import RunNotificationDispatcher
 from app.services.scheduler import Scheduler
 from app.services.scheduler_settings import reset_next_run_for_timezone
 from app.models.auth import AuthSession, User  # noqa: F401  (register tables)
 from app.models.assistant import AssistantMessage, AssistantSession  # noqa: F401
 from app.models.assistant_workflow import AssistantWorkflowAction  # noqa: F401
 from app.models.assistant_run import AssistantRunGuard  # noqa: F401
+from app.models.assistant_takeover import AssistantJobConfigSnapshot, AssistantTakeoverAction  # noqa: F401
+from app.models.assistant_takeover_conclusion import AssistantTakeoverConclusion  # noqa: F401
+from app.models.assistant_takeover_dedup import TakeoverFailureSignature, TakeoverDedupLink  # noqa: F401
+from app.models.assistant_takeover_notice import AssistantTakeoverNotice  # noqa: F401
 from app.models.execution import JobStep, Run, SiteJob  # noqa: F401  (register tables)
 from app.models.integration import IntegrationConfig  # noqa: F401  (register table)
+from app.models.run_notification import RunNotificationIntent  # noqa: F401
 from app.models.plugin import PluginRegistration  # noqa: F401  (register table)
 from app.models.setting import AppSetting  # noqa: F401  (register table)
 from app.models.workflow import (  # noqa: F401  (register tables)
@@ -59,6 +66,7 @@ from app.models.workflow import (  # noqa: F401  (register tables)
 from app.services.auth import bootstrap_admin
 from app.services.workflows import WorkflowService
 from app.services.assistant import AssistantManager
+from app.services.assistant_takeover import AssistantTakeover
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -80,19 +88,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     artifact_cleanup = ArtifactCleanupRunner(session_factory, settings)
     assistant_manager = AssistantManager(session_factory, settings, crypto, executor=executor)
     assistant_manager.recover()
+    takeover = AssistantTakeover(assistant_manager)
+    executor.takeover = takeover
+    notification_dispatch = RunNotificationDispatcher(executor)
+    executor.notification_dispatch = notification_dispatch
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         with session_factory() as session:
             reset_next_run_for_timezone(session, settings.scheduler_timezone)
             ExecutionService(session, settings, crypto).recover_interrupted()
+        await notification_dispatch.start()
         await scheduler.start()
         await artifact_cleanup.start()
+        await takeover.start()
         yield
+        await takeover.stop()
         await artifact_cleanup.stop()
         await assistant_manager.shutdown()
         await scheduler.stop()
         await executor.shutdown()
+        await notification_dispatch.stop()
 
     app = FastAPI(
         title="SiteFlow API",
@@ -112,6 +128,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.scheduler = scheduler
     app.state.artifact_cleanup = artifact_cleanup
     app.state.assistant_manager = assistant_manager
+    app.state.assistant_takeover = takeover
+    app.state.notification_dispatch = notification_dispatch
 
     app.add_middleware(
         CORSMiddleware,
@@ -131,6 +149,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(lane_settings.router)
     app.include_router(features.router)
     app.include_router(assistant.router)
+    app.include_router(assistant_takeover.router)
     app.include_router(config_ai.router)
     app.include_router(workflow_drafts.router)
     app.include_router(templates.router)

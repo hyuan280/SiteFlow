@@ -1,4 +1,4 @@
-import { isSiteConfigReview } from "@/utils/assistant-review";
+import { isConsumptionReview, isCookieClearReview, isSiteConfigReview, templateImportReview, isSchedulerConfigReview, runCancelReview } from "@/utils/assistant-review";
 
 export type AssistantStatus = "idle" | "running";
 export type CredentialMode = "manual" | "bitwarden" | "cookie" | "none";
@@ -7,6 +7,8 @@ export type AssistantRunLanePolicy = typeof assistantRunLanePolicies[number];
 export const assistantExecutionFeatures = [
   "flow.open", "action.navigate", "auth.form_login", "auth.password_verify", "action.wait",
   "sign.button", "sign.unit3d_claim", "challenge.altcha", "challenge.slider", "action.click",
+  "challenge.2fa", "challenge.turnstile", "challenge.image_captcha", "challenge.grid_captcha",
+  "sign.iframe.image_captcha", "sign.image_quiz", "action.fill", "flow.result",
 ] as const;
 export type AssistantExecutionFeature = typeof assistantExecutionFeatures[number];
 
@@ -62,6 +64,11 @@ export interface AssistantSession {
   updated_at: string;
   context?: AssistantContext;
 }
+
+export type AssistantSessionList = { items: AssistantSession[] } & (
+  { offset: number; limit: number; next_offset: number | null; truncated: boolean } |
+  { offset?: never; limit?: never; next_offset?: never; truncated?: never }
+);
 
 export interface AssistantTarget {
   name: string;
@@ -212,7 +219,12 @@ export function isAssistantPendingInteraction(value: unknown): value is Assistan
     (value.kind === "choice" ? Array.isArray(value.options) && value.options.length > 0 : value.options === undefined || (Array.isArray(value.options) && value.options.length === 0)) &&
     (value.kind === "input" ? Array.isArray(value.fields) && value.fields.length > 0 : value.fields === undefined || (Array.isArray(value.fields) && value.fields.length === 0)) &&
     (value.multiple !== true || value.kind === "choice") &&
-    (value.review === undefined || (record(value.review) && safeReview(value.review))) &&
+    (value.purpose === "consumption" ? value.kind === "authorization" && isConsumptionReview(value.review) :
+      value.purpose === "cookie_clear" ? value.kind === "authorization" && isCookieClearReview(value.review) :
+      value.purpose === "template_import" ? value.kind === "authorization" && templateImportReview(value.review) !== null :
+      value.purpose === "scheduler_config" ? value.kind === "authorization" && isSchedulerConfigReview(value.review) :
+      value.purpose === "run_cancel" ? value.kind === "authorization" && runCancelReview(value.review) !== null :
+      value.review === undefined || (record(value.review) && safeReview(value.review))) &&
     (value.purpose !== "site_config" || (value.kind === "authorization" && isSiteConfigReview(value.review))) &&
     Object.keys(value).every(key => ["id", "kind", "purpose", "title", "description", "expires_at", "options", "multiple", "fields", "review"].includes(key));
 }
@@ -311,6 +323,19 @@ export function isAssistantSession(value: unknown): value is AssistantSession {
     date(value.created_at) && date(value.updated_at);
 }
 
+export function isAssistantSessionList(value: unknown): value is AssistantSessionList {
+  if (!record(value) || !Array.isArray(value.items) || value.items.length > 100 ||
+    !value.items.every(isAssistantSession) ||
+    new Set(value.items.map(item => item.id.toLowerCase())).size !== value.items.length) return false;
+  const metadata = ["offset", "limit", "next_offset", "truncated"];
+  if (!metadata.some(key => key in value)) return true; // Shipped legacy list responses.
+  return count(value.offset) && count(value.limit) && value.limit >= 1 && value.limit <= 100 &&
+    value.items.length <= value.limit && typeof value.truncated === "boolean" &&
+    (value.next_offset === null ? value.truncated === false :
+      count(value.next_offset) && value.truncated === true && value.items.length === value.limit &&
+      Number.isSafeInteger(value.offset + value.limit) && value.next_offset === value.offset + value.limit);
+}
+
 // Both HTTP and SSE are untrusted boundaries; never publish partial/invalid snapshots.
 export function isAssistantDetail(value: unknown): value is AssistantDetail {
   if (!record(value) || !uuid(value.id) || !titleFields(value) || !contextFields(value) || !status(value.status) ||
@@ -337,7 +362,7 @@ export function isAssistantDetail(value: unknown): value is AssistantDetail {
       (!Number.isSafeInteger(target[key]) || (target[key] as number) < 1)) ||
     (target.run_lane_policy !== undefined && !assistantRunLanePolicies.includes(target.run_lane_policy as AssistantRunLanePolicy)) ||
     ["execution_consent", "credential_consent", "allow_sign", "screenshot_consent", "workflow_consent"].some(key => target[key] !== undefined && typeof target[key] !== "boolean") ||
-    (target.execution_features !== undefined && (!Array.isArray(target.execution_features) || target.execution_features.length > 10 ||
+    (target.execution_features !== undefined && (!Array.isArray(target.execution_features) || target.execution_features.length > assistantExecutionFeatures.length ||
       new Set(target.execution_features).size !== target.execution_features.length ||
       !target.execution_features.every(key => assistantExecutionFeatures.includes(key as AssistantExecutionFeature)))))) return false;
   const browser = value.browser;

@@ -25,6 +25,7 @@ export interface EmailNotificationView {
   enabled: boolean;
   notify_success: boolean;
   notify_manual: boolean;
+  notify_assistant: boolean;
   available: boolean;
   smtp_host: NotificationFieldView;
   smtp_port: NotificationFieldView;
@@ -40,6 +41,7 @@ export interface HTTPNotificationView {
   enabled: boolean;
   notify_success: boolean;
   notify_manual: boolean;
+  notify_assistant: boolean;
   available: boolean;
   url: NotificationFieldView;
   method: NotificationFieldView;

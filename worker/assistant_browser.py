@@ -9,6 +9,12 @@ lane proxy. Local DNS must resolve even in proxy lanes; failures are fail-closed
 Manual login must use a separate user-controlled tab in this shared profile.
 The assistant tab only permits POST during a host-reviewed non-read-only step;
 outside execution, even human-submitted forms are blocked in this tab.
+
+Cookie substring protection covers only opaque, credential-like imported values,
+not short/low-information preferences or unknown cookies already in the profile.
+Fingerprints and revocation generations follow the lane's persistent profile
+across context reconnects, but are not persisted for full worker-restart DLP.
+Screenshots mask controls, not arbitrary reflected text: there is no pixel DLP.
 """
 from __future__ import annotations
 
@@ -19,6 +25,7 @@ import math
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import socket
 import time
@@ -30,7 +37,7 @@ from typing import Any, Literal
 from urllib.parse import unquote, urljoin
 
 from fastapi import HTTPException
-from pydantic import UUID4, BaseModel, ConfigDict, Field, field_validator
+from pydantic import UUID4, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from worker.assistant_urls import MAX_DECODE_ROUNDS, parse_url, project_url
 from worker.assistant_snapshot import (
@@ -39,15 +46,16 @@ from worker.assistant_snapshot import (
 )
 
 TTL_SECONDS = 15 * 60
+QUEUE_TIMEOUT = 20 * 60
 ACQUIRE_TIMEOUT = 2
 OPEN_TIMEOUT = 110
 MAX_TOMBSTONES = 1024
 EXECUTE_TIMEOUT = 90
 MAX_OPERATIONS = 20
-READ_ONLY = frozenset({"flow.open", "action.navigate", "action.wait"})
+READ_ONLY = frozenset({"flow.open", "action.navigate", "action.wait", "flow.result"})
 MAX_SCREENSHOT_BYTES = 384 * 1024
 SCREENSHOT_MASK = (
-    'iframe, frame, input:not([type="button"]):not([type="submit"]):not([type="reset"])'
+    'input:not([type="button"]):not([type="submit"]):not([type="reset"])'
     ':not([type="checkbox"]):not([type="radio"]), textarea, select, '
     '[contenteditable]:not([contenteditable="false"])'
 )
@@ -139,6 +147,15 @@ class OpenRequest(TokenRequest):
     lane_key: Literal["interaction", "proxy_interaction"] = "interaction"
     session_id: UUID4 | None = None
     trusted_origins: list[str] = Field(default_factory=list, max_length=20, strict=True)
+    same_origin_only: bool = Field(default=False, strict=True)
+    wait_for_lane: bool = Field(default=False, strict=True)
+    cookies: list[Any] | None = Field(default=None, repr=False, strict=True, max_length=300)
+    cookie_generation: UUID4 | None = Field(default=None, repr=False)
+
+    @model_validator(mode="after")
+    def private_cookies(self):
+        _cookie_payload(self.cookies, self.cookie_generation, self.url)
+        return self
 
     @field_validator("trusted_origins")
     @classmethod
@@ -151,6 +168,16 @@ class OpenRequest(TokenRequest):
 
 class NavigateRequest(TokenRequest):
     url: str = Field(max_length=4096)
+
+
+class ClearCookiesRequest(TokenRequest):
+    operation_id: UUID4
+
+
+class CookieGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    url: str = Field(max_length=4096, strict=True)
+    lane_key: Literal["interaction", "proxy_interaction"] = "interaction"
 
 
 class ObserveRequest(TokenRequest):
@@ -207,6 +234,67 @@ def _trusted_origins(values: list[str]) -> set[str]:
             raise _denied()
         origins.add(origin)
     return origins
+
+
+def _cookie_payload(cookies, generation, url) -> bytes:
+    """Validate the private transport independently of the host's saved-cookie filter."""
+    try:
+        if generation is not None:
+            if not isinstance(generation, (str, uuid.UUID)) or uuid.UUID(str(generation)).version != 4:
+                raise ValueError()
+        if cookies is not None:
+            if type(cookies) is not list or len(cookies) > 300 or generation is None:
+                raise ValueError()
+            host, origin, _ = parse_url(url)
+            allowed = {"name", "value", "domain", "path", "url", "expires", "secure", "httpOnly", "sameSite"}
+            for row in cookies:
+                if type(row) is not dict or not {"name", "value"} <= row.keys() <= allowed:
+                    raise ValueError()
+                for key in {"name", "value", "domain", "path", "url", "sameSite"} & row.keys():
+                    if type(row[key]) is not str or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in row[key]):
+                        raise ValueError()
+                    row[key].encode("utf-8")
+                if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", row["name"]):
+                    raise ValueError()
+                if "url" in row:
+                    if "domain" in row or "path" in row or parse_url(row["url"])[1] != origin:
+                        raise ValueError()
+                elif (row.get("domain") not in {host, "." + host}
+                      or not row.get("path", "").startswith("/")):
+                    raise ValueError()
+                for key in {"secure", "httpOnly"} & row.keys():
+                    if type(row[key]) is not bool:
+                        raise ValueError()
+                if "sameSite" in row and row["sameSite"] not in {"Strict", "Lax", "None"}:
+                    raise ValueError()
+                if "expires" in row:
+                    expires = row["expires"]
+                    if (type(expires) not in {int, float} or not math.isfinite(expires)
+                            or (expires != -1 and expires < 0)):
+                        raise ValueError()
+        encoded = json.dumps(cookies, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                             allow_nan=False).encode()
+        if len(encoded) > 256 * 1024:
+            raise ValueError()
+        return hashlib.sha256(encoded).digest()
+    except (ValueError, TypeError, OverflowError, RecursionError, UnicodeError):
+        raise ValueError("Invalid browser cookies") from None
+
+
+def _cookie_fingerprints(cookies) -> set[tuple[int, bytes]]:
+    from collections import Counter
+    from worker.assistant_step import fingerprints
+
+    values = []
+    for row in cookies:
+        value = row["value"]
+        if len(value) < 16:
+            continue
+        counts = Counter(value)
+        entropy = -sum((count / len(value)) * math.log2(count / len(value)) for count in counts.values())
+        if len(counts) >= 8 and entropy >= 3:
+            values.append(value)
+    return fingerprints(values)
 
 
 def _project_url(url: str, known: set) -> dict[str, Any]:
@@ -312,6 +400,13 @@ class PublicDNS:
 
 
 @dataclass
+class CookieState:
+    context: Any = field(default=None, repr=False)
+    fingerprints: set[tuple[int, bytes]] = field(default_factory=set, repr=False)
+    generations: dict[str, str] = field(default_factory=dict, repr=False)
+
+
+@dataclass
 class BrowserSession:
     session_id: str
     lane_key: str
@@ -335,6 +430,7 @@ class BrowserSession:
     quarantined: bool = False
     opening: asyncio.Task | None = None
     cleanup: asyncio.Task | None = None
+    disposal: asyncio.Task | None = None
     pages: list[Any] = field(default_factory=list)
     redirects: dict[str, int] = field(default_factory=dict)
     frame_id: str | None = None
@@ -342,24 +438,46 @@ class BrowserSession:
     executing: bool = False
     writes_authorized: bool = False
     credential_execution: bool = False
+    challenge_resources: bool = False
     blocked_requests: list[dict[str, Any]] = field(default_factory=list, repr=False)
     uncertain: bool = False
     same_origin_only: bool = False
+    open_wait_for_lane: bool = False
+    admitted_at: float | None = None
+    queue_deadline: float | None = None
+    open_deadline: float | None = None
+    queue_turn: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    # Execution tightens routing without changing the idempotent open contract.
+    open_same_origin_only: bool = False
     execution_task: asyncio.Task | None = None
     operations: dict[str, tuple[bytes, dict[str, Any] | None]] = field(default_factory=dict)
     operation_steps: dict[str, bytes] = field(default_factory=dict, repr=False)
     consumed_permits: set[str] = field(default_factory=set, repr=False)
     unresolved_operations: set[str] = field(default_factory=set)
     secret_fingerprints: set[tuple[int, bytes]] = field(default_factory=set, repr=False)
+    cookie_fingerprints: set[tuple[int, bytes]] = field(default_factory=set, repr=False)
+    cookie_context: Any = field(default=None, repr=False)
+    provider_fingerprints: set[tuple[int, bytes]] = field(default_factory=set, repr=False)
     snapshots: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
     latest_snapshots: dict[str, str] = field(default_factory=dict, repr=False)
     document_versions: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
+    cookies: list[dict[str, Any]] | None = field(default=None, repr=False)
+    cookie_payload_hash: bytes = field(default=b"", repr=False)
+    cookie_generation: str | None = field(default=None, repr=False)
+    clear_operations: dict[str, bool | None] = field(default_factory=dict, repr=False)
+
+    @property
+    def known_fingerprints(self) -> set[tuple[int, bytes]]:
+        return self.secret_fingerprints | self.cookie_fingerprints
 
     def view(self) -> dict[str, Any]:
         result = {"session_id": self.session_id, "lane_key": self.lane_key,
                   "expires_at": datetime.fromtimestamp(self.expires_at, timezone.utc).isoformat()}
+        if self.open_wait_for_lane:
+            result["status"] = ("ready" if self.ready else
+                                "opening" if self.admitted_at is not None else "queued")
         if self.ready and self.page is not None:
-            result.update(_project_url(self.page.url, self.secret_fingerprints))
+            result.update(_project_url(self.page.url, self.known_fingerprints))
         return result
 
 
@@ -370,6 +488,35 @@ class AssistantBrowser:
         self._reaper: asyncio.Task | None = None
         self._stopping = False
         self.tombstones: dict[str, tuple[bytes, float]] = {}
+        self._queues: dict[str, list[BrowserSession]] = {}
+        self._open_errors: dict[str, tuple[int, str]] = {}
+        self._cookie_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._cookie_states: dict[str, CookieState] = {}
+
+    def _cookie_state(self, lane_key: str, context: Any) -> CookieState:
+        state = self._cookie_states.setdefault(lane_key, CookieState())
+        if context is not None:
+            # Reconnected contexts use the same lane's persistent cookie jar.
+            state.context = context
+        for session in self.sessions.values():
+            if session.lane_key == lane_key:
+                session.cookie_fingerprints = state.fingerprints
+        return state
+
+    async def cookie_generation(self, url: str, lane_key: str) -> dict[str, str]:
+        if lane_key not in {"interaction", "proxy_interaction"}:
+            raise _denied()
+        host = _url(url)[0]
+        if self._stopping:
+            raise _error(503, "browser_lane_unavailable", lane_key=lane_key)
+        async with self._cookie_locks.setdefault((lane_key, host), asyncio.Lock()):
+            try:
+                context = self.manager.get(lane_key).context
+            except Exception:
+                raise _error(409, "browser_lane_unavailable", lane_key=lane_key) from None
+            state = self._cookie_state(lane_key, context)
+            generation = state.generations.setdefault(host, str(uuid.uuid4()))
+            return {"generation": generation}
 
     async def start(self) -> None:
         self._reaper = asyncio.create_task(self._reap(), name="assistant-browser-reaper")
@@ -388,10 +535,13 @@ class AssistantBrowser:
             self._prune_tombstones()
             for session in list(self.sessions.values()):
                 if session.closed or session.deadline <= time.monotonic():
+                    if session.open_wait_for_lane and session.admitted_at is None and not session.closed:
+                        self._open_errors[session.session_id] = (504, "browser_queue_timeout")
                     await self._dispose(session)
 
     async def _dispose(self, session: BrowserSession) -> None:
         session.closed = True
+        session.cookies = None
         session.snapshots.clear()
         session.latest_snapshots.clear()
         session.document_versions.clear()
@@ -414,6 +564,7 @@ class AssistantBrowser:
         if session.opening is not None and not session.opening.done():
             session.opening.cancel()
             await asyncio.gather(session.opening, return_exceptions=True)
+        self._dequeue(session)
         # Shield resource-producing operations so cancellation cannot lose a
         # lease or a page between remote creation and assignment to its owner.
         if session.provisioning:
@@ -502,7 +653,11 @@ class AssistantBrowser:
             methods = {"GET", "HEAD", "POST"} if session.writes_authorized else {"GET", "HEAD"}
             if session.closed or request.method not in methods:
                 raise _denied()
-            if (session.executing or session.same_origin_only) and origin != session.origin:
+            challenge_resource = (session.executing and session.challenge_resources
+                and not session.credential_execution and request.method in {"GET", "HEAD"}
+                and origin in session.approved_origins
+                and (not document or request.frame != session.page.main_frame))
+            if (session.executing or session.same_origin_only) and origin != session.origin and not challenge_resource:
                 raise _denied()
             if document:
                 if origin not in session.approved_origins:
@@ -528,7 +683,7 @@ class AssistantBrowser:
     def _guard_secret_url(self, session: BrowserSession, url: str, method: str) -> None:
         from worker.assistant_step import secret_in_url
 
-        if secret_in_url(url, session.secret_fingerprints):
+        if secret_in_url(url, session.known_fingerprints):
             session.failure = {"code": "browser_url_denied"}
             raise _denied()
         if (session.credential_execution and method == "POST" and
@@ -544,7 +699,7 @@ class AssistantBrowser:
         if len(session.blocked_requests) >= 5:
             return
         try:
-            view = _project_url(url, session.secret_fingerprints)
+            view = _project_url(url, session.known_fingerprints)
             if len(json.dumps(view, ensure_ascii=True).encode()) > 2048:
                 raise ValueError()
         except ValueError:
@@ -570,8 +725,8 @@ class AssistantBrowser:
         if session.executing or session.credential_execution or session.same_origin_only:
             return _denied("browser_redirect_denied")
         try:
-            source_view = _project_url(source, session.secret_fingerprints)
-            target_view = _project_url(target, session.secret_fingerprints)
+            source_view = _project_url(source, session.known_fingerprints)
+            target_view = _project_url(target, session.known_fingerprints)
         except ValueError:
             return _denied()
         failure = {
@@ -616,7 +771,12 @@ class AssistantBrowser:
                     blocked_url, blocked_method = target, method
                     self._guard_secret_url(session, target, method)
                     host, origin, _ = _url(target, document=False)
-                    if (session.executing or session.same_origin_only) and (source_origin != session.origin or origin != session.origin):
+                    challenge_resource = (session.executing and session.challenge_resources
+                        and not session.credential_execution and request["method"] in {"GET", "HEAD"}
+                        and method in {"GET", "HEAD"}
+                        and source_origin in session.approved_origins and origin in session.approved_origins
+                        and (not document or event.get("frameId") != session.frame_id))
+                    if (session.executing or session.same_origin_only) and (source_origin != session.origin or origin != session.origin) and not challenge_resource:
                         raise _denied("browser_redirect_denied")
                     methods = {"GET", "HEAD", "POST"} if session.writes_authorized else {"GET", "HEAD"}
                     if request["method"] not in methods:
@@ -660,6 +820,7 @@ class AssistantBrowser:
         for session_id, (_, deadline) in list(self.tombstones.items()):
             if deadline <= now:
                 del self.tombstones[session_id]
+                self._open_errors.pop(session_id, None)
 
     def _remember(self, session_id: str, digest: bytes) -> None:
         self._prune_tombstones()
@@ -678,9 +839,20 @@ class AssistantBrowser:
 
     async def open(self, url: str, lane_key: str, token: str,
                    session_id: str | None = None,
-                   trusted_origins: list[str] | None = None) -> dict[str, Any]:
+                   trusted_origins: list[str] | None = None,
+                   same_origin_only: bool = False,
+                   wait_for_lane: bool = False, *,
+                   cookies: list[dict[str, Any]] | None = None,
+                   cookie_generation: str | None = None) -> dict[str, Any]:
         if lane_key not in {"interaction", "proxy_interaction"} or not token or len(token) > 512:
             raise _denied()
+        if type(same_origin_only) is not bool or type(wait_for_lane) is not bool:
+            raise _denied()
+        try:
+            cookie_hash = _cookie_payload(cookies, cookie_generation, url)
+            cookie_generation = str(uuid.UUID(str(cookie_generation))) if cookie_generation is not None else None
+        except ValueError:
+            raise _error(422, "browser_cookies_invalid", lane_key=lane_key, stage="open") from None
         if self._stopping:
             raise _error(503, "browser_lane_unavailable", lane_key=lane_key, stage="open")
         approved = _trusted_origins(trusted_origins if trusted_origins is not None else [])
@@ -701,23 +873,50 @@ class AssistantBrowser:
                 raise _error(410, "browser_closed", lane_key=lane_key, stage="open")
             if session.deadline <= time.monotonic():
                 await self._dispose(session)
+                if session.open_wait_for_lane and session.admitted_at is None:
+                    raise _error(504, "browser_queue_timeout", lane_key=lane_key, stage="acquire")
                 raise _error(410, "browser_session_expired", lane_key=lane_key, stage="open")
             if (session.initial_url != url or session.lane_key != lane_key
-                    or session.approved_origins != approved):
+                    or session.approved_origins != approved
+                    or session.open_same_origin_only != same_origin_only
+                    or session.open_wait_for_lane != wait_for_lane
+                    or session.cookie_payload_hash != cookie_hash
+                    or session.cookie_generation != cookie_generation):
                 raise HTTPException(409, "Browser session conflict")
             if session.ready:
                 await self._current(session)
                 return session.view()
+            if wait_for_lane:
+                return await self.open_status(session_id, token)
         else:
             if len(self.sessions) + len(self.tombstones) >= MAX_TOMBSTONES:
                 raise _error(503, "browser_lane_unavailable", lane_key=lane_key, stage="open")
+            queued = wait_for_lane
+            expires = time.time() + (QUEUE_TIMEOUT if queued else TTL_SECONDS)
+            deadline = time.monotonic() + (QUEUE_TIMEOUT if queued else TTL_SECONDS)
             session = BrowserSession(
-                session_id, lane_key, digest, "", time.time() + TTL_SECONDS,
-                time.monotonic() + TTL_SECONDS, initial_url=url, approved_origins=approved,
+                session_id, lane_key, digest, "", expires, deadline,
+                initial_url=url, approved_origins=approved,
+                same_origin_only=same_origin_only, open_same_origin_only=same_origin_only,
+                open_wait_for_lane=queued,
+                queue_deadline=deadline if queued else None,
+                open_deadline=None if queued else deadline - TTL_SECONDS + OPEN_TIMEOUT,
+                cookies=[dict(row) for row in cookies] if cookies is not None else None,
+                cookie_payload_hash=cookie_hash, cookie_generation=cookie_generation,
+                cookie_fingerprints=self._cookie_states.setdefault(lane_key, CookieState()).fingerprints,
             )
             # Publish ownership before DNS, lease, page creation, or any await.
             self.sessions[session_id] = session
-            session.opening = asyncio.create_task(self._initialize(session))
+            if queued:
+                queue = self._queues.setdefault(lane_key, [])
+                queue.append(session)
+                if len(queue) == 1:
+                    session.queue_turn.set()
+            session.opening = asyncio.create_task(
+                self._initialize_queued(session) if queued else self._initialize(session))
+            session.opening.add_done_callback(lambda task: self._opened(session, task))
+            if queued:
+                return session.view()
         deadline = session.deadline - TTL_SECONDS + OPEN_TIMEOUT
         try:
             async with asyncio.timeout_at(deadline):
@@ -740,6 +939,55 @@ class AssistantBrowser:
                 raise
             raise _error(502, "browser_lane_unavailable", lane_key=lane_key, stage="open") from None
 
+    def _opened(self, session: BrowserSession, task: asyncio.Task) -> None:
+        # Always retrieve exceptions, including opens whose HTTP client went away.
+        error = None if task.cancelled() else task.exception()
+        if not session.open_wait_for_lane or session.closed or session.ready:
+            return
+        code, status = "browser_lane_unavailable", 502
+        if isinstance(error, HTTPException) and isinstance(error.detail, dict):
+            candidate = error.detail.get("code")
+            if isinstance(candidate, str) and candidate in POLICY_CODES | {
+                "browser_queue_timeout", "browser_open_timeout", "browser_lane_unavailable",
+                "browser_navigation_failed", "browser_cookie_import_failed",
+            }:
+                code, status = candidate, error.status_code
+        self._open_errors[session.session_id] = (status, code)
+        self._schedule_dispose(session)
+
+    def _schedule_dispose(self, session: BrowserSession) -> None:
+        session.closed = True
+        if session.disposal is None or session.disposal.done():
+            session.disposal = asyncio.create_task(self._dispose(session))
+            session.disposal.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+
+    def _dequeue(self, session: BrowserSession) -> None:
+        queue = self._queues.get(session.lane_key, [])
+        if session in queue:
+            queue.remove(session)
+        if queue:
+            queue[0].queue_turn.set()
+        else:
+            self._queues.pop(session.lane_key, None)
+
+    async def _initialize_queued(self, session: BrowserSession) -> None:
+        try:
+            try:
+                async with asyncio.timeout_at(session.queue_deadline):
+                    await session.queue_turn.wait()
+                    await self._initialize(session)
+            except TimeoutError:
+                raise _error(504, "browser_queue_timeout", lane_key=session.lane_key,
+                             stage="acquire") from None
+        finally:
+            self._dequeue(session)
+        try:
+            async with asyncio.timeout_at(session.open_deadline):
+                await self._provision(session)
+        except TimeoutError:
+            raise _error(504, "browser_open_timeout", lane_key=session.lane_key,
+                         stage="open") from None
+
     async def _initialize(self, session: BrowserSession) -> None:
         host, session.origin, _ = _url(session.initial_url)
         await session.dns.check(host)
@@ -761,6 +1009,32 @@ class AssistantBrowser:
         session.provisioning.add(task)
         await asyncio.shield(task)
         session.provisioning.discard(task)
+        if session.open_wait_for_lane:
+            # Viewers do not hold the limiter. Recheck them while waiting for it,
+            # and immediately after acquisition, without preempting human pages.
+            while True:
+                if session.closed:
+                    raise asyncio.CancelledError()
+                if time.monotonic() >= session.queue_deadline:
+                    raise TimeoutError()
+                if getattr(lane, "viewers", None):
+                    await asyncio.sleep(0.2)
+                    continue
+                try:
+                    async with asyncio.timeout(0.2):
+                        await lane.execution_semaphore.__aenter__()
+                except TimeoutError:
+                    continue
+                session.acquired = True
+                if not getattr(lane, "viewers", None):
+                    break
+                await lane.execution_semaphore.__aexit__(None, None, None)
+                session.acquired = False
+            session.admitted_at = time.monotonic()
+            session.expires_at = time.time() + TTL_SECONDS
+            session.deadline = session.admitted_at + TTL_SECONDS
+            session.open_deadline = session.admitted_at + OPEN_TIMEOUT
+            return
         try:
             async def acquire() -> None:
                 await lane.execution_semaphore.__aenter__()
@@ -769,8 +1043,15 @@ class AssistantBrowser:
             await asyncio.wait_for(acquire(), ACQUIRE_TIMEOUT)
         except TimeoutError:
             raise _error(409, "browser_lane_busy", lane_key=session.lane_key, stage="acquire") from None
+        session.admitted_at = time.monotonic()
+        await self._provision(session)
+
+    async def _provision(self, session: BrowserSession) -> None:
+        lane = session.lane
         if lane.context is None:
             raise _error(409, "browser_lane_unavailable", lane_key=session.lane_key, stage="context")
+        session.cookie_fingerprints = self._cookie_state(session.lane_key, lane.context).fingerprints
+        session.cookie_context = lane.context
 
         async def new_page() -> None:
             session.page = await lane.context.new_page()
@@ -792,6 +1073,27 @@ class AssistantBrowser:
         await page.route("**/*", lambda route: self._route(session, route))
         await page.route_web_socket("**/*", lambda ws: ws.close())
         await page.bring_to_front()
+        if session.cookies is not None:
+            async def import_cookies() -> None:
+                key = (session.lane_key, _url(session.initial_url)[0])
+                try:
+                    async with self._cookie_locks.setdefault(key, asyncio.Lock()):
+                        state = self._cookie_state(session.lane_key, lane.context)
+                        session.cookie_fingerprints = state.fingerprints
+                        if (not session.closed and session.cookies is not None
+                                and session.cookie_generation == state.generations.get(key[1])):
+                            state.fingerprints.update(_cookie_fingerprints(session.cookies))
+                            await lane.context.add_cookies(session.cookies)
+                except Exception:
+                    raise _error(502, "browser_cookie_import_failed", lane_key=session.lane_key,
+                                 stage="open") from None
+                finally:
+                    session.cookies = None
+
+            task = asyncio.create_task(import_cookies())
+            session.provisioning.add(task)
+            await asyncio.shield(task)
+            session.provisioning.discard(task)
         try:
             await page.goto(session.initial_url, wait_until="domcontentloaded", timeout=30000)
         except Exception:
@@ -802,6 +1104,99 @@ class AssistantBrowser:
             raise HTTPException(403, session.failure)
         await self._current(session)
         session.ready = True
+
+    async def clear_cookies(self, session_id: str, token: str, operation_id: str) -> dict[str, Any]:
+        session = await self._session(session_id, token)
+        try:
+            operation = uuid.UUID(str(operation_id))
+            if operation.version != 4:
+                raise ValueError()
+            operation_id = str(operation)
+        except ValueError:
+            raise _error(422, "browser_operation_invalid") from None
+
+        async def mutate() -> dict[str, Any]:
+            async with session.lock:
+                if (session.closed or not session.ready or session.deadline <= time.monotonic()
+                        or session.lane.context is not session.cookie_context):
+                    raise HTTPException(409, "Browser session unavailable")
+                result = {"session_id": session.session_id, "lane_key": session.lane_key, "cleared": True}
+                if operation_id in session.clear_operations:
+                    if session.clear_operations[operation_id] is True:
+                        return result
+                    raise _error(502, "browser_cookie_clear_uncertain", lane_key=session.lane_key, stage="clear-cookies")
+                if len(session.clear_operations) >= MAX_OPERATIONS:
+                    raise _error(409, "browser_operation_limit", lane_key=session.lane_key, stage="clear-cookies")
+                key = (session.lane_key, _url(session.initial_url)[0])
+                async with self._cookie_locks.setdefault(key, asyncio.Lock()):
+                    session.clear_operations[operation_id] = None
+                    state = self._cookie_state(session.lane_key, session.lane.context)
+                    state.generations[key[1]] = str(uuid.uuid4())
+                    # Rotate before mutation, including ambiguous failures. A late
+                    # HTTP open cannot register or restore its obsolete generation.
+                    for affected in self.sessions.values():
+                        if (affected.lane_key, _url(affected.initial_url)[0]) == key:
+                            if affected.cookie_generation != state.generations[key[1]]:
+                                affected.cookies = None
+                    try:
+                        # Playwright serializes this regex for JavaScript; use
+                        # portable anchors, not Python-only \A / \Z.
+                        await session.lane.context.clear_cookies(domain=re.compile(r"^\.?" + re.escape(key[1]) + r"$"))
+                    except Exception:
+                        raise _error(502, "browser_cookie_clear_uncertain", lane_key=session.lane_key,
+                                     stage="clear-cookies") from None
+                    finally:
+                        for affected in self.sessions.values():
+                            if (affected.lane_key, _url(affected.initial_url)[0]) == key:
+                                affected.snapshots.clear()
+                                affected.latest_snapshots.clear()
+                                affected.document_versions.clear()
+                    session.clear_operations[operation_id] = True
+                    return result
+
+        task = asyncio.create_task(mutate())
+        session.provisioning.add(task)
+
+        def finished(task):
+            session.provisioning.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def open_status(self, session_id: str, token: str) -> dict[str, Any]:
+        session_id = self._id(session_id)
+        self._prune_tombstones()
+        session = self.sessions.get(session_id)
+        digest = hashlib.sha256(token.encode()).digest()
+        tombstone = self.tombstones.get(session_id)
+        expected = session.token_digest if session is not None else tombstone[0] if tombstone else None
+        if expected is None or not secrets.compare_digest(expected, digest):
+            raise HTTPException(404, "Browser session unavailable")
+        if session_id in self._open_errors:
+            status, code = self._open_errors[session_id]
+            raise _error(status, code, stage="acquire" if code == "browser_queue_timeout" else "open")
+        if session is None or session.closed:
+            raise _error(410, "browser_closed", stage="open-status")
+        if session.deadline <= time.monotonic():
+            code = ("browser_queue_timeout" if session.open_wait_for_lane and session.admitted_at is None
+                    else "browser_session_expired")
+            status = 504 if code == "browser_queue_timeout" else 410
+            self._open_errors[session_id] = (status, code)
+            self._schedule_dispose(session)
+            raise _error(status, code, lane_key=session.lane_key,
+                         stage="acquire" if status == 504 else "open-status")
+        if not session.ready and session.opening is not None and session.opening.done():
+            self._opened(session, session.opening)
+            if session_id in self._open_errors:
+                status, code = self._open_errors[session_id]
+                raise _error(status, code, lane_key=session.lane_key, stage="open-status")
+            raise _error(410, "browser_closed", lane_key=session.lane_key, stage="open-status")
+        if session.ready:
+            await self._current(session)
+        return {**session.view(), "status": ("ready" if session.ready else
+                "opening" if session.admitted_at is not None else "queued")}
 
     async def _session(self, session_id: str, token: str) -> BrowserSession:
         session_id = self._id(session_id)
@@ -859,7 +1254,7 @@ class AssistantBrowser:
             if parent_id is not None:
                 item["parent_frame_id"] = parent_id
             try:
-                item.update(_project_url(url, session.secret_fingerprints))
+                item.update(_project_url(url, session.known_fingerprints))
                 host, origin, _ = _url(url, document=False)
                 await session.dns.check(host)
                 if origin not in session.approved_origins:
@@ -944,7 +1339,7 @@ class AssistantBrowser:
                             snapshot["truncated"] or frames_truncated, budget)
 
     def _redact_snapshot(self, result, session, key):
-        redacted = _redact_known(result, session.secret_fingerprints)
+        redacted = _redact_known(result, session.known_fingerprints)
         for original, node in zip(result[key], redacted[key]):
             if original.get("selector") != node.get("selector"):
                 for field in ("selector", "selector_matches", "selector_source"):
@@ -965,7 +1360,7 @@ class AssistantBrowser:
         else:
             version = session.document_versions[frame_id]
             raw = await asyncio.wait_for(self._isolated_snapshot(session, registry[frame_id]), 10)
-            snapshot = {**_snapshot(raw, frame_id, session.secret_fingerprints), "snapshot_id": str(uuid.uuid4()),
+            snapshot = {**_snapshot(raw, frame_id, session.known_fingerprints), "snapshot_id": str(uuid.uuid4()),
                         "frame_id": frame_id, "version": version}
             snapshot = {**snapshot, "elements": self._redact_snapshot(
                 {"elements": snapshot["elements"]}, session, "elements")["elements"]}
@@ -980,7 +1375,7 @@ class AssistantBrowser:
                     session.latest_snapshots.pop(evicted["frame_id"], None)
             session.snapshots[snapshot["snapshot_id"]] = snapshot
             session.latest_snapshots[frame_id] = snapshot["snapshot_id"]
-        warning = (_blocked_warning(pending_failure, session.secret_fingerprints)
+        warning = (_blocked_warning(pending_failure, session.known_fingerprints)
                    if pending_failure and not session.executing else None)
         result = self._snapshot_page(session, snapshot, frames, frames_truncated,
                                      snapshot["elements"], offset, limit, warning)
@@ -1036,7 +1431,7 @@ class AssistantBrowser:
                     raise _error(409, "browser_snapshot_stale")
                 self._frame(frames, frame_id)
                 matches = _snapshot({"elements": raw.get("matches", [])}, frame_id,
-                                    session.secret_fingerprints)["elements"][:10]
+                                    session.known_fingerprints)["elements"][:10]
                 response = {**session.view(), "frame_id": frame_id, "selector": selector,
                             "match_count": min(10000, max(0, int(raw.get("match_count", 0)))),
                             "visible_count": min(10000, max(0, int(raw.get("visible_count", 0)))),
@@ -1060,6 +1455,19 @@ class AssistantBrowser:
         from worker.assistant_step import validate_step
 
         session = await self._session(session_id, request.token)
+        operation_id = str(request.operation_id)
+        prior = session.operations.get(operation_id)
+        # Bind retries to the complete reviewed request without retaining secrets.
+        digest = hashlib.sha256(session.token_digest + json.dumps(
+            request.model_dump(mode="json", exclude={"token", "operation_id"}),
+            sort_keys=True, ensure_ascii=True, allow_nan=False,
+        ).encode()).digest()
+        if prior is not None:
+            if not secrets.compare_digest(prior[0], digest):
+                raise HTTPException(409, "Browser operation conflict")
+            if prior[1] is None:
+                raise HTTPException(409, "Browser operation in progress")
+            return _redact_known(prior[1], session.known_fingerprints)
         try:
             step = validate_step(request)
             _, origin, _ = _url(request.site_origin)
@@ -1071,24 +1479,11 @@ class AssistantBrowser:
                     raise ValueError()
         except (ValueError, TypeError, HTTPException):
             raise HTTPException(422, "Invalid browser execution") from None
-        operation_id = str(request.operation_id)
         retry_of = str(request.retry_of) if request.retry_of is not None else None
         permit = str(request.retry_authorization) if request.retry_authorization is not None else None
         step_digest = hashlib.sha256(json.dumps(
             step, sort_keys=True, ensure_ascii=True, allow_nan=False,
         ).encode()).digest()
-        # Bind retries to the complete reviewed request without retaining secrets.
-        digest = hashlib.sha256(session.token_digest + json.dumps(
-            request.model_dump(mode="json", exclude={"token", "operation_id"}),
-            sort_keys=True, ensure_ascii=True, allow_nan=False,
-        ).encode()).digest()
-        prior = session.operations.get(operation_id)
-        if prior is not None:
-            if not secrets.compare_digest(prior[0], digest):
-                raise HTTPException(409, "Browser operation conflict")
-            if prior[1] is None:
-                raise HTTPException(409, "Browser operation in progress")
-            return _redact_known(prior[1], session.secret_fingerprints)
         if session.lock.locked():
             raise HTTPException(409, "Browser session busy")
         if retry_of is not None:
@@ -1106,9 +1501,8 @@ class AssistantBrowser:
             # host owns durable exact-step approval and permit issuance.
         elif permit is not None:
             raise HTTPException(422, "Invalid browser retry authorization")
-        if (session.uncertain and retry_of is None
-                and step["feature_type"] not in READ_ONLY):
-            raise HTTPException(409, "Browser outcome uncertain; close and reconfirm target")
+        # Unknown history is evidence, not a blanket veto on fresh approved steps.
+        # validate_step admits only trusted non-post builtin categories.
         if len(session.operations) >= MAX_OPERATIONS:
             raise HTTPException(409, "Browser operation limit reached")
         # Acquire before publishing the task; no lane or page is reacquired.
@@ -1125,6 +1519,8 @@ class AssistantBrowser:
 
     async def _execute_locked(self, session, operation_id, step, request):
         from worker.assistant_step import fingerprints, validate_secret_targets
+        from worker.assistant_private import PrivateContext
+        from worker.vision import _result_request_active
         from worker.executor import _run_step
         from worker.secret_client import AssistantSecretContext
 
@@ -1132,6 +1528,13 @@ class AssistantBrowser:
         after = {"elements": []}
         status, code, result = "error", "execution_error", {}
         context = None
+        private = None
+        runtime = request.private_runtime.model_dump(exclude_none=True) if request.private_runtime else {}
+        vision = runtime.get("vision")
+        if vision is not None:
+            vision["execution_settings"] = {**vision.get("execution_settings", {}),
+                **runtime.get("feature_execution_settings", {}).get(step["feature_type"], {})}
+        provider_log_token = _result_request_active.set(bool(runtime))
         started = False
         diagnostics = {}
         operation_failure = None
@@ -1150,8 +1553,30 @@ class AssistantBrowser:
                 await session.dns.check(_url(request.site_origin)[0])
                 if step["feature_type"] in {"flow.open", "action.navigate"}:
                     await session.dns.check(_url(step["config"]["url"], document=False)[0])
-                if request.credentials is not None:
-                    credentials = request.credentials.model_dump(exclude_none=True)
+                def register_secret(*values):
+                    session.secret_fingerprints.update(fingerprints(
+                        value for value in values if isinstance(value, str)))
+
+                for provider in (runtime.get("vision", {}), runtime.get("cfbox", {})):
+                    register_secret(*(provider.get(key, "") for key in ("api_key", "base_url", "url", "model")))
+                    session.provider_fingerprints.update(fingerprints(
+                        provider.get(key, "") for key in ("api_key", "base_url", "url")))
+                register_secret(runtime.get("totp_code", ""))
+                if step["feature_type"] in {
+                    "action.fill", "challenge.2fa", "challenge.turnstile", "challenge.image_captcha",
+                    "sign.iframe.image_captcha", "challenge.grid_captcha", "sign.image_quiz",
+                }:
+                    def register_answer(*values):
+                        for value in values:
+                            private.reject_provider_secret(value)
+
+                    private = PrivateContext(session.page, session.origin, register_answer, session.known_fingerprints,
+                        provider_fingerprints=frozenset(session.provider_fingerprints),
+                        approved_origins=frozenset(session.approved_origins))
+                    secret_payload["_assistant_private_context"] = private
+                if request.credentials is not None or step["feature_type"] == "challenge.2fa":
+                    credentials = (request.credentials.model_dump(exclude_none=True)
+                                   if request.credentials else {"code": runtime["totp_code"]})
                     session.secret_fingerprints.update(fingerprints(credentials.values()))
 
                     async def validate_targets():
@@ -1166,16 +1591,20 @@ class AssistantBrowser:
                         step["feature_type"], step["step_key"], credentials, validate_targets,
                     )
                     secret_payload["_assistant_secret_context"] = context
+                if private is not None:
+                    private.known = session.known_fingerprints
                 session.failure = None
                 session.blocked_requests.clear()
                 session.same_origin_only = True
                 session.executing = True
                 session.writes_authorized = step["feature_type"] not in READ_ONLY
                 session.credential_execution = context is not None
+                session.challenge_resources = step["feature_type"] == "challenge.turnstile"
                 before = await self._collect(session)
                 started = True
                 raw_status, _, data = await _run_step(
-                    session.page, step, credentials=None, twofauth=None, cfbox=None,
+                    session.page, step, credentials=None, twofauth=None, cfbox=runtime.get("cfbox"),
+                    vision=vision,
                     cancel=None, xdisplay=None, lane_key=session.lane_key,
                     log=lambda *_: None, capture_image=None, artifacts=None,
                     secret_payload=secret_payload,
@@ -1184,13 +1613,16 @@ class AssistantBrowser:
                     raise HTTPException(403, session.failure or {"code": "browser_url_denied"})
                 await self._current(session)
                 status = {"success": "success", "fail": "failed", "unknown": "unknown"}.get(raw_status, "unknown")
-                if status == "failed" and context is not None and context.action_started:
+                if status == "failed" and ((context is not None and context.action_started)
+                                           or (private is not None and private.action_started)):
                     status = "unknown"
                 code = {"success": "step_succeeded", "failed": "step_failed", "unknown": "outcome_uncertain"}[status]
                 if isinstance(data, dict):
                     result = {key: data[key] for key in ("submitted", "verified", "count")
-                              if key in data and (type(data[key]) is bool or
+                              if key in data and ((key != "count" and type(data[key]) is bool) or
                                   (key == "count" and type(data[key]) is int and 0 <= data[key] <= 10000))}
+                    if step["feature_type"] == "flow.result":
+                        result = {"value": data["value"]} if type(data.get("value")) is bool else {}
                     if step["feature_type"] == "auth.form_login":
                         evidence = _success_evidence_result(data.get("success_evidence"))
                         if evidence is not None:
@@ -1232,7 +1664,8 @@ class AssistantBrowser:
                     diagnostics.setdefault("evidence_errorcode", _exception_code(exc, "browser_snapshot_unavailable"))
             if session.failure is operation_failure:
                 session.failure = None
-            if status == "error" and (context.action_started if context is not None else started):
+            if status == "error" and (context.action_started if context is not None else
+                                      private.action_started if private is not None else started):
                 status, code = "unknown", "outcome_uncertain"
             if status == "unknown":
                 session.unresolved_operations.add(operation_id)
@@ -1267,11 +1700,18 @@ class AssistantBrowser:
                 session.tasks.add(task)
                 task.add_done_callback(session.tasks.discard)
             secret_payload.clear()
+            if private is not None:
+                task = asyncio.create_task(private.close())
+                session.tasks.add(task)
+                task.add_done_callback(session.tasks.discard)
+            runtime.clear()
+            _result_request_active.reset(provider_log_token)
             # Keep cross-origin subresources blocked after execution as DOM input
             # values or delayed page scripts may still contain credentials.
             session.executing = False
             session.writes_authorized = False
             session.credential_execution = False
+            session.challenge_resources = False
             if session.blocked_requests:
                 diagnostics["blocked_requests"] = list(session.blocked_requests)
             response = {
@@ -1295,10 +1735,23 @@ class AssistantBrowser:
         if session.lock.locked():
             raise HTTPException(409, "Browser session busy")
         async with session.lock:
+            pinned_frames = []
+            frame_events = []
+            frames_changed = False
+
+            def frame_changed(_frame):
+                nonlocal frames_changed
+                frames_changed = True
+
             try:
                 async with asyncio.timeout(10):
                     if session.closed:
                         raise HTTPException(404, "Browser session unavailable")
+                    # A frame can appear during capture and disappear before the
+                    # final tree read. Tree equality alone cannot detect that ABA.
+                    for event in ("frameattached", "framedetached", "framenavigated"):
+                        frame_events.append(event)
+                        session.page.on(event, frame_changed)
                     url = await self._current(session)
                     if session.failure:
                         raise HTTPException(403, session.failure)
@@ -1324,12 +1777,36 @@ class AssistantBrowser:
                     height = min(1200, int(dimensions["height"]))
                     if width < 1 or height < 1:
                         raise ValueError()
-                    # Mask every embedded document, including approved frames:
-                    # frame attachment/navigation cannot race a trust decision.
+                    masks = [session.page.locator(SCREENSHOT_MASK)]
+                    scopes = [session.page]
+                    while scopes:
+                        scope = scopes.pop()
+                        for locator in await scope.locator("iframe, frame").all():
+                            if len(pinned_frames) >= MAX_FRAMES:
+                                raise _error(502, "browser_screenshot_unavailable")
+                            handle = await locator.element_handle()
+                            pinned_frames.append((locator, handle))
+                            try:
+                                # Browser-enforced readability excludes sandboxed and
+                                # cross-origin frames, even if separately approved.
+                                source = await handle.evaluate("el => el.contentDocument?.location.href || ''")
+                                host, origin, _ = _url(source)
+                                if origin != _url(url)[1] or origin not in session.approved_origins:
+                                    raise ValueError()
+                                await session.dns.check(host)
+                                child = await handle.content_frame()
+                                if child is None or child.url != source:
+                                    raise ValueError()
+                            except Exception:
+                                masks.append(locator)
+                            else:
+                                masks.append(child.locator(SCREENSHOT_MASK))
+                                scopes.append(child)
+                    # Masked controls need no caret hiding, which rewrites inline styles.
                     image = await session.page.screenshot(
                         type="jpeg", quality=60, full_page=False, scale="css",
                         clip={"x": 0, "y": 0, "width": width, "height": height},
-                        mask=[session.page.locator(SCREENSHOT_MASK)], animations="disabled", timeout=5000,
+                        mask=masks, animations="disabled", caret="initial", timeout=5000,
                     )
                     if len(image) > MAX_SCREENSHOT_BYTES:
                         raise _error(502, "browser_screenshot_limit")
@@ -1338,17 +1815,37 @@ class AssistantBrowser:
                             raise ValueError()
                     if await self._current(session) != url:
                         raise _error(409, "browser_snapshot_stale")
-                    current = (await session.cdp.send("Page.getFrameTree"))["frameTree"]["frame"]
-                    if (session.closed or session.failure or current.get("unreachableUrl")
-                            or any(current.get(key) != frame.get(key) for key in ("id", "loaderId", "url", "urlFragment"))):
+                    current_tree = await session.cdp.send("Page.getFrameTree")
+                    if session.closed or session.failure or current_tree != tree:
+                        raise _error(409, "browser_snapshot_stale")
+                    for locator, handle in pinned_frames:
+                        if not await locator.evaluate("(el, original) => el === original", handle):
+                            raise _error(409, "browser_snapshot_stale")
+                    if frames_changed:
                         raise _error(409, "browser_snapshot_stale")
                     return {**session.view(), "mime_type": "image/jpeg",
                             "image_base64": base64.b64encode(image).decode("ascii"),
                             "width": width, "height": height, "masked": True}
             except HTTPException:
+                if frames_changed:
+                    raise _error(409, "browser_snapshot_stale") from None
                 raise
             except Exception:
+                if frames_changed:
+                    raise _error(409, "browser_snapshot_stale") from None
                 raise _error(502, "browser_screenshot_unavailable") from None
+            finally:
+                for event in frame_events:
+                    try:
+                        session.page.remove_listener(event, frame_changed)
+                    except Exception:
+                        pass
+                for _, handle in pinned_frames:
+                    if handle is not None:
+                        try:
+                            await asyncio.wait_for(handle.dispose(), 1)
+                        except Exception:
+                            pass
 
     async def refresh(self, session_id: str, token: str) -> dict[str, Any]:
         session = await self._session(session_id, token)

@@ -945,15 +945,31 @@ def test_routes_use_app_state_and_validation_never_echoes_tokens():
         app.state.assistant_browser = browser
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://worker") as client:
             assert (await client.post("/assistant-browser/open", json={"url": URL, "token": TOKEN})).status_code == 200
-            browser.open.assert_awaited_once_with(URL, "interaction", TOKEN, session_id=None, trusted_origins=[])
+            browser.open.assert_awaited_once_with(URL, "interaction", TOKEN, session_id=None,
+                                                 trusted_origins=[], same_origin_only=False, wait_for_lane=False)
             host_id = str(uuid.uuid4())
             response = await client.post("/assistant-browser/open", json={"url": URL, "token": TOKEN, "session_id": host_id})
             assert response.status_code == 200
-            browser.open.assert_awaited_with(URL, "interaction", TOKEN, session_id=host_id, trusted_origins=[])
+            browser.open.assert_awaited_with(URL, "interaction", TOKEN, session_id=host_id,
+                                            trusted_origins=[], same_origin_only=False, wait_for_lane=False)
             await client.post("/assistant-browser/open", json={"url": URL, "token": TOKEN,
                 "trusted_origins": ["https://sso.example.com"]})
             browser.open.assert_awaited_with(URL, "interaction", TOKEN, session_id=None,
-                                           trusted_origins=["https://sso.example.com"])
+                                           trusted_origins=["https://sso.example.com"], same_origin_only=False,
+                                           wait_for_lane=False)
+            for policy in [False, True]:
+                response = await client.post("/assistant-browser/open", json={
+                    "url": URL, "token": TOKEN, "same_origin_only": policy})
+                assert response.status_code == 200
+                browser.open.assert_awaited_with(URL, "interaction", TOKEN, session_id=None,
+                                                trusted_origins=[], same_origin_only=policy, wait_for_lane=False)
+            for policy in [0, 1, "true", "false", "1", "0", None, [], {}]:
+                calls = browser.open.await_count
+                response = await client.post("/assistant-browser/open", json={
+                    "url": URL, "token": TOKEN, "same_origin_only": policy})
+                assert response.status_code == 422
+                assert response.json() == {"detail": "Invalid browser request"}
+                assert browser.open.await_count == calls
             for op in ["observe", "navigate", "close"]:
                 payload = {"token": TOKEN, **({"url": URL} if op == "navigate" else {})}
                 assert (await client.post(f"/assistant-browser/opaque/{op}", json=payload)).status_code == 200

@@ -83,6 +83,8 @@ def validate_draft(
     owner_type: str,
     payload: SiteWrite | TemplateWrite,
     owner_id: int | None,
+    *,
+    preserve_local: bool = False,
 ) -> dict:
     model = {OWNER_SITE: SiteWrite, OWNER_TEMPLATE: TemplateWrite}.get(owner_type)
     if model is None or not isinstance(payload, model):
@@ -104,7 +106,8 @@ def validate_draft(
     owner_model = Template if owner_type == OWNER_TEMPLATE else Site
     context._ensure_name_available(owner_model, payload.name, exclude_id=owner_id)
     parent_id = payload.parent_id if isinstance(payload, TemplateWrite) else payload.template_id
-    context._prepare_local_inputs(owner_type, payload, parent_id, existing)
+    context._prepare_local_inputs(
+        owner_type, payload, parent_id, existing, preserve_positions=preserve_local)
 
     candidate_id = owner_id
     if candidate_id is None:
@@ -120,7 +123,8 @@ def validate_draft(
             values["trusted_urls_json"] = existing.trusted_urls_json
     candidate = owner_model(id=candidate_id, **values)
 
-    groups = sorted(context._group_rows(owner_type, candidate_id, payload.groups), key=lambda row: row.position)
+    groups = sorted(context._group_rows(
+        owner_type, candidate_id, payload.groups, preserve_null=preserve_local), key=lambda row: row.position)
     steps = context._step_rows(owner_type, candidate_id, payload.steps)
     signals = context._signal_rows(owner_type, candidate_id, payload.signals)
 

@@ -224,7 +224,7 @@ def test_challenge_arbitrary_targets_require_sign_permission(public_dns, monkeyp
 
 
 @pytest.mark.parametrize("outcome", ["unknown", "timeout", "raise"])
-def test_uncertainty_blocks_new_actions_but_not_replay_observe_or_navigation(public_dns, monkeypatch, outcome):
+def test_uncertainty_preserves_history_but_allows_fresh_steps(public_dns, monkeypatch, outcome):
     monkeypatch.setattr(module, "EXECUTE_TIMEOUT", 0.02)
 
     async def run():
@@ -246,17 +246,17 @@ def test_uncertainty_blocks_new_actions_but_not_replay_observe_or_navigation(pub
         if outcome == "unknown":
             assert result["result"] == {"submitted": True, "verified": False}
         assert await browser.execute(session_id, payload) == result
+        mock.assert_awaited_once()
+        mock.side_effect = None
+        mock.return_value = ("success", "", {})
         for feature, config in [("sign.button", {"button_selector": ["#sign"]}),
                                 ("action.click", {"selector": ["#sign"]}),
                                 ("challenge.slider", {"container_selector": ["#c"], "handle_selector": ["#h"]})]:
-            with pytest.raises(HTTPException) as error:
-                await browser.execute(session_id, request(feature, config))
-            assert error.value.status_code == 409 and "uncertain" in error.value.detail
-        mock.assert_awaited_once()
+            assert (await browser.execute(session_id, request(feature, config)))["status"] == "success"
+        assert browser.sessions[session_id].unresolved_operations == {str(payload.operation_id)}
+        assert await browser.execute(session_id, payload) == result
         await browser.observe(session_id, TOKEN)
         await browser.navigate(session_id, TOKEN, URL)
-        mock.side_effect = None
-        mock.return_value = ("success", "", {})
         for payload in [request(), request("action.navigate", {"url": URL})]:
             assert (await browser.execute(session_id, payload))["status"] == "success"
         assert browser.sessions[session_id].uncertain
@@ -360,10 +360,6 @@ def test_only_host_reviewed_write_steps_allow_post(public_dns, monkeypatch, feat
             assert not session.writes_authorized
         payload = original.model_copy(update={"operation_id": uuid.uuid4()})
         allowed = feature == "action.click"
-        if uncertain and allowed:
-            payload = payload.model_copy(update={
-                "retry_of": original.operation_id, "retry_authorization": uuid.uuid4(),
-            })
 
         async def delayed_post(*args, **kwargs):
             assert session.executing and session.writes_authorized == allowed
@@ -392,8 +388,8 @@ def test_only_host_reviewed_write_steps_allow_post(public_dns, monkeypatch, feat
             assert result["diagnostics"]["blocked_requests"][0]["method"] == "POST"
             assert result["diagnostics"]["blocked_requests"][0]["code"] == "browser_url_denied"
             assert result["after"]["url"] == URL
-            if uncertain:
-                assert str(original.operation_id) in session.unresolved_operations
+        if uncertain:
+            assert str(original.operation_id) in session.unresolved_operations
         # Observation never re-enables writes, including after a granted step.
         await browser.observe(session_id, TOKEN)
         assert not session.writes_authorized
@@ -610,7 +606,7 @@ def test_real_browser_login_and_secret_target_defenses(public_dns):
                 assert verified["result"] == {"submitted": True, "verified": True}
                 assert "password-private" not in json.dumps(verified)
                 # A failed success-element check is not proof the submitted auth
-                # action failed; preserve evidence and prevent a new-ID replay.
+                # action failed; preserve evidence and the exact-ID replay result.
                 await browser.navigate(session_id, TOKEN, origin + "/")
                 unconfirmed = verify.model_copy(deep=True)
                 unconfirmed.operation_id = uuid.uuid4()
@@ -658,9 +654,7 @@ def test_real_browser_login_and_secret_target_defenses(public_dns):
                         assert await page.locator("#p").input_value() == ""
                     assert "password-private" not in json.dumps(denied)
                     assert "alice-private" not in json.dumps(denied)
-                    with pytest.raises(HTTPException) as error:
-                        await browser.execute(session_id, unsafe.model_copy(update={"operation_id": uuid.uuid4()}))
-                    assert error.value.status_code == 409
+                    assert str(unsafe.operation_id) in browser.sessions[session_id].unresolved_operations
             finally:
                 if browser:
                     await browser.stop()

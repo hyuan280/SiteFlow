@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from app.features.catalog import FEATURE_LIST
 from app.models.setting import AppSetting
 from app.schemas.config_ai import GenerateSiteDraftRequest, GenerationResult
 from app.services import config_ai_generation as generation
@@ -522,10 +523,40 @@ def test_request_budget_includes_all_messages_and_tool_definitions(harness, monk
     assert len(harness[1]) == (1 if source == "history" else 0)
 
 
-@pytest.mark.parametrize("features", [["unknown"], ["action.fill"], ["post.buy_card"]])
+@pytest.mark.parametrize("features", [["unknown"], ["plugin.private.wait"], ["sign.iframe_form"]])
 def test_invalid_host_selection_is_safe_422_without_network(harness, features):
     _fails(harness, [], "invalid_selection", 422, payload=_payload(allowed_features=features))
     assert not harness[1]
+
+
+@pytest.mark.parametrize("feature", [
+    "action.fill", "post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog",
+])
+def test_all_builtins_selected_and_newly_available_features_are_proposal_only(harness, feature):
+    features = [feature.key for feature in FEATURE_LIST]
+    config = {"selector": ["#search"], "value": "public text"} if feature == "action.fill" else {}
+    draft = {**EMPTY, "steps": [{"step_key": "proposed", "feature_type": feature, "config": config}]}
+    result = harness[0]([
+        _response(_call()),
+        _response(_call("get_feature_schema", {"feature_type": feature}, "schema")),
+        _response(_submit(draft)),
+    ], payload=_payload(allowed_features=features))
+    assert result["draft"]["steps"][0]["config"] == draft["steps"][0]["config"]
+    assert result["requires_review"] is True and result["status"] == "proposal"
+    messages = json.loads(harness[1][-1].content)["messages"]
+    listing = next(json.loads(message["content"]) for message in messages
+                   if message["role"] == "tool")
+    assert {item["feature_type"] for item in listing["features"]} == set(features)
+
+
+def test_fill_cannot_carry_known_provider_key(harness, monkeypatch):
+    draft = {**EMPTY, "steps": [{"step_key": "fill", "feature_type": "action.fill",
+                                "config": {"selector": ["#search"], "value": KEY}}]}
+    dispatch = Mock(side_effect=AssertionError("must not dispatch"))
+    monkeypatch.setattr(ConfigAITools, "dispatch", dispatch)
+    _fails(harness, [_response(_submit(draft))], "secret_output",
+           payload=_payload(allowed_features=["action.fill"]))
+    dispatch.assert_not_called()
 
 
 @pytest.mark.parametrize("changes", [

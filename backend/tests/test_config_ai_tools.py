@@ -26,8 +26,7 @@ from tests.test_workflow_drafts import _read_only
 
 SITE = {"name": "new-generated-site", "base_url": "https://example.com"}
 EMPTY = {"steps": [], "groups": [], "signals": []}
-ALLOWED = [feature.key for feature in FEATURE_LIST
-           if not feature.key.startswith("post.") and feature.key != "action.fill"]
+ALLOWED = [feature.key for feature in FEATURE_LIST if feature.generation_hints is not None]
 PRIVATE = "PRIVATE-ADMIN-SECRET"
 
 
@@ -88,7 +87,7 @@ def test_consent_requires_explicit_boolean_true(value):
 @pytest.mark.parametrize("changes", [
     {"requirements": ""}, {"requirements": "x" * 8001}, {"evidence": "x" * 16001},
     {"allowed_features": []}, {"allowed_features": ["action.wait"] * 2},
-    {"allowed_features": [str(index) for index in range(23)]},
+    {"allowed_features": [str(index) for index in range(24)]},
     {"site": {**SITE, "name": ""}}, {"site": {**SITE, "name": "x" * 129}},
     {"site": {**SITE, "base_url": "file:///private"}},
 ])
@@ -109,8 +108,7 @@ def test_request_and_site_forbid_privileged_metadata(key):
 
 
 @pytest.mark.parametrize("key", [
-    "post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog", "plugin.private.wait",
-    "sign.iframe_form", "action.fill", "unknown", PRIVATE,
+    "plugin.private.wait", "sign.iframe_form", "auth.totp_login", "unknown", PRIVATE,
 ])
 def test_host_cannot_authorize_unreviewed_or_excluded_features(tools, key):
     with pytest.raises(ValueError, match="^Invalid generation feature selection$"):
@@ -183,6 +181,9 @@ def test_schema_consultation_is_per_feature_and_per_generation(tools):
 @pytest.mark.parametrize("feature,field", [
     ("sign.iframe.image_captcha", "fields"), ("flow.result", "llm_enabled"),
     ("flow.result", "llm_prompt"), ("challenge.image_captcha", "llm_prompt"),
+    ("post.buy_card", "option_selector"), ("post.buy_card", "exchange_action"),
+    ("post.buy_card", "submit_value"), ("action.fill", "password"),
+    ("action.fill", "cookie"), ("action.fill", "token"), ("action.fill", "otp"),
     ("action.wait", "unknown"), ("action.wait", "owner_id"),
 ])
 @pytest.mark.parametrize("value", [None, PRIVATE])
@@ -213,6 +214,7 @@ def test_override_schema_enforces_builtin_provider_enum_and_field_constraints(to
     ("challenge.2fa", {"service_hint": "Example", "totp_provider_id": "builtin.twofauth"}),
     ("action.click", {"selector": ["#observed"]}),
     ("action.navigate", {"url": "https://example.com/observed"}),
+    ("action.fill", {"selector": ["#public-search"], "value": "public search text"}),
 ])
 def test_builtin_providers_and_reviewed_generic_actions_can_be_proposed(tools, feature, config):
     _consult(tools, feature)

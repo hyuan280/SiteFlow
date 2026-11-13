@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -14,9 +13,18 @@ from app.services.assistant_prompt import SYSTEM_PROMPT, tool_definitions
 from app.services.assistant_snapshot import safe_selector_result, safe_snapshot
 from app.services.assistant_tools import AssistantTools
 from app.services.assistant_urls import trust_required
+from app.schemas.assistant import CreateSession
 
 
-TARGET = {"base_url": "https://example.com/", "proxy": False}
+TARGET = {"base_url": "https://example.com/", "proxy": False,
+          "confirmed": True, "browser_consent": True}
+
+
+@pytest.fixture
+def dispatch_manager(client):
+    manager = client.app.state.assistant_manager
+    sid = manager.create("owner", CreateSession())["id"]
+    return manager, sid
 
 
 def node(node_id="n0", **fields):
@@ -211,7 +219,8 @@ def test_trust_warning_rebuilds_details_without_granting_authority():
     assert result["warnings"][0]["target_origin"] == "https://sso.example"
     assert result["frames"][1]["readable"] is False
     assert "PRIVATE" not in json.dumps(result)
-    assert TARGET == {"base_url": "https://example.com/", "proxy": False}
+    assert TARGET == {"base_url": "https://example.com/", "proxy": False,
+                      "confirmed": True, "browser_consent": True}
     raw["url"] = destination
     assert safe_snapshot(raw, TARGET) == {"ok": False, "code": "browser_unavailable"}
 
@@ -374,9 +383,10 @@ def test_projection_enforces_complete_json_result_budget():
     ("browser_check_selector", {"selector": "#safe", "offset": 0}),
     ("browser_unknown", {}),
 ])
-def test_strict_browser_arguments_do_not_reach_worker(name, args):
-    manager = SimpleNamespace(browser_tool=AsyncMock())
-    tools = AssistantTools(manager, "owner", "session", TARGET)
+def test_strict_browser_arguments_do_not_reach_worker(dispatch_manager, name, args):
+    manager, sid = dispatch_manager
+    manager.browser_tool = AsyncMock()
+    tools = AssistantTools(manager, "owner", sid, TARGET)
     assert asyncio.run(tools.dispatch(name, args)) == {"ok": False, "code": "invalid_arguments"}
     manager.browser_tool.assert_not_awaited()
 
@@ -386,30 +396,31 @@ def test_strict_browser_arguments_do_not_reach_worker(name, args):
     ("browser_inspect", "inspect", {"snapshot_id": str(uuid4()), "node_id": "n0", "limit": 1}),
     ("browser_check_selector", "check-selector", {"selector": "#duplicate", "frame_id": "main"}),
 ])
-def test_dispatch_routes_payload_with_identity_and_safe_projection(name, operation, args):
-    manager = AssistantManager(None, None, None)
+def test_dispatch_routes_payload_with_identity_and_safe_projection(dispatch_manager, name, operation, args):
+    manager, sid = dispatch_manager
     scope = BrowserScope("owner", str(uuid4()), "HOST_TOKEN", "interaction", "", time.monotonic() + 900)
-    manager.browsers["session"] = scope
+    manager.browsers[sid] = scope
     raw = selector_result() if operation == "check-selector" else snapshot([node()])
     if operation == "inspect":
         raw["snapshot_id"] = args["snapshot_id"]
     raw.update(session_id=scope.session_id, lane_key=scope.lane_key, token=scope.token, cdp="PRIVATE")
     manager._worker = AsyncMock(return_value=raw)
-    tools = AssistantTools(manager, "owner", "session", TARGET)
+    tools = AssistantTools(manager, "owner", sid, TARGET)
     result = asyncio.run(tools.dispatch(name, args))
     assert result["ok"]
     manager._worker.assert_awaited_once_with(f"{scope.session_id}/{operation}", {**args, "token": scope.token})
-    assert manager.browsers["session"] is scope
+    assert manager.browsers[sid] is scope
     assert "HOST_TOKEN" not in json.dumps(result) and "PRIVATE" not in json.dumps(result)
     raw["session_id"] = str(uuid4())
     manager._close_browser = AsyncMock()
     assert not asyncio.run(tools.dispatch(name, args))["ok"]
-    manager._close_browser.assert_awaited_once_with("session")
+    manager._close_browser.assert_awaited_once_with(sid)
 
 
-def test_inspect_normalizes_uuid_without_mutating_caller_arguments():
-    manager = SimpleNamespace(browser_tool=AsyncMock(return_value={"ok": True}))
-    tools = AssistantTools(manager, "owner", "session", TARGET)
+def test_inspect_normalizes_uuid_without_mutating_caller_arguments(dispatch_manager):
+    manager, sid = dispatch_manager
+    manager.browser_tool = AsyncMock(return_value={"ok": True})
+    tools = AssistantTools(manager, "owner", sid, TARGET)
     identifier = str(uuid4())
     args = {"snapshot_id": identifier.upper(), "node_id": "n0"}
     assert asyncio.run(tools.dispatch("browser_inspect", args))["ok"]
@@ -424,16 +435,16 @@ def test_inspect_normalizes_uuid_without_mutating_caller_arguments():
     ("browser_inspect", {"snapshot_id": str(uuid4()), "node_id": "n0"}, snapshot()),
     ("browser_check_selector", {"selector": "#expected"}, selector_result()),
 ])
-def test_response_request_binding_mismatches_fail_closed(name, args, raw):
-    manager = AssistantManager(None, None, None)
+def test_response_request_binding_mismatches_fail_closed(dispatch_manager, name, args, raw):
+    manager, sid = dispatch_manager
     scope = BrowserScope("owner", str(uuid4()), "HOST_TOKEN", "interaction", "", time.monotonic() + 900)
-    manager.browsers["session"] = scope
+    manager.browsers[sid] = scope
     raw.update(session_id=scope.session_id, lane_key=scope.lane_key)
     manager._worker = AsyncMock(return_value=raw)
     manager._close_browser = AsyncMock()
-    result = asyncio.run(manager.browser_tool("owner", "session", TARGET, name, None, args))
+    result = asyncio.run(manager.browser_tool("owner", sid, TARGET, name, None, args))
     assert result["code"] == "browser_unavailable"
-    manager._close_browser.assert_awaited_once_with("session")
+    manager._close_browser.assert_awaited_once_with(sid)
 
 
 @pytest.mark.parametrize("name,args", [
@@ -443,31 +454,31 @@ def test_response_request_binding_mismatches_fail_closed(name, args, raw):
 ])
 @pytest.mark.parametrize("code", ["browser_snapshot_stale", "browser_selector_invalid",
                                   "browser_frame_unavailable", "browser_frame_unreadable"])
-def test_semantic_worker_errors_leave_browser_open(code, name, args):
-    manager = AssistantManager(None, None, None)
+def test_semantic_worker_errors_leave_browser_open(dispatch_manager, code, name, args):
+    manager, sid = dispatch_manager
     scope = BrowserScope("owner", str(uuid4()), "HOST_TOKEN", "interaction", "", time.monotonic() + 900)
-    manager.browsers["session"] = scope
+    manager.browsers[sid] = scope
     manager._worker = AsyncMock(side_effect=AssistantError("browser_unavailable", 502, reason=code))
     manager._close_browser = AsyncMock()
-    tools = AssistantTools(manager, "owner", "session", TARGET)
+    tools = AssistantTools(manager, "owner", sid, TARGET)
     result = asyncio.run(tools.dispatch(name, args))
     assert result["code"] == code and result["reason"] == code
     assert "page remains open" in result["notice"]
-    assert manager.browsers["session"] is scope
+    assert manager.browsers[sid] is scope
     manager._close_browser.assert_not_awaited()
 
 
-def test_top_level_dns_denial_retains_browser_without_evidence():
-    manager = AssistantManager(None, None, None)
+def test_top_level_dns_denial_retains_browser_without_evidence(dispatch_manager):
+    manager, sid = dispatch_manager
     scope = BrowserScope("owner", str(uuid4()), "HOST_TOKEN", "interaction", "", time.monotonic() + 900)
-    manager.browsers["session"] = scope
+    manager.browsers[sid] = scope
     manager._worker = AsyncMock(side_effect=AssistantError("browser_unavailable", 502, reason="browser_dns_denied"))
     manager._close_browser = AsyncMock()
-    tools = AssistantTools(manager, "owner", "session", TARGET)
+    tools = AssistantTools(manager, "owner", sid, TARGET)
     result = asyncio.run(tools.dispatch("browser_observe", {}))
     assert result["reason"] == "browser_dns_denied"
     assert result["page_retained"] is True and result["ok"] is False
-    assert manager.browsers["session"] is scope
+    assert manager.browsers[sid] is scope
     manager._close_browser.assert_not_awaited()
 
 

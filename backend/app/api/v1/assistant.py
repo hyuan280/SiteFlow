@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
@@ -111,10 +111,17 @@ def reset_assistant_settings(
 
 @router.get("/sessions")
 async def list_sessions(
+    request: Request,
+    offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=100),
     current: AuthSession = Depends(get_readonly_current_session),
     service: AssistantManager = Depends(manager),
 ) -> dict:
-    return service.list_sessions(current.username)
+    # Query strings are integers, but Pydantic also accepts integral floats ("1.0").
+    for name in ("offset", "limit"):
+        raw = request.query_params.get(name)
+        if raw is not None and not (raw.isascii() and raw.lstrip("+-").isdecimal()):
+            raise AssistantError("invalid_arguments", 422)
+    return service.list_sessions(current.username, offset=offset, limit=limit)
 
 
 @router.post("/sessions")
@@ -213,23 +220,28 @@ async def events(
     service: AssistantManager = Depends(manager),
 ):
     identifier = str(session_id)
-    initial = service.detail(owner, identifier)
+
+    def snapshot():
+        # Each worker owns its DB sessions; only the encoded projection crosses threads.
+        with service.session_factory() as db:
+            auth = get_readonly_current_session(request, db, service.settings)
+            if auth.username != owner:
+                raise HTTPException(status_code=401)
+        return _json(service.detail(owner, identifier))
+
+    initial = await asyncio.to_thread(snapshot)
 
     async def snapshots():
         previous = None
-        detail = initial
+        encoded = initial
         while not await request.is_disconnected():
-            # Recheck login expiry/revocation as well as ownership on each snapshot.
-            try:
-                with service.session_factory() as db:
-                    auth = get_readonly_current_session(request, db, service.settings)
-                    if auth.username != owner:
-                        return
-                detail = service.detail(owner, identifier)
-            except (HTTPException, AssistantError):
-                return
-            encoded = _json(detail)
-            if encoded != previous or detail["status"] == "running":
+            if previous is not None:
+                # Recheck login expiry/revocation and ownership on every poll.
+                try:
+                    encoded = await asyncio.to_thread(snapshot)
+                except (HTTPException, AssistantError):
+                    return
+            if encoded != previous:
                 yield "event: update\ndata: " + encoded + "\n\n"
                 previous = encoded
             else:

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from worker import executor
 from worker import resign_checkpoint
 from worker.resign_click import resign_click_timeout, run_resign_click
+from tests.assistant_consumption_helpers import approved_consumption_payload  # noqa: F401
 
 
 BASE = "http://127.0.0.1:18765"
@@ -332,14 +333,15 @@ def step(key, feature="action.click", **extra):
 
 
 @pytest.fixture
-def worker_run(monkeypatch, tmp_path):
+def worker_run(monkeypatch, tmp_path, approved_consumption_payload):
     from tests.test_worker_navigation import _JumpLane, _JumpManager, _JumpPage
 
     monkeypatch.setattr(executor, "ARTIFACT_ROOT", tmp_path)
     monkeypatch.setattr(executor.JobArtifacts, "capture_failure", AsyncMock())
     monkeypatch.setattr(executor, "_export_site_cookies", AsyncMock(return_value=[]))
 
-    async def execute(steps, run_step, cancel=None, disconnect=False, task_cancel=False, assistant=False):
+    async def execute(steps, run_step, cancel=None, disconnect=False, task_cancel=False,
+                      assistant=False, approved=True):
         monkeypatch.setattr(executor, "_run_step", run_step)
         lane = _JumpLane(_JumpPage())
         lane.session = SimpleNamespace(disconnected=False, desktop=None)
@@ -357,11 +359,12 @@ def worker_run(monkeypatch, tmp_path):
                 canceled = True
                 task.cancel()
 
-        task = asyncio.create_task(executor.execute_job(
-            manager, {"job_id": 1, "steps": steps, "assistant_run": assistant}, cancel, progress,
-        ))
+        payload = {"job_id": 1, "steps": steps, "assistant_run": assistant}
+        if approved:
+            payload = approved_consumption_payload(payload)
+        task = asyncio.create_task(executor.execute_job(manager, payload, cancel, progress))
         result = await task
-        assert manager.released
+        assert manager.released is approved
         return result, snapshots
 
     return execute
@@ -432,6 +435,17 @@ def test_executor_exception_keeps_partial_checkpoint(worker_run, feature, assist
     assert result["status"] == ("unknown" if assistant else "waiting_human")
     assert len(result["steps"]) == 1
     assert result["steps"][0]["data"]["resign"] == state
+
+
+@pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])
+def test_unapproved_assistant_resign_does_not_reach_checkpoint_runner(worker_run, feature):
+    run_step = AsyncMock()
+    result, _ = asyncio.run(worker_run(
+        [step("resign", feature)], run_step, assistant=True, approved=False))
+    assert result["status"] == "fail"
+    assert result["reason"] == "assistant_configuration_changed"
+    assert result["steps"] == []
+    run_step.assert_not_awaited()
 
 
 @pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])

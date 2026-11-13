@@ -11,10 +11,10 @@ import pytest
 from fastapi import HTTPException
 
 from app.services.assistant_tools import AssistantTools
-from app.services.assistant_retry import PENDING, decide_retry_approval
+from app.services.assistant_retry import PENDING
 from app.services.assistant_urls import trust_required
 from tests.test_assistant_execution import (  # noqa: F401
-    BASE, OWNER, PASSWORD, TOKEN, USERNAME, arguments, bind, execution,
+    BASE, OWNER, PASSWORD, TOKEN, USERNAME, arguments, bind, execution, save_target,
 )
 from tests.test_assistant_retry import load
 
@@ -35,6 +35,7 @@ def test_uncertain_login_keeps_safe_reads_but_unsafe_current_url_closes(
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
     ]))
     bind(execution)
+    save_target(execution, {**execution.target, "browser_consent": True})
     manager = execution.manager
     manager.browsers.clear()
     lane_manager = Manager()
@@ -140,13 +141,8 @@ def test_uncertain_login_keeps_safe_reads_but_unsafe_current_url_closes(
             assert inspected["ok"] and inspected["elements"] == refreshed["elements"]
             checked = await tools.dispatch("browser_check_selector", {"selector": "#login"})
             assert checked["ok"]
-            retry = asyncio.create_task(tools.dispatch("execute_step", args))
-            async with asyncio.timeout(2):
-                while not load(execution).get(PENDING):
-                    await asyncio.sleep(0)
-            approval = load(execution)[PENDING]
-            await decide_retry_approval(manager, OWNER, execution.session_id, approval["id"], "deny")
-            assert (await retry)["code"] == "retry_denied"
+            assert (await tools.dispatch("execute_step", args))["code"] == "operation_already_used"
+            assert not load(execution).get(PENDING)
             run_step.assert_awaited_once()
             assert manager.browsers[execution.session_id] is scope
             close.assert_not_awaited()

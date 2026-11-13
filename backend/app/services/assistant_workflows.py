@@ -158,11 +158,12 @@ def workflow_candidate(service, target, draft):
 
 
 class AssistantWorkflows:
-    def __init__(self, manager, owner, session_id, target):
+    def __init__(self, manager, owner, session_id, target, *, turn=None, auth_limit=None):
         self.manager, self.owner, self.session_id = manager, owner, session_id
         self.target = target
+        self.turn, self.auth_limit = turn, auth_limit
 
-    def _context(self, db, *, write=False):
+    def _context(self, db, *, write=False, operation="run"):
         manager = self.manager
         if write:
             changed = db.execute(update(AssistantSession).where(
@@ -171,8 +172,13 @@ class AssistantWorkflows:
             ).values(status="running"))
             if changed.rowcount != 1:
                 raise WorkflowDenied("workflow_authorization_changed")
+            db.expire_all()
         row = manager._owned(db, self.owner, self.session_id)
         data = manager._decrypt(row)
+        if write:
+            from app.services.assistant_takeover import takeover_workflow_authority
+
+            takeover_workflow_authority(self, db, data, operation=operation)
         target = data.get("target") or {}
         if target != self.target:
             raise WorkflowDenied("workflow_authorization_changed")
@@ -198,7 +204,7 @@ class AssistantWorkflows:
         return _strict_json(self.manager.crypto.decrypt(
             f"assistant-workflow:{action.id}", action.ciphertext, action.nonce, action.key_version))
 
-    def _action(self, db, kind, identity, proposal_id=None):
+    def _action(self, db, kind, identity, proposal_id=None, *, reserve=True):
         fingerprint = hashlib.sha256(_json(identity).encode()).hexdigest()
         action = db.scalar(select(AssistantWorkflowAction).where(
             AssistantWorkflowAction.session_id == self.session_id,
@@ -207,6 +213,8 @@ class AssistantWorkflows:
         ))
         if action:
             return action, True
+        if not reserve:
+            return None, False
         action = AssistantWorkflowAction(
             id=str(uuid4()), session_id=self.session_id, owner=self.owner, kind=kind,
             request_fingerprint=fingerprint, proposal_message_id=proposal_id, state="reserved")
@@ -226,7 +234,7 @@ class AssistantWorkflows:
         from app.schemas.config_ai import GenerationSite
 
         with self.manager.session_factory() as db:
-            row, data, target = self._context(db, write=True)
+            row, data, target = self._context(db, write=True, operation="import")
             message = db.scalar(select(AssistantMessage).where(
                 AssistantMessage.id == proposal_message_id,
                 AssistantMessage.session_id == self.session_id, AssistantMessage.role == "tool",
@@ -277,6 +285,9 @@ class AssistantWorkflows:
                 "draft": proposal.draft.model_dump(mode="json")})
             if not checked.get("ok"):
                 return checked
+            from app.services.assistant_takeover import takeover_workflow_authority
+
+            takeover_action = takeover_workflow_authority(self, db, data, operation="import")
             if owner_id is None:
                 saved = service.create_site(candidate, _commit=False)
             else:
@@ -309,11 +320,16 @@ class AssistantWorkflows:
                                      "\u672a\u542f\u7528\u5b9a\u65f6\u8c03\u5ea6\uff0c\u9700\u7528\u6237\u5ba1\u6838\u542f\u7528\u3002"
                                      if owner_id is None else "Existing enabled and scheduling settings were preserved."))}
             self._seal(action, {"result": output, "target_revision": data["_target_revision"]})
+            from app.services.assistant_takeover import takeover_import_receipt
+
+            # Validate before the candidate changes the source binding; consume in
+            # the same transaction as the site write and its typed receipt.
+            takeover_import_receipt(takeover_action, output)
             db.commit()
             self.target = target
             return output
 
-    async def run_site(self):
+    async def run_site(self, *, consumption_permit=None):
         from app.services.execution import ExecutionService
         from app.services.secret_providers import credential_provider
         from app.services.assistant_tools import ALLOWED_FEATURES
@@ -322,12 +338,15 @@ class AssistantWorkflows:
         if self.manager.executor is None:
             raise WorkflowDenied("executor_unavailable")
         with self.manager.session_factory() as db:
-            self._context(db)
+            _, data, _ = self._context(db)
+            from app.services.assistant_takeover import takeover_workflow_authority
+
+            takeover_workflow_authority(self, db, data, operation="run")
         # Release the discovery tab before taking the same interaction lane slot.
         if saved_lane(self.target or {}) in {"interaction", "proxy_interaction"}:
             await self.manager._close_browser(self.session_id)
         with self.manager.session_factory() as db:
-            _, data, target = self._context(db, write=True)
+            row, data, target = self._context(db, write=True)
             site = bound_workflow(db, target)
             action, replay = self._action(db, "run", {
                 "binding": workflow_binding(site), "proposal": data.get("_workflow_proposal_id")},
@@ -357,6 +376,12 @@ class AssistantWorkflows:
             service = self._service(db)
             resolved = service.resolve_site(site.id)
             validate_workflow_urls(resolved, target)
+            from app.features.catalog import FEATURES
+            from app.services.assistant_consumption import consume_permit
+
+            if any(step.feature_type not in FEATURES for step in resolved.steps):
+                raise WorkflowDenied("workflow_feature_denied")
+            consumption_plan = consume_permit(db, self, site, consumption_permit)
             if any(step.feature_type not in ALLOWED_FEATURES for step in resolved.steps):
                 raise WorkflowDenied("workflow_feature_denied")
             if any(isinstance(value, str) and value.startswith("plugin.")
@@ -369,7 +394,21 @@ class AssistantWorkflows:
             expected = "builtin.bitwarden" if mode == "bitwarden" else "builtin.manual"
             if credential_provider(site) != expected:
                 raise WorkflowDenied("workflow_credential_policy_mismatch")
-            auth = any(step.enabled and step.feature_type.startswith("auth.") for step in resolved.steps)
+            from app.services.assistant_categories import (
+                Denied, auth_budget_context, builtin_category, require_auth_capacity,
+            )
+
+            auth = any(step.enabled and builtin_category(step.feature_type) == "auth" for step in resolved.steps)
+            auth_budget = None
+            if auth:
+                try:
+                    turn_id, limit = auth_budget_context(
+                        self.manager, db, self.session_id, data, turn=self.turn, auth_limit=self.auth_limit)
+                    require_auth_capacity(data, turn_id, limit)
+                except Denied as exc:
+                    raise WorkflowDenied(str(exc)) from None
+                auth_budget = {"session_id": self.session_id, "owner": self.owner,
+                               "turn_id": turn_id, "limit": limit}
             credential = db.get(SiteCredential, site.id)
             if mode in {"cookie", "none"} and auth:
                 raise WorkflowDenied("credential_mode_incompatible")
@@ -392,7 +431,9 @@ class AssistantWorkflows:
             action.run_id, action.state = run.id, "complete"
             output = {"ok": True, "run_id": run.id, "site_id": site.id, "status": "queued",
                       "trigger": "assistant", "created_by": "assistant", "lane": resolved.lane}
-            self._seal(action, {"result": output})
+            self._seal(action, {"result": output, "consumption_plan": consumption_plan,
+                                "auth_budget": auth_budget})
+            self.manager._encrypt(row, data)
             db.commit()
         try:
             self.manager.executor.submit(run.id)
@@ -403,7 +444,7 @@ class AssistantWorkflows:
             with self.manager.session_factory() as db:
                 saved_action = db.get(AssistantWorkflowAction, action.id)
                 saved_action.state = "unknown"
-                self._seal(saved_action, {"result": output})
+                self._seal(saved_action, {**self._open(saved_action), "result": output})
                 db.commit()
         return output
 
@@ -415,10 +456,15 @@ class AssistantWorkflows:
                 AssistantWorkflowAction.session_id == self.session_id,
                 AssistantWorkflowAction.owner == self.owner, AssistantWorkflowAction.kind == "run",
                 AssistantWorkflowAction.run_id == run_id))
-            run = db.get(Run, run_id) if action else None
+            from app.services.assistant_takeover import takeover_source_job
+
+            source_job_id = takeover_source_job(self.manager, db, self.owner, self.session_id, run_id)
+            run = db.get(Run, run_id) if action or source_job_id else None
             if run is None:
                 raise WorkflowDenied("run_unavailable")
             jobs = list(db.scalars(select(SiteJob).where(SiteJob.run_id == run.id).order_by(SiteJob.id)))
+            if source_job_id is not None:
+                jobs = [job for job in jobs if job.id == source_job_id]
             steps = list(db.scalars(select(JobStep).where(
                 JobStep.site_job_id.in_([job.id for job in jobs]),
             ).order_by(JobStep.id).limit(1001)))
@@ -475,10 +521,10 @@ class AssistantWorkflows:
             output = {"ok": True, "run_id": run.id,
                       "status": run.status if run.status in statuses else "unknown",
                       "truncated": len(steps) > 1000}
-            submission = self._open(action).get("result", {})
+            submission = self._open(action).get("result", {}) if action else {}
             if submission.get("submitted") is False:
                 output.update(submitted=False, submission_code="run_submission_uncertain")
-            elif action.state == "unknown":
+            elif action is not None and action.state == "unknown":
                 output.update(submitted=False, submission_code="workflow_outcome_uncertain")
             output["jobs"] = []
             for job in jobs:

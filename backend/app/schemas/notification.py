@@ -32,6 +32,7 @@ class EmailNotificationView(BaseModel):
     enabled: bool
     notify_success: bool
     notify_manual: bool
+    notify_assistant: bool = True
     available: bool
     smtp_host: NotificationFieldView
     smtp_port: NotificationFieldView
@@ -47,6 +48,7 @@ class HTTPNotificationView(BaseModel):
     enabled: bool
     notify_success: bool
     notify_manual: bool
+    notify_assistant: bool = True
     available: bool
     url: NotificationFieldView
     method: NotificationFieldView
@@ -72,6 +74,7 @@ class EmailNotificationUpdate(BaseModel):
     enabled: bool | None = None
     notify_success: bool | None = None
     notify_manual: bool | None = None
+    notify_assistant: bool | None = None
     smtp_host: str | None = Field(default=None, max_length=255)
     smtp_port: int | None = Field(default=None, ge=1, le=65535)
     security: Literal["ssl", "starttls", "none"] | None = None
@@ -85,6 +88,7 @@ class HTTPNotificationUpdate(BaseModel):
     enabled: bool | None = None
     notify_success: bool | None = None
     notify_manual: bool | None = None
+    notify_assistant: bool | None = None
     url: str | None = Field(default=None, max_length=2048)
     method: Literal["POST", "PUT", "PATCH"] | None = None
     headers: dict[str, str] | None = None

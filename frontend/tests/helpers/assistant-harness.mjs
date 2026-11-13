@@ -55,6 +55,7 @@ export async function harness(exposed) {
         code = code.replace(line, line.replace(/import (.*?) from .*;/, "const $1 = globalThis.__assistantHarness;"));
       }
       return code.replace('import AssistantSettingsDialog from "@/components/AssistantSettingsDialog.vue";', 'const AssistantSettingsDialog = { render: () => null };')
+        .replace('import AssistantTakeoverDialog from "@/components/AssistantTakeoverDialog.vue";', 'const AssistantTakeoverDialog = { render: () => null };')
         .replace("</script>", `defineExpose({ ${exposed} });\n</script>`);
     } }] });
   const { default: View } = await server.ssrLoadModule("/src/views/AIAssistantView.vue");

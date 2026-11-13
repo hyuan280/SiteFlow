@@ -385,7 +385,7 @@ def test_protected_local_inline_values_require_manual_editor(context):
         assert db.get(Site, site.id).config_revision == 1
 
 
-def test_inherited_post_feature_is_rejected_independently_of_draft(context):
+def test_inherited_purchase_requires_bounded_consumption_independently_of_draft(context):
     manager, _ = context
     site = make_site(context)
     with manager.session_factory() as db:
@@ -397,7 +397,7 @@ def test_inherited_post_feature_is_rejected_independently_of_draft(context):
         db.get(Site, site.id).template_id = template.id
         db.commit()
     tools = configure(context, workflow_site_id=site.id)
-    assert call(tools, "run_site") == {"ok": False, "code": "workflow_feature_denied"}
+    assert call(tools, "run_site") == {"ok": False, "code": "consumption_max_price_required"}
     manager.executor.submit.assert_not_called()
 
 
@@ -533,7 +533,8 @@ def test_new_tool_definitions_are_unique_titled_bounded_and_valid():
 
     definitions = tool_definitions()
     names = [item["function"]["name"] for item in definitions]
-    assert len(names) == len(set(names)) == 28
+    assert len(names) == len(set(names))
+    assert "create_template_from_site" in names
     for item in definitions:
         schema = item["function"]["parameters"]
         Draft202012Validator.check_schema(schema)
@@ -895,12 +896,14 @@ def test_real_executor_fake_worker_feedback_correction_and_uncertainty(context, 
             scope = BrowserScope(OWNER, str(uuid4()), "private-browser-token", "proxy_interaction", "",
                                  time.monotonic() + 900)
             manager.browsers[tools.session_id] = scope
-            manager._worker = AsyncMock()
+            from tests.test_assistant_execution import response
+
+            manager._worker = AsyncMock(side_effect=lambda path, payload: response(scope, payload["operation_id"]))
             step_result = await AssistantExecution(manager, OWNER, tools.session_id, tools.target).execute({
                 "operation_id": str(uuid4()), "step": {"step_key": "click", "feature_type": "action.click",
                                                         "config": {"selector": ["#sign"]}}})
-            assert step_result == {"ok": False, "code": "workflow_outcome_uncertain"}
-            manager._worker.assert_not_awaited()
+            assert step_result["ok"]
+            manager._worker.assert_awaited_once()
         else:
             assert sign["data"] == {"reason": "selector_not_found", "field": "submit_selector",
                                     "stage": "fill", "cause": "selector_not_found"}

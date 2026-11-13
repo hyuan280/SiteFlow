@@ -6,7 +6,7 @@ import json
 from fastapi.testclient import TestClient
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import insert, select, update
+from sqlalchemy import event, insert, select, update
 
 from app.main import create_app
 from app.models.assistant import AssistantMessage, AssistantSession
@@ -28,12 +28,14 @@ ROOT = "/api/v1/assistant/settings"
 PRIVATE = "private-api-key-never-echo-or-persist"
 DEFAULTS = {
     "max_tool_calls": 20, "max_model_rounds": 12, "max_parallel_tool_calls": 4,
+    "max_auth_uses_per_turn": 3,
     "turn_timeout_seconds": 180, "max_tokens": None, "context_max_tokens": 64000,
     "auto_compact": True, "auto_title": True,
     "auto_authorize_execution": False, "auto_authorize_screenshot": False,
     "auto_authorize_workflow": False,
 }
-LEGACY = {**{key: value for key, value in DEFAULTS.items()
+PREVIOUS = {key: value for key, value in DEFAULTS.items() if key != "max_auth_uses_per_turn"}
+LEGACY = {**{key: value for key, value in PREVIOUS.items()
              if key not in {"context_max_tokens", "auto_authorize_execution",
                             "auto_authorize_screenshot", "auto_authorize_workflow"}},
           "context_max_bytes": 200000}
@@ -57,10 +59,48 @@ def test_exact_legacy_settings_migrate_readonly_then_persist_with_original_cas(c
         assert json.loads(db.get(AppSetting, KEY).value_json) == {"revision": 8, "values": migrated}
 
 
+@pytest.mark.parametrize("old_values", [PREVIOUS, LEGACY])
+@pytest.mark.parametrize("reset", [False, True])
+def test_exact_old_settings_load_without_dml_then_update_or_reset(client, old_values, reset):
+    raw = json.dumps({"revision": 7, "values": old_values}, indent=2)
+    factory = client.app.state.session_factory
+    with factory() as db:
+        db.add(AppSetting(key=KEY, value_json=raw))
+        db.commit()
+        statements = []
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement.lstrip().split()[0].upper())
+
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            view = AssistantSettingsService(db).view()
+            loaded = AssistantSettingsService(db).load()
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        assert set(statements) == {"SELECT"}
+        assert view.revision == 7 and view.source == "db"
+        assert loaded.model_dump() == {
+            **DEFAULTS, "context_max_tokens": 50000 if old_values == LEGACY else 64000,
+        }
+        assert db.get(AppSetting, KEY).value_json == raw
+    if reset:
+        response = client.post(ROOT + "/reset", json={"expected_revision": 7})
+        expected = DEFAULTS
+    else:
+        expected = {**loaded.model_dump(), "max_auth_uses_per_turn": 20}
+        response = client.put(ROOT, json={"expected_revision": 7, "values": expected})
+    assert response.json() == {"revision": 8, "source": "db", "values": expected}
+    with factory() as db:
+        assert json.loads(db.get(AppSetting, KEY).value_json) == {"revision": 8, "values": expected}
+
+
 @pytest.mark.parametrize("changes,removed", [
     ({"context_max_bytes": True}, None), ({"context_max_bytes": 63999}, None),
     ({"context_max_bytes": 1000001}, None), ({"auto_title": 1}, None),
     ({"auto_authorize_execution": False}, None), ({"extra": False}, None),
+    ({"max_auth_uses_per_turn": 3}, None),
     ({}, "auto_title"), ({}, "max_tokens"),
 ])
 def test_near_legacy_shape_fails_closed(client, changes, removed):
@@ -134,6 +174,7 @@ def test_csrf_required_without_auth_touch(client, method, path):
 @pytest.mark.parametrize("field,low,high", [
     ("max_tool_calls", 1, 200), ("max_model_rounds", 1, 100),
     ("max_parallel_tool_calls", 1, 8), ("turn_timeout_seconds", 30, 1800),
+    ("max_auth_uses_per_turn", 1, 20),
     ("max_tokens", 0, 9007199254740991), ("context_max_tokens", 16000, 1000000),
 ])
 def test_integer_bounds_and_strict_types(field, low, high):
@@ -176,6 +217,8 @@ def test_revision_is_required_strict_nonnegative(revision):
     {"expected_revision": 0, "values": {**DEFAULTS, "max_tool_calls": PRIVATE}},
     {"expected_revision": 0, "values": {**DEFAULTS, "auto_title": 1}},
     {"expected_revision": True, "values": DEFAULTS},
+    *({"expected_revision": 0, "values": {**DEFAULTS, "max_auth_uses_per_turn": value}}
+      for value in (None, True, False, 1.0, 1.5, 0, 21, "3", "1.5")),
 ])
 def test_invalid_api_inputs_are_static_and_not_persisted(client, payload):
     response = client.put(ROOT, json=payload)
@@ -189,7 +232,8 @@ def test_invalid_api_inputs_are_static_and_not_persisted(client, payload):
 
 @pytest.mark.parametrize("tokens", [None, 0, 1, 9007199254740991])
 def test_update_preserves_token_semantics_and_reopen_persistence(client, tokens):
-    values = {**DEFAULTS, "max_tokens": tokens, "max_tool_calls": 27, "auto_title": False}
+    values = {**DEFAULTS, "max_tokens": tokens, "max_tool_calls": 27, "auto_title": False,
+              "max_auth_uses_per_turn": 20}
     response = client.put(ROOT, json={"expected_revision": 0, "values": values})
     assert response.status_code == 200, response.text
     expected = {"revision": 1, "source": "db", "values": values}
@@ -203,7 +247,7 @@ def test_update_preserves_token_semantics_and_reopen_persistence(client, tokens)
 
 
 def test_full_replacement_global_view_and_monotonic_reset(client):
-    values = {**DEFAULTS, "auto_compact": False, "max_tokens": 0}
+    values = {**DEFAULTS, "auto_compact": False, "max_tokens": 0, "max_auth_uses_per_turn": 1}
     assert client.put(ROOT, json={"expected_revision": 0, "values": values}).json() == {
         "revision": 1, "source": "db", "values": values,
     }
@@ -244,6 +288,12 @@ def test_reset_absent_settings_creates_revision_one(client):
     json.dumps({"revision": 1, "values": {**DEFAULTS, "api_key": PRIVATE}}),
     json.dumps({"revision": 1, "values": {key: value for key, value in DEFAULTS.items()
                                           if key != "auto_authorize_execution"}}),
+    *(json.dumps({"revision": 1, "values": {key: value for key, value in PREVIOUS.items()
+                                            if key != missing}}) for missing in PREVIOUS),
+    json.dumps({"revision": 1, "values": {**PREVIOUS, "unknown": False}}),
+    json.dumps({"revision": 1, "values": {**PREVIOUS, "auto_title": 1}}),
+    *(json.dumps({"revision": 1, "values": {**DEFAULTS, "max_auth_uses_per_turn": value}})
+      for value in (None, True, False, 1.0, 1.5, 0, 21, "3")),
     json.dumps({"revision": 1, "values": DEFAULTS, "source": "default"}),
     '{"revision":1,"revision":2,"values":' + json.dumps(LEGACY) + '}',
 ])
@@ -270,10 +320,10 @@ def test_corrupt_settings_fail_closed_without_echo_or_overwrite(client, raw):
 
 
 @pytest.mark.parametrize("existing", [False, True])
-@pytest.mark.parametrize("legacy", [False, True])
-def test_atomic_cas_detects_interleaved_insert_or_raw_change(client, monkeypatch, existing, legacy):
+@pytest.mark.parametrize("values", [DEFAULTS, PREVIOUS, LEGACY])
+def test_atomic_cas_detects_interleaved_insert_or_raw_change(client, monkeypatch, existing, values):
     factory = client.app.state.session_factory
-    initial = json.dumps({"revision": 1, "values": LEGACY if legacy else DEFAULTS})
+    initial = json.dumps({"revision": 1, "values": values})
     winning_values = {**DEFAULTS, "max_tool_calls": 77}
     # Same revision intentionally proves the UPDATE compares the entire previous raw value.
     winning_raw = json.dumps({"revision": 1, "values": winning_values})
@@ -352,10 +402,12 @@ def test_settings_never_probe_or_modify_global_model_configuration(tmp_path, mon
     assert client.get(ROOT).json()["values"] == DEFAULTS
     for revision, tokens in enumerate((None, 0, 123)):
         response = client.put(ROOT, json={
-            "expected_revision": revision, "values": {**DEFAULTS, "max_tokens": tokens},
+            "expected_revision": revision,
+            "values": {**DEFAULTS, "max_tokens": tokens, "max_auth_uses_per_turn": 20},
         })
         assert response.status_code == 200
         assert response.json()["values"]["max_tokens"] == tokens
+        assert response.json()["values"]["max_auth_uses_per_turn"] == 20
     assert client.post(ROOT + "/reset", json={"expected_revision": 3}).status_code == 200
     assert settings.model_dump() == before
     with client.app.state.session_factory() as db:

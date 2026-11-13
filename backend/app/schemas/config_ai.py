@@ -29,7 +29,7 @@ class GenerateSiteDraftRequest(BaseModel):
     requirements: str = Field(min_length=1, max_length=8000)
     evidence: str = Field(default="", max_length=16000)
     consent_to_send: Literal[True]
-    allowed_features: list[str] = Field(min_length=1, max_length=22)
+    allowed_features: list[str] = Field(min_length=1, max_length=23)
 
     @field_validator("consent_to_send", mode="before")
     @classmethod

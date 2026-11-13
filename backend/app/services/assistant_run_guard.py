@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.crypto import CryptoError, CryptoService
+from app.features.catalog import FEATURES
 from app.models.assistant import AssistantSession
 from app.models.assistant_run import AssistantRunGuard
 from app.models.assistant_workflow import AssistantWorkflowAction
@@ -51,7 +52,8 @@ def create_guard(
 
 
 def validate_guard(
-    session: Session, run_id: int, site: Site, settings: Settings, crypto: CryptoService
+    session: Session, run_id: int, site: Site, settings: Settings, crypto: CryptoService,
+    *, check_consumption: bool = True,
 ) -> bool:
     guard = session.get(AssistantRunGuard, run_id)
     if guard is None or (
@@ -66,12 +68,36 @@ def validate_guard(
             SiteJob.run_id == run_id, SiteJob.site_id == site.id,
         )))
         fallback = {"general": "interaction", "proxy_general": "proxy_interaction"}.get(lane)
+        from app.services.assistant_consumption import build_plan
+
+        service = WorkflowService(session, settings, crypto)
+        consuming = any(step.enabled and FEATURES[step.feature_type].category == "post"
+                        for step in service.resolve_site(site.id).steps)
+        plan = consumption_plan(session, run_id, crypto) if consuming else None
+        current_plan = build_plan(session, service, site) if check_consumption else plan
+        if consuming and plan is None:
+            return False
+        if current_plan != plan or (plan is not None and any(job.attempt != 1 for job in jobs)):
+            return False
         return bool(jobs) and all(
             job.lane == lane or (job.attempt > 1 and job.lane == fallback)
             for job in jobs
         ) and guard.fingerprint == fingerprint
-    except (ValueError, TypeError, KeyError):
+    except (CryptoError, ValueError, TypeError, KeyError):
         return False
+
+
+def consumption_plan(session: Session, run_id: int, crypto: CryptoService):
+    action = session.scalar(select(AssistantWorkflowAction).where(
+        AssistantWorkflowAction.run_id == run_id, AssistantWorkflowAction.kind == "run",
+    ))
+    if action is None:
+        return None
+    from app.services.config_ai_generation import _strict_json
+
+    saved = _strict_json(crypto.decrypt(
+        f"assistant-workflow:{action.id}", action.ciphertext, action.nonce, action.key_version))
+    return saved.get("consumption_plan")
 
 
 def unresolved_assistant_runs(session: Session, site_id: int) -> list[int]:
@@ -177,6 +203,8 @@ def require_enable_success(
         jobs = list(db.scalars(select(SiteJob).where(SiteJob.run_id == run.id)))
         if (len(jobs) == 1 and jobs[0].site_id == site.id
                 and jobs[0].status == "success" and jobs[0].finished_at is not None
-                and validate_guard(db, run.id, site, service.settings, service.crypto)):
+                # Completed resign records legitimately change pending dates.
+                and validate_guard(db, run.id, site, service.settings, service.crypto,
+                                   check_consumption=False)):
             return run.id
     raise WorkflowDenied("enable_success_required")

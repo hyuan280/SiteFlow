@@ -340,6 +340,9 @@ class ExecutionService:
                     job.message = "运行已取消"
                     job.finished_at = now
             run.summary_json = json.dumps(self._counts(self._jobs(run_id)))
+            from app.services.run_notification_dispatch import register_run_notification
+
+            register_run_notification(self.session, self.settings, self.crypto, run.id)
         self.session.commit()
         return self.get_run(run_id)
 
@@ -364,5 +367,8 @@ class ExecutionService:
                             step.message = "API 重启，执行已中断"
                             step.finished_at = now
             run.summary_json = json.dumps(self._counts(jobs))
+            from app.services.run_notification_dispatch import register_run_notification
+
+            register_run_notification(self.session, self.settings, self.crypto, run.id)
         if runs:
             self.session.commit()

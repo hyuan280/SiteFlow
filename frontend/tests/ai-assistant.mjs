@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { harness, id, otherId, base, session, message, ApiError, tick, date } from "./helpers/assistant-harness.mjs";
 
 const source = await readFile(new URL("../src/views/AIAssistantView.vue", import.meta.url), "utf8");
-const h = await harness("detail, sessions, content, action, error, createError, creating, detailLoading, titleDialog, titleInput, settingsOpen, connection, usageOpen, contextPercentText, contextCircle, safetyVisible, canSend, tokenText, dismissSafety, createSession, selectSession, loadSessions, refreshDetail, send, cancel, openTitle, saveTitle, deleteSession, toolResult, trustResult, isContextLimit");
+const h = await harness("detail, sessions, content, action, error, createError, creating, detailLoading, titleDialog, titleInput, settingsOpen, connection, usageOpen, contextPercentText, contextCircle, safetyVisible, canSend, tokenText, dismissSafety, createSession, selectSession, loadSessions, refreshDetail, send, cancel, openTitle, saveTitle, deleteSession, toolResult, trustResult, isContextLimit, toggleMessage");
 const { ui, types, last, respond, choose, emit, finish, requests } = h;
 const counters = ["prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "reasoning_tokens"];
 const call = (kind = "conversation", fields = {}) => ({ id: randomUUID(), kind, created_at: date, prompt_tokens: 120, completion_tokens: 30,
@@ -168,7 +168,11 @@ try {
    assert.equal((messageHtml.match(/class="assistant-markdown"/g) ?? []).length, 1, "only non-error assistant replies use Markdown");
    assert.match(messageHtml, /<h2>回复<\/h2>/); assert.match(messageHtml, /<strong>重要<\/strong>/);
    assert.match(messageHtml, /<li>第一项<\/li>/); assert.doesNotMatch(messageHtml, /<script>/);
-   assert.equal((messageHtml.match(/## 回复/g) ?? []).length, 4, "user, tool, system and error records remain plaintext");
+   assert.equal((messageHtml.match(/## 回复/g) ?? []).length, 3, "closed tool content is not rendered; user, system and error records remain plaintext");
+   ui.toggleMessage(3, { currentTarget: { open: true } });
+   const expandedHtml = await h.html();
+   assert.equal((expandedHtml.match(/## 回复/g) ?? []).length, 4, "expanded tool records remain plaintext");
+   assert.doesNotMatch(expandedHtml, /<script>/);
 
   ui.content.value = "preserved";
   ui.settingsOpen.value = true; await tick();
