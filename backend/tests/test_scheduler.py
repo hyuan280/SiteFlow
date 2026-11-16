@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -14,8 +15,9 @@ from app.services.execution import ExecutionService
 from app.services.scheduler import Scheduler
 from app.schemas.scheduler import SchedulerSettingsUpdate
 from app.services.scheduler_settings import (
-    CRON_KEY, REVISION_KEY, SchedulerConflictError, SchedulerSettingsService,
-    SchedulerValidationError,
+    CRON_KEY, NEXT_RUN_KEY, REVISION_KEY, TIMEZONE_APPLIED_KEY,
+    SchedulerConflictError, SchedulerSettingsService, SchedulerValidationError,
+    next_random_run, reset_next_run_for_timezone,
 )
 from tests.helpers import login_client, make_settings
 from app.main import create_app
@@ -186,6 +188,230 @@ def test_scheduler_cron_uses_configured_timezone(tmp_path) -> None:
     next_run = datetime.fromisoformat(response.json()["next_run_at"])
     local = next_run.astimezone(ZoneInfo("Asia/Shanghai"))
     assert (local.hour, local.minute) == (10, 0)
+
+
+@pytest.mark.parametrize("mode", ["cron", "interval"])
+@pytest.mark.parametrize("marker", [None, "UTC"])
+@pytest.mark.parametrize("naive", [False, True])
+def test_scheduler_recovers_overdue_schedule_after_restart(
+    tmp_path, monkeypatch, mode, marker, naive,
+) -> None:
+    settings = make_settings(tmp_path, scheduler_timezone="UTC")
+    client = TestClient(create_app(settings))
+    login_client(client)
+    _create_site(client)
+    response = client.put("/api/v1/scheduler-settings", json={
+        "mode": mode, "cron": "0 10 * * *", "interval_seconds": 600,
+    })
+    assert response.status_code == 200, response.text
+    current = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+    overdue = current - timedelta(days=3)
+    with client.app.state.session_factory() as session:
+        SchedulerSettingsService(session, settings).set_next_run(overdue)
+        if naive:
+            session.get(AppSetting, NEXT_RUN_KEY).value_json = json.dumps(
+                overdue.replace(tzinfo=None).isoformat())
+        if marker is not None:
+            session.add(AppSetting(key=TIMEZONE_APPLIED_KEY, value_json=json.dumps(marker)))
+        session.commit()
+
+    executor = FakeExecutor()
+
+    async def scan_on_start(self):
+        self.scan_once(current)
+
+    async def no_background_work(*args):
+        pass
+
+    monkeypatch.setattr(Scheduler, "start", scan_on_start)
+    monkeypatch.setattr(Scheduler, "stop", no_background_work)
+    monkeypatch.setattr("app.services.artifacts.ArtifactCleanupRunner.start", no_background_work)
+    monkeypatch.setattr("app.services.artifacts.ArtifactCleanupRunner.stop", no_background_work)
+    monkeypatch.setattr("app.services.executor.ExecutionManager.submit",
+                        lambda self, run_id: executor.submit(run_id))
+
+    expected = (current + timedelta(seconds=600) if mode == "interval"
+                else current.replace(hour=10) + timedelta(days=1))
+    # Reopen the persisted database twice through the real startup recovery path.
+    for _ in range(2):
+        with TestClient(create_app(settings)) as restarted:
+            assert len(executor.submitted) == 1
+            with restarted.app.state.session_factory() as session:
+                service = SchedulerSettingsService(session, settings)
+                assert service.view().next_run_at == expected
+                assert session.query(Run).count() == 1
+                assert json.loads(session.get(AppSetting, TIMEZONE_APPLIED_KEY).value_json) == "UTC"
+
+
+@pytest.mark.parametrize("marker, reset", [
+    (None, False), ("invalid-json", False), ('"UTC"', False), ('"Asia/Shanghai"', True),
+])
+def test_scheduler_timezone_initialization_preserves_existing_schedule(client, marker, reset):
+    next_run = datetime.now(timezone.utc) - timedelta(days=1)
+    with client.app.state.session_factory() as session:
+        service = SchedulerSettingsService(session, client.app.state.settings)
+        service.set_next_run(next_run)
+        if marker is not None:
+            session.add(AppSetting(key=TIMEZONE_APPLIED_KEY, value_json=marker))
+            session.commit()
+        reset_next_run_for_timezone(session, "UTC")
+        assert service.view().next_run_at == (None if reset else next_run)
+        assert reset_next_run_for_timezone(session, "UTC") is False
+
+
+def test_scheduler_timezone_initialization_discards_untrusted_future_time(client):
+    with client.app.state.session_factory() as session:
+        service = SchedulerSettingsService(session, client.app.state.settings)
+        service.set_next_run(datetime.now(timezone.utc) + timedelta(days=1))
+        reset_next_run_for_timezone(session, "Asia/Shanghai")
+        assert service.view().next_run_at is None
+
+
+@pytest.mark.parametrize("mode", ["cron", "interval"])
+def test_scheduler_retries_overdue_schedule_after_trigger_error(client, monkeypatch, mode):
+    _create_site(client)
+    executor = FakeExecutor()
+    scheduler = _scheduler(client, executor)
+    response = client.put("/api/v1/scheduler-settings", json={
+        "mode": mode, "cron": "0 10 * * *", "interval_seconds": 600,
+    })
+    assert response.status_code == 200, response.text
+    current = datetime.fromisoformat(response.json()["next_run_at"]) + timedelta(days=3)
+    trigger = scheduler._trigger
+
+    def fail(*args):
+        raise RuntimeError("temporary trigger failure")
+
+    monkeypatch.setattr(scheduler, "_trigger", fail)
+    with pytest.raises(RuntimeError, match="temporary trigger failure"):
+        scheduler.scan_once(current)
+    with client.app.state.session_factory() as session:
+        assert SchedulerSettingsService(session, client.app.state.settings).view().next_run_at < current
+    monkeypatch.setattr(scheduler, "_trigger", trigger)
+    assert len(scheduler.scan_once(current)) == 1
+    assert scheduler.scan_once(current) == []
+
+
+@pytest.mark.parametrize("when", ["before", "between", "after", "next_day"])
+def test_random_scheduler_refreshes_missed_windows(client, when):
+    _create_site(client)
+    executor = FakeExecutor()
+    scheduler = _scheduler(client, executor)
+    ranges = ["10:00-10:10", "14:00-14:10"]
+    response = client.put("/api/v1/scheduler-settings", json={
+        "mode": "random", "ranges": ranges,
+    })
+    assert response.status_code == 200, response.text
+    day = datetime(2026, 10, 23, tzinfo=scheduler.timezone)
+    current = day + {
+        "before": timedelta(hours=9), "between": timedelta(hours=12),
+        "after": timedelta(hours=15), "next_day": timedelta(days=1, hours=9),
+    }[when]
+    first_target, _ = scheduler._range_target(day.date(), 0, ranges[0], scheduler.timezone)
+    stale = first_target if when != "before" else first_target - timedelta(days=1)
+    with client.app.state.session_factory() as session:
+        SchedulerSettingsService(session, client.app.state.settings).set_next_run(stale)
+
+    # A new scheduler instance must recover without relying on in-memory state.
+    scheduler = _scheduler(client, executor)
+    assert scheduler.scan_once(current) == []
+    with client.app.state.session_factory() as session:
+        next_run = SchedulerSettingsService(session, client.app.state.settings).view().next_run_at
+    assert next_run == next_random_run(ranges, current, tz=scheduler.timezone)
+    assert next_run > current
+    assert executor.submitted == []
+    run_ids = scheduler.scan_once(next_run)
+    assert len(run_ids) == 1
+    with client.app.state.session_factory() as session:
+        session.get(Run, run_ids[0]).created_at = next_run
+        session.commit()
+    assert scheduler.scan_once(next_run) == []
+    with client.app.state.session_factory() as session:
+        assert SchedulerSettingsService(session, client.app.state.settings).view().next_run_at > next_run
+
+
+def test_random_scheduler_recovers_within_window_without_duplicate_run(client):
+    _create_site(client)
+    executor = FakeExecutor()
+    scheduler = _scheduler(client, executor)
+    response = client.put("/api/v1/scheduler-settings", json={
+        "mode": "random", "ranges": ["10:00-10:10"],
+    })
+    assert response.status_code == 200, response.text
+    day = datetime(2026, 10, 23, tzinfo=scheduler.timezone)
+    target, end = scheduler._range_target(day.date(), 0, "10:00-10:10", scheduler.timezone)
+    with client.app.state.session_factory() as session:
+        SchedulerSettingsService(session, client.app.state.settings).set_next_run(target)
+    current = target + (end - target) / 2
+    run_ids = _scheduler(client, executor).scan_once(current)
+    assert len(run_ids) == 1
+    with client.app.state.session_factory() as session:
+        # Store the simulated run time so window deduplication, not active-run filtering, is tested.
+        run = session.get(Run, run_ids[0])
+        run.created_at = current.astimezone(timezone.utc)
+        run.status = "fail"
+        for job in session.query(SiteJob).filter_by(run_id=run.id):
+            job.status = "fail"
+        SchedulerSettingsService(session, client.app.state.settings).set_next_run(target)
+    assert _scheduler(client, executor).scan_once(current) == []
+    with client.app.state.session_factory() as session:
+        assert SchedulerSettingsService(session, client.app.state.settings).view().next_run_at > end
+    assert executor.submitted == run_ids
+
+
+@pytest.mark.parametrize("created_during_scan", [False, True])
+def test_random_scheduler_excludes_consumed_future_target(client, monkeypatch, created_during_scan):
+    _create_site(client)
+    executor = FakeExecutor()
+    scheduler = _scheduler(client, executor)
+    ranges = ["10:00-12:00", "10:00-10:10"]
+    response = client.put("/api/v1/scheduler-settings", json={
+        "mode": "random", "ranges": ranges,
+    })
+    assert response.status_code == 200, response.text
+    day = datetime(2026, 10, 23, tzinfo=scheduler.timezone)
+    current = day + timedelta(hours=10, minutes=11)
+    if created_during_scan:
+        current, _ = scheduler._range_target(day.date(), 1, ranges[1], scheduler.timezone)
+        trigger = scheduler._trigger
+
+        def trigger_at_scan_time(session, now):
+            run_ids = trigger(session, now)
+            for run_id in run_ids:
+                session.get(Run, run_id).created_at = now.astimezone(timezone.utc)
+            session.commit()
+            return run_ids
+
+        monkeypatch.setattr(scheduler, "_trigger", trigger_at_scan_time)
+    with client.app.state.session_factory() as session:
+        if not created_during_scan:
+            session.add(Run(
+                trigger="schedule", status="fail", created_by="scheduler",
+                created_at=(day + timedelta(hours=10, minutes=5)).astimezone(timezone.utc),
+            ))
+        SchedulerSettingsService(session, client.app.state.settings).set_next_run(
+            next_random_run(ranges, day + timedelta(days=1), tz=scheduler.timezone))
+    assert len(scheduler.scan_once(current)) == int(created_during_scan)
+    with client.app.state.session_factory() as session:
+        next_run = SchedulerSettingsService(session, client.app.state.settings).view().next_run_at
+    assert next_run == next_random_run(ranges, day + timedelta(days=1), tz=scheduler.timezone)
+    assert len(executor.submitted) == int(created_during_scan)
+
+
+def test_random_scheduler_retries_within_window_when_no_sites_are_eligible(client):
+    executor = FakeExecutor()
+    scheduler = _scheduler(client, executor)
+    response = client.put("/api/v1/scheduler-settings", json={
+        "mode": "random", "ranges": ["10:00-10:10"],
+    })
+    assert response.status_code == 200, response.text
+    day = datetime(2026, 10, 23, tzinfo=scheduler.timezone)
+    target, end = scheduler._range_target(day.date(), 0, "10:00-10:10", scheduler.timezone)
+    assert scheduler.scan_once(target) == []
+    with client.app.state.session_factory() as session:
+        assert SchedulerSettingsService(session, client.app.state.settings).view().next_run_at == target
+    _create_site(client)
+    assert len(scheduler.scan_once(target + (end - target) / 2)) == 1
 
 
 def test_scheduler_interval_and_random_ranges(client, settings) -> None:

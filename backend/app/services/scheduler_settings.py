@@ -152,7 +152,18 @@ def reset_next_run_for_timezone(session: Session, timezone_name: str) -> bool:
         return False
     next_run = session.get(AppSetting, NEXT_RUN_KEY)
     if next_run is not None:
-        session.delete(next_run)
+        overdue = False
+        if not isinstance(applied, str):
+            try:
+                value = datetime.fromisoformat(json.loads(next_run.value_json))
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                overdue = value <= datetime.now(timezone.utc)
+            except (ValueError, TypeError):
+                pass
+        # Preserve an upgrade's missed trigger, but recompute untrusted future timing.
+        if not overdue:
+            session.delete(next_run)
     if marker is None:
         session.add(
             AppSetting(key=TIMEZONE_APPLIED_KEY, value_json=json.dumps(timezone_name))
@@ -253,6 +264,8 @@ class SchedulerSettingsService:
         if isinstance(next_run, str):
             try:
                 next_run_at = datetime.fromisoformat(next_run)
+                if next_run_at.tzinfo is None:
+                    next_run_at = next_run_at.replace(tzinfo=timezone.utc)
             except ValueError:
                 next_run_at = None
         return SchedulerSettingsView(

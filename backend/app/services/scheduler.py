@@ -148,11 +148,14 @@ class Scheduler:
                     settings_service.set_next_run(None)
                 return []
             if settings.mode == "random":
-                if settings.next_run_at is None:
-                    settings_service.set_next_run(
-                        next_random_run(settings.ranges, current, tz=self.timezone)
-                    )
                 local = current.astimezone(self.timezone)
+                next_run = next_random_run(
+                    settings.ranges,
+                    (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0),
+                    tz=self.timezone,
+                )
+                due = False
+                candidates: list[tuple[datetime, datetime, datetime]] = []
                 for index, text in enumerate(settings.ranges):
                     try:
                         target, end_dt = self._range_target(
@@ -160,13 +163,16 @@ class Scheduler:
                         )
                     except (ValueError, TypeError):
                         continue
-                    if local < target or local > end_dt:
+                    if local > end_dt:
                         continue
                     start_dt = datetime.combine(
                         local.date(),
                         time.fromisoformat(text.split("-", 1)[0]),
                         tzinfo=local.tzinfo,
                     )
+                    if local < target:
+                        candidates.append((target, start_dt, end_dt))
+                        continue
                     existing = session.scalar(
                         select(Run.id)
                         .where(
@@ -178,18 +184,25 @@ class Scheduler:
                     )
                     if existing is not None:
                         continue
-                    run_ids = self._trigger(session, current)
-                    if run_ids:
-                        settings_service.set_next_run(
-                            next_random_run(
-                                settings.ranges,
-                                current,
-                                tz=self.timezone,
-                                include_now=False,
-                            )
-                        )
-                    return run_ids
-                return []
+                    due = True
+                run_ids = self._trigger(session, current) if due else []
+                # A run just created can also consume an overlapping future window.
+                for target, start_dt, end_dt in candidates:
+                    existing = session.scalar(
+                        select(Run.id).where(
+                            Run.trigger == "schedule",
+                            Run.created_at >= start_dt.astimezone(timezone.utc),
+                            Run.created_at <= end_dt.astimezone(timezone.utc),
+                        ).limit(1)
+                    )
+                    if existing is None and (next_run is None or target < next_run):
+                        next_run = target
+                if due and not run_ids:
+                    next_run = current
+                # Missed or already consumed windows must not leave a stale timestamp.
+                if settings.next_run_at != next_run:
+                    settings_service.set_next_run(next_run)
+                return run_ids
 
             next_run = settings.next_run_at
             if next_run is None:
@@ -199,8 +212,9 @@ class Scheduler:
             if current < next_run:
                 return []
             next_run = self._next_run(settings.mode, settings.cron, settings.interval_seconds, current)
+            run_ids = self._trigger(session, current)
             settings_service.set_next_run(next_run)
-            return self._trigger(session, current)
+            return run_ids
 
     def _next_run(
         self, mode: str, cron: str, interval_seconds: int, current: datetime
