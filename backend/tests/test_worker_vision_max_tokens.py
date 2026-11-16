@@ -117,14 +117,9 @@ def test_invalid_budget_fails_safely_before_request(vision_path, max_tokens):
         assert error.__context__ is None
         assert not vision._result_request_active.get()
     else:
-        assert type(error) is ValueError
-        assert str(error) == (
-            "Grid vision provider request failed or returned invalid output"
-            if case.path == "grid" else
-            "Vision provider request failed or returned invalid output"
-        )
-        if case.path == "grid":
-            assert error.reason == "invalid_response"
+        assert type(error) is vision.ModelCallError
+        assert (error.code, error.stage) == ("invalid_input", "input")
+        assert error.__context__ is None
     assert error.__cause__ is None
     assert error.__suppress_context__ is True
     output = "".join(traceback.format_exception(error))
@@ -165,9 +160,11 @@ def test_reasoning_without_final_content_remains_failure(vision_path, options, f
         assert caught.value.__context__ is None
         assert not vision._result_request_active.get()
     else:
-        assert type(caught.value) is ValueError
-        assert str(caught.value) == (
-            "Grid vision provider request failed or returned invalid output"
-            if case.path == "grid" else
-            "Vision provider request failed or returned invalid output"
-        )
+        assert type(caught.value) is vision.ModelCallError
+        code, stage = {
+            "stop": ("no_result", "content"),
+            "length": ("truncated", "provider_response"),
+            "content_filter": ("content_filtered", "provider_response"),
+        }[finish_reason]
+        assert (caught.value.code, caught.value.stage) == (code, stage)
+        assert caught.value.__context__ is None

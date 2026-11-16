@@ -2134,6 +2134,17 @@ async def _read_captcha(
     except _CaptchaMethodUnavailable as exc:
         return "fail", "", str(exc), data(None, False, exc.reason)
     except Exception as exc:
+        from worker.vision import ModelCallError, format_model_error, model_error_data
+
+        if method == "vision":
+            error = exc if isinstance(exc, ModelCallError) else ModelCallError("invalid_response", "request")
+            message = f"图形验证码识别失败（{method_label}）: {format_model_error(error, vision)}"
+            log("WARN", message)
+            return "fail", "", message, {
+                **data(None, False, "provider_failed"), **model_error_data(error, vision),
+            }
+        if isinstance(exc, ModelCallError):
+            return "fail", "", f"图形验证码识别失败（{method_label}）", data(None, False, "provider_failed")
         return (
             "fail",
             "",
@@ -2162,6 +2173,17 @@ async def _read_captcha(
         except _CaptchaMethodUnavailable as exc:
             return "fail", "", str(exc), data(None, True, exc.reason)
         except Exception as exc:
+            from worker.vision import ModelCallError, format_model_error, model_error_data
+
+            if method == "vision":
+                error = exc if isinstance(exc, ModelCallError) else ModelCallError("invalid_response", "request")
+                message = f"刷新后图形验证码识别失败（{method_label}）: {format_model_error(error, vision)}"
+                log("WARN", message)
+                return "fail", "", message, {
+                    **data(None, True, "provider_failed"), **model_error_data(error, vision),
+                }
+            if isinstance(exc, ModelCallError):
+                return "fail", "", f"刷新后图形验证码识别失败（{method_label}）", data(None, True, "provider_failed")
             return (
                 "fail",
                 "",
@@ -2577,7 +2599,10 @@ async def _run_image_quiz(
                     "WARN",
                     f"图片答题截图保存失败: {type(exc).__name__}: {str(exc)[:200]}",
                 )
-        from worker.vision import ImageQuizUnclear, answer_image_quiz
+        from worker.vision import (
+            ImageQuizUnclear, ModelCallError, answer_image_quiz,
+            format_model_error, model_error_data,
+        )
 
         log(
             "INFO",
@@ -2624,11 +2649,15 @@ async def _run_image_quiz(
                     {"reason": "refresh_unavailable", "attempts": attempt + 1},
                 )
             continue
-        except ValueError:
+        except ValueError as exc:
+            error = exc if isinstance(exc, ModelCallError) else ModelCallError("invalid_response", "request")
+            message = f"视觉模型调用失败（{format_model_error(error, vision)}），图片答题需要人工处理"
+            log("WARN", message)
             return (
                 "waiting_human",
-                "视觉模型调用失败，图片答题需要人工处理",
-                {"reason": "vision_failed", "attempts": attempt + 1},
+                message,
+                {"reason": "vision_failed", "attempts": attempt + 1,
+                 **model_error_data(error, vision)},
             )
         message_text = str(config.get("message_text") or "")
         message_selectors = list(config.get("message_selector") or [])
@@ -4024,6 +4053,27 @@ async def _run_plugin_step(
     return str(result.get("status") or "error"), str(result.get("message") or ""), data
 
 
+def _model_redaction_values(*sources: tuple[Any, bool]) -> tuple[str, ...]:
+    """Collect known job secrets before model helpers normalize or truncate replies."""
+    pending = list(sources)
+    seen = set()
+    secrets = set()
+    while pending:
+        item, sensitive = pending.pop()
+        if isinstance(item, str) and item and sensitive:
+            secrets.add(item)
+        elif isinstance(item, (dict, list, tuple, set)) and (id(item), sensitive) not in seen:
+            seen.add((id(item), sensitive))
+            if isinstance(item, dict):
+                pending.extend((child, sensitive or (isinstance(key, str) and bool(re.search(
+                    r"password|passwd|secret|token|api.?key|credential|authorization|cookie|"
+                    r"username|account|otp|endpoint|(?:^|_)url$|^model$|^_model_redaction_values$", key, re.I,
+                )))) for key, child in item.items())
+            else:
+                pending.extend((child, sensitive) for child in item)
+    return tuple(sorted(secrets))
+
+
 async def _run_step(
     page: Any,
     step: dict[str, Any],
@@ -4049,6 +4099,13 @@ async def _run_step(
     if not isinstance(config, dict):
         return "fail", "步骤配置不是对象", {"reason": "input_validation_failed", "field": "config"}
     note = log or (lambda _level, _message: None)
+    if vision is not None:
+        vision = {**vision, "_model_redaction_values": _model_redaction_values(
+            (vision, False), (credentials, True), (twofauth, False), (cfbox, False),
+            (secret_payload, False), (plugin_runtimes, False),
+        )}
+        if (secret_payload or {}).get("_result_secret_fingerprints"):
+            vision["_result_secret_fingerprints"] = secret_payload["_result_secret_fingerprints"]
 
     def record_secret(*values: Any) -> None:
         if secret_payload is not None:
@@ -4120,16 +4177,18 @@ async def _run_step(
             from worker.vision import (
                 DEFAULT_RESULT_PROMPT,
                 ResultJudgmentError,
+                format_model_error,
                 judge_result,
+                model_error_data,
                 sanitize_judgment_reason,
             )
 
             judgment_started = time.monotonic()
             model = {**(vision or {})}
-            if (secret_payload or {}).get("_result_secret_fingerprints"):
-                model["_result_secret_fingerprints"] = secret_payload["_result_secret_fingerprints"]
             if behavior.get("model"):
                 model["model"] = behavior["model"]
+            redaction_values = _model_redaction_values((model, False))
+            model["_model_redaction_values"] = redaction_values
             if not all(model.get(key) for key in ("base_url", "model", "api_key")):
                 message = "未配置大模型，无法判断输出结果"
                 note("ERROR", message)
@@ -4157,25 +4216,6 @@ async def _run_step(
                         raise ValueError()
                     evidence = {"page_text": text}
                 stage = "provider_request"
-                # Supply job secrets before the provider helper normalizes or truncates reasons.
-                pending = [(model, False), (credentials, True), (twofauth, False),
-                           (cfbox, False), (secret_payload or {}, False)]
-                seen = set()
-                secrets = set()
-                while pending:
-                    item, sensitive = pending.pop()
-                    if isinstance(item, str) and item and sensitive:
-                        secrets.add(item)
-                    elif isinstance(item, (dict, list, tuple)) and (id(item), sensitive) not in seen:
-                        seen.add((id(item), sensitive))
-                        if isinstance(item, dict):
-                            pending.extend((child, sensitive or (isinstance(key, str) and bool(re.search(
-                                r"password|passwd|secret|token|api.?key|credential|authorization|cookie|"
-                                r"username|account|otp|endpoint|(?:^|_)url$|^model$", key, re.I,
-                            )))) for key, child in item.items())
-                        else:
-                            pending.extend((child, sensitive) for child in item)
-                redaction_values = tuple(sorted(secrets))
                 prompt = str(config.get("llm_prompt") or "").strip()
                 judgment = await judge_result(
                     model, prompt or behavior.get("llm_prompt") or DEFAULT_RESULT_PROMPT,
@@ -4194,16 +4234,15 @@ async def _run_step(
                     raise ValueError()
             except Exception as exc:
                 code = "evidence_error" if stage == "evidence" else "invalid_response"
-                http_status = None
+                diagnostics = {"provider_error": code, "stage": stage}
                 if stage != "evidence" and isinstance(exc, ResultJudgmentError):
-                    code, stage, http_status = exc.code, exc.stage, exc.http_status
-                detail = f"{code}，阶段 {stage}"
-                message = (f"大模型判断失败：HTTP {http_status}（{detail}）" if http_status is not None
-                           else f"大模型判断失败：{detail}")
+                    diagnostics = model_error_data(exc, model)
+                    detail = format_model_error(exc, model)
+                else:
+                    detail = f"{code}，阶段 {stage}"
+                message = f"大模型判断失败：{detail}"
                 note("ERROR", f"{message}；耗时 {time.monotonic() - judgment_started:.2f}s")
-                data = {"reason": "model_judgment_failed", "provider_error": code, "stage": stage}
-                if http_status is not None:
-                    data["http_status"] = http_status
+                data = {"reason": "model_judgment_failed", **diagnostics}
                 return "fail", message, data
             judged = judgment["result"]
             note("INFO", f"大模型判断结果: {str(judged).lower()}；判断依据: {reason}")

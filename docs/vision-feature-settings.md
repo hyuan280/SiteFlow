@@ -141,8 +141,9 @@ so thinking-model providers that reject named/required tool choices can use thei
 native tool parser without disabling reasoning. The selected model must support
 image input and tool calling. A provider returning plain content is accepted only when
 the entire content is valid JSON with the same fields; prose, invalid indices,
-duplicate indices, and truncated answers are rejected. Provider error bodies and
-reasoning are never logged. Only the captured widget PNG is sent, not page text,
+duplicate indices, and truncated answers are rejected. Raw provider error bodies and
+reasoning are never logged; only the sanitized error fields described below may
+appear in admin diagnostics. Only the captured widget PNG is sent, not page text,
 cookies, or an arbitrary image URL fetched by the Worker.
 
 The Worker pins the challenge DOM and image sources before recognition. It
@@ -180,6 +181,62 @@ or `"content_filter"` are rejected. Requests use the global `max_tokens` setting
 some reasoning providers can consume the budget without producing final content.
 Parsing cannot recover an answer that was never emitted, and provider-specific
 reasoning budgets/token parameters are not automatically negotiated.
+
+### Worker Model Errors
+
+Worker model failures in `sign.image_quiz`, `challenge.image_captcha` and
+`sign.iframe.image_captcha` with `captcha_method=vision`, `challenge.grid_captcha`,
+and opted-in `flow.result` judgement use `worker/vision.py`'s `ModelCallError`
+(`ResultJudgmentError` for judgement). Its exception text contains only static
+category/stage labels and an optional HTTP status, with no raw underlying exception
+or cause chain. `model_error_data` provides structured step `data`;
+`format_model_error` adds a Chinese troubleshooting summary to the step message
+and `job.log` artifact. This is bounded diagnostic detail, not a full provider dump.
+
+| Field | Meaning |
+| --- | --- |
+| `provider_error` | Static category: `http_error`, `timeout`, `network_error`, `invalid_json`, `invalid_response`, `no_tool_call`, `no_result`, `invalid_tool_call`, `schema_error`, `truncated`, `content_filtered`, `refused`, `invalid_input`, or `unexpected_error`. |
+| `stage` | Model processing stage: `input`, `request`, `provider_response`, `tool_call`, `tool_arguments`, or `content`. This is not necessarily a precise network phase. |
+| `http_status` | Optional status for `http_error`, not a response body or headers. |
+| `timeout_phase`, `timeout_seconds` | Optional timeout phase (`connect`, `read`, `write`, `pool`, or coarse `request`) and configured model-request timeout in seconds, not measured elapsed time. |
+| `provider_message`, `provider_type`, `provider_code` | Optional sanitized fields from a recognized JSON `{"error": {"message": "...", "type": "...", "code": "..."}}` envelope; `code` may also be an integer, converted to text. |
+
+Provider detail extraction inspects at most 16 KiB of the error envelope. Oversized
+or unrecognized bodies, non-JSON text and HTML are omitted, not copied into logs.
+Only `error.message`, `error.type`, and `error.code` are considered. Known secrets
+and endpoints, URLs and credential/header patterns are redacted; reflected
+prompt/request dumps, images/base64 and markup are rejected. Control characters
+are cleaned, each retained provider field is limited to 500 characters, and the
+formatted summary to 2000. Raw transport exception text, URLs, API keys, headers,
+prompts, images/base64 and reasoning are not diagnostic payloads.
+
+These provider fields are **untrusted, admin-only diagnostic text**, never
+instructions or authorization. Sanitization is not general DLP and cannot promise
+to remove unknown private prose. Existing assistant single-step and curated
+full-run projections remain limited to their static/typed diagnostics and Boolean
+results; these richer fields and provider prose are not automatically fed to the
+assistant. Explicit historical artifact reading remains a separate authorized,
+sanitized evidence path, not an expansion of those projections.
+
+Existing outcomes and `reason` values are unchanged: character-captcha model
+failures return `fail` / `provider_failed`; quiz and grid model failures return
+`waiting_human` / `vision_failed`; result judgement failures return `fail` /
+`model_judgment_failed` without a Boolean result. Legacy/unclassified feature-boundary
+exceptions are conservatively mapped to `invalid_response` (the grid retains its
+recognized legacy HTTP/timeout/network categories), never their raw cause. New
+client failures may use `unexpected_error`; neither label proves a more precise
+cause. Unclear-answer refresh/retry rules and counters remain unchanged; HTTP,
+network or response failures do not gain automatic retries or model/OCR fallbacks.
+
+The outer step deadline is separate from `SITEFLOW_VISION_TIMEOUT` (model request,
+default 30 seconds). An outer timeout can end the step before model diagnostics
+arrive and retains `stage=step_execution` / `reason=execution_timeout` (or existing
+assistant outcome-uncertainty semantics). A generic failure after roughly 30
+seconds cannot alone distinguish the two, HTTP failure or invalid output. Transport
+errors also do not always identify a precise network phase; a coarse `request`
+label must not be turned into a guessed connect/read diagnosis. These diagnostics
+change no default step/request budgets, response-size budgets or `max_tokens`
+behavior, and do not retroactively explain historical failures.
 
 ## Feature Policies
 
@@ -326,8 +383,10 @@ sanitization is not comprehensive DLP. Existing configured result messages retai
 their prior semantics and are not replaced by the reason.
 
 Failures retain `reason=model_judgment_failed` and add a fixed `provider_error` code,
-`stage`, and optional `http_status`. Codes distinguish HTTP errors, timeout, network
-errors, missing results, wrong/multiple tool calls, invalid JSON or schema, truncation, content
-filtering and refusal. Evidence collection errors use `evidence_error`. Logs include
-these safe diagnostics and elapsed time, never raw provider bodies, arguments,
+`stage`, optional `http_status`, timeout metadata and sanitized provider fields as
+described in [Worker Model Errors](#worker-model-errors). Codes distinguish HTTP
+errors, timeout, network errors, missing results, wrong/multiple tool calls, invalid
+JSON or schema, truncation, content filtering and refusal. Evidence collection
+errors use `evidence_error`. Logs include
+these bounded diagnostics and elapsed time, never raw provider bodies, arguments,
 credentials or transport exception text. Calls remain non-retrying and cancellable.

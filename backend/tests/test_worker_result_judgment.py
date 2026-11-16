@@ -165,13 +165,14 @@ def test_judgment_replaces_value_without_turning_false_into_step_failure(
     }
     assert message == ("original message" if judged == value else f"大模型判断结果: {str(judged).lower()}")
     assert ("INFO", f"大模型判断结果: {str(judged).lower()}；判断依据: {JUDGMENT_REASON}") in result_context.logs
+    redactions = tuple(sorted({model_config[key] for key in ("api_key", "base_url", "model")}))
     result_context.judge.assert_awaited_once_with(
-        {**model_config, "execution_settings": {
+        {**model_config, "_model_redaction_values": redactions, "execution_settings": {
             "llm_enabled": True, "judgment_scope": scope,
         }},
         vision.DEFAULT_RESULT_PROMPT,
         image=b"private-screen-image",
-        redaction_values=tuple(sorted({model_config[key] for key in ("api_key", "base_url", "model")})),
+        redaction_values=redactions,
     )
     result_context.page.screenshot.assert_awaited_once_with(
         type="png", timeout=executor.PAGE_TIMEOUT_MS,
@@ -235,10 +236,12 @@ def test_text_judgment_uses_bounded_inner_text_and_model_prompt_overrides(
     result_context.page.screenshot.assert_not_awaited()
     result_context.page.content.assert_not_awaited()
     result_context.page.inner_text.assert_not_awaited()
+    redactions = tuple(sorted({API_KEY, model_config["base_url"], model_config["model"], "text-only-override"}))
     result_context.judge.assert_awaited_once_with(
-        {**model_config, "model": "text-only-override", "execution_settings": settings},
+        {**model_config, "model": "text-only-override", "execution_settings": settings,
+         "_model_redaction_values": redactions},
         "custom judgment instruction", page_text=text,
-        redaction_values=tuple(sorted({API_KEY, model_config["base_url"], "text-only-override"})),
+        redaction_values=redactions,
     )
     assert model_config["model"] == "default-model"
     assert PAGE_TEXT not in repr(result_context.logs)
@@ -711,7 +714,9 @@ def test_executor_preserves_typed_provider_http_error_without_retry(
     ))
     context = SimpleNamespace(page=SimpleNamespace(evaluate=AsyncMock(return_value=PAGE_TEXT)), logs=[])
     result = run_result(context, model_config, {"llm_enabled": True, "use_vision": False})
-    assert result == ("fail", f"大模型判断失败：HTTP {status}（http_error，阶段 request）", {
+    assert result == ("fail", "大模型判断失败：" + vision.format_model_error(
+        vision.ResultJudgmentError("http_error", "request", status), model_config,
+    ), {
         "reason": "model_judgment_failed", "provider_error": "http_error",
         "stage": "request", "http_status": status,
     })

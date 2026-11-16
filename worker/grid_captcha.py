@@ -297,7 +297,10 @@ async def _run_grid_round(page, config, log, vision, capture, state, counts, max
             "reason": "vision_not_supported",
         }
 
-    from worker.vision import GridCaptchaUnclear, answer_grid_captcha
+    from worker.vision import (
+        GridCaptchaUnclear, ModelCallError, answer_grid_captcha,
+        format_model_error, model_error_data,
+    )
 
     custom_prompt = str(
         (vision.get("execution_settings") or {}).get("llm_prompt") or ""
@@ -360,16 +363,17 @@ async def _run_grid_round(page, config, log, vision, capture, state, counts, max
                 }
             return "retry", "", {"state": fresh}
         except Exception as exc:
-            reason = getattr(exc, "reason", "invalid_response")
-            if reason not in {"http_error", "timeout", "network_error", "invalid_response"}:
-                reason = "invalid_response"
-            status = getattr(exc, "status_code", None)
-            diagnostics = {"provider_error": reason}
-            if reason == "http_error" and type(status) is int and 100 <= status <= 599:
-                diagnostics["http_status"] = status
-            log("WARN", f"九宫格模型请求失败：{reason}" +
-                (f"，HTTP {diagnostics['http_status']}" if "http_status" in diagnostics else ""))
-            return "waiting_human", "九宫格视觉模型调用失败，需要人工处理", {
+            error = exc
+            if not isinstance(exc, ModelCallError):
+                legacy = model_error_data(exc)
+                reason = legacy["provider_error"]
+                if reason not in {"http_error", "timeout", "network_error", "invalid_response"}:
+                    reason = "invalid_response"
+                error = ModelCallError(reason, "request", legacy.get("http_status"))
+            diagnostics = model_error_data(error, vision)
+            message = f"九宫格视觉模型调用失败（{format_model_error(error, vision)}），需要人工处理"
+            log("WARN", message)
+            return "waiting_human", message, {
                 "reason": "vision_failed", "attempts": attempts, **diagnostics,
             }
         if (not isinstance(answer, list) or not answer or

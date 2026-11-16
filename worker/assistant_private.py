@@ -318,7 +318,7 @@ async def run_private_step(context, step, vision, cfbox, lane_key):
 
 async def _run_grid(context, config, vision):
     from worker import grid_captcha as grid
-    from worker.vision import answer_grid_captcha, GridCaptchaUnclear
+    from worker.vision import answer_grid_captcha, GridCaptchaUnclear, ModelCallError
 
     if not vision or vision.get('supports_vision') is not True:
         return 'fail', '', {}
@@ -354,6 +354,8 @@ async def _run_grid(context, config, vision):
                 if state is None:
                     return 'fail', '', {}
                 continue
+            except ModelCallError:
+                return 'fail', '', {}
             if (type(answer) is not list or not answer or len(set(answer)) != len(answer)
                     or any(type(index) is not int or not 1 <= index <= 9 for index in answer)):
                 return 'fail', '', {}

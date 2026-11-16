@@ -351,7 +351,7 @@ def test_worker_vision_does_not_forward_secret_on_redirect():
             thread.start()
             stack.callback(thread.join)
             stack.callback(server.shutdown)
-        with pytest.raises(ValueError, match='Vision provider request failed'):
+        with pytest.raises(vision.ModelCallError, match='http_error'):
             vision.recognize(b'cropped', {
                 'base_url': f'http://127.0.0.1:{source.server_port}/v1',
                 'api_key': 'secret', 'model': 'vision',

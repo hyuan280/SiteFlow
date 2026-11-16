@@ -19,7 +19,7 @@ from worker import vision  # noqa: E402
 API_KEY = "private-grid-api-key"
 IMAGE = b"private-grid-image"
 RAW_OUTPUT = "private-grid-provider-response"
-GRID_ERROR = "Grid vision provider request failed or returned invalid output"
+GRID_ERROR = r"Model call failed: .+"
 VALID_RESULT = {"is_clear": True, "selected_indices": [9, 1, 5], "need_refresh": False}
 
 
@@ -187,8 +187,8 @@ def test_invalid_indices_are_rejected(mock_provider, model_config, source, indic
     )))
     with pytest.raises(ValueError) as error:
         asyncio.run(vision.answer_grid_captcha(IMAGE, model_config))
-    assert type(error.value) is ValueError
-    assert str(error.value) == GRID_ERROR
+    assert type(error.value) is vision.ModelCallError
+    assert error.value.code == "schema_error"
 
 
 @pytest.mark.parametrize("result", [
@@ -208,8 +208,8 @@ def test_invalid_result_shape_is_rejected(mock_provider, model_config, source, r
     )))
     with pytest.raises(ValueError) as error:
         asyncio.run(vision.answer_grid_captcha(IMAGE, model_config))
-    assert type(error.value) is ValueError
-    assert str(error.value) == GRID_ERROR
+    assert type(error.value) is vision.ModelCallError
+    assert error.value.code == "schema_error"
 
 
 @pytest.mark.parametrize("tools", [
@@ -320,13 +320,13 @@ def test_provider_errors_are_sanitized(mock_provider, model_config, failure, cap
     captured = mock_provider(handle)
     with pytest.raises(ValueError) as error:
         asyncio.run(vision.answer_grid_captcha(IMAGE, model_config))
-    assert type(error.value) is ValueError
-    assert str(error.value) == GRID_ERROR
+    assert type(error.value) is vision.ModelCallError
+    assert error.value.__context__ is None
     assert error.value.__cause__ is None
     assert error.value.__suppress_context__ is True
     assert error.value.reason == {"http": "http_error", "network": "network_error",
-                                  "timeout": "timeout", "json": "invalid_response",
-                                  "output": "invalid_response"}[failure]
+                                  "timeout": "timeout", "json": "invalid_json",
+                                  "output": "invalid_json"}[failure]
     if failure == "http":
         assert error.value.status_code == 401
     assert len(captured.requests) == 1
@@ -353,7 +353,7 @@ def test_redirects_are_not_followed_or_exposed(
     captured = mock_provider(handle)
     with pytest.raises(ValueError) as error:
         asyncio.run(vision.answer_grid_captcha(IMAGE, model_config))
-    assert str(error.value) == GRID_ERROR
+    assert error.value.code == "http_error"
     assert len(captured.requests) == 1
     assert captured.options[0]["follow_redirects"] is False
     assert str(captured.requests[0].url) == "https://grid-provider.invalid/v1/chat/completions"
