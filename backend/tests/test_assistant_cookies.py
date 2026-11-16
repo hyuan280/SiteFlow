@@ -268,7 +268,8 @@ def test_generation_failure_static_before_decrypt_or_open(tools, monkeypatch, re
         return response
     tools.manager._worker.side_effect = worker
     assert asyncio.run(tools.dispatch("browser_open", {})) == {
-        "ok": False, "code": "cookie_restore_unavailable"}
+        "ok": False, "code": "cookie_restore_unavailable", "reason": "browser_connection_failed",
+        "lane_key": "interaction", "stage": "cookie_restore"}
     tools.manager._worker.assert_awaited_once()
     resolve.assert_not_called()
     assert not tools.manager.browsers

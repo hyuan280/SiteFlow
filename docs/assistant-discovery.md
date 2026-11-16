@@ -4,6 +4,8 @@
 
 当前共 **23 项内置功能**可编写提案并用于授权完整运行，包含公开非秘密 `action.fill` 和四项 `post.*`；孤立单步为 **18 项**，排除 `flow.jump` 和四项 `post.*`。插件仍不开放，普通交互工具数为 **38**，另有 1 个接管专用 `submit_takeover_conclusion`（注册表共 39 个）；自动接管只开放委托过滤后的子集。目录与 schema 按当前代码及服务端策略提供，不保证生产站点适用或业务成功。
 
+新模型输出遵循「真实用户明确指定语言 > 真实用户消息语言 > 安装级 `Settings.scheduler_timezone`（`SITEFLOW_SCHEDULER_TIMEZONE`）白名单默认值」，不是按网站语言或站点时区切换。自动生成的英文接管指令、工具/日志和助手输出不代表人类偏好；最终回复、可见工具标题、提案说明及接管结论模型正文均适用。完整映射、简体中文兜底及固定宿主文案/历史记录不翻译的边界见[回复语言](ai-assistant.md#回复语言)；这是提示策略，不是语言校验或送达保证。
+
 ## 示例来源
 
 经用户授权，通过运行中 API 容器的 Python 应用服务，只读检查生产库的 `NexusPHP站点登录签到`（本次库中 ID 3）及其父模板 `NexusPHP站点登录`（ID 2）。数据库连接使用 SQLite `mode=ro` 和 `query_only`；未启动应用、保存模板或运行工作流。ID 仅说明本次来源，不能用来绑定其他部署。
@@ -194,6 +196,8 @@ UI「截图预览」仅在当前页面内存展示、关闭清除，不调用模
 公共跨源导航/重定向尚未获批时，`browser_trust_required` 返回脱敏后的完整 `source_url`、`target_url`、各自的 `source_url_redacted` / `target_url_redacted`、`redacted_parameters`，以及 `target_origin` 和精确 origin 转义得到的 `trusted_url_pattern`。这只是被阻止的候选，不是已访问或已获信任的证据。工具卡片展示完整地址、待核对来源和脱敏警告；只有用户明确要求变更观察来源后，助手才可用 `update_site_config` 的 `observation.trusted_origins` 提交完整目标列表供精确审核，不再推荐旧 purpose 或打开目标设置。批准恢复原调用、替换来源列表、更新目标修订并释放旧浏览器，不自动导航、执行或重试；模型可在同轮安全重开/导航，不需另发消息。Worker 仍校验公共 DNS；额外来源不能用于单步执行、凭据发送或同源站点绑定，也不写入站点 `trusted_urls`，单步后仍保留原始同源限制。完整边界见 [完整 URL 与可信来源](ai-assistant.md#完整-url-与可信来源)。
 
 打开失败时，记录工具结果中安全的 `code`、`lane_key`、`reason`：`browser_dns_denied` 指向 Worker 本地 DNS/公共地址检查，**不证明需要代理**；`browser_url_denied` / `browser_redirect_denied` 指向 URL 或重定向边界，`browser_lane_busy` / `browser_lane_unavailable` 指向所选交互车道；不要输出原始异常或秘密。读取遇到 DNS/策略失败而 `page_retained: true` 时，没有证据但保留页面，不是登录结果；含已知秘密的当前 URL 拒绝仍致命，不套用保留页面例外。此前生产环境两次打开返回 403，尚无证据归因于通用车道停止，也没有生产复测证明已完整修复；没有具体原因时应说明未知，详见 [API 与排查](ai-assistant.md#api-与排查)。
+
+`ready` 不是页面后续存活保证：异步 Fetch 失败可随后关闭页面，保留 `browser_response_interception_failed` 与 `stage: response_event / continue_response / fail_request`，仍 fail closed 清理、不自动重试或放宽请求策略。正确令牌在有界关闭 tombstone 内可查已知原因或 410 `browser_closed`，错误令牌仍为通用 404；API 将 Worker 404 映射为 `browser_session_unavailable`，不再一律报 `browser_worker_error`。Cookie generation/导入失败也保留静态原因，详见[生命周期诊断](ai-assistant.md#生命周期诊断)。来源任务认证选择器失败与实时浏览器失效须分开；精确生产异常未记录时，不能宣称 CDP 不支持、代理/URL 故障，也不能因观察不可用就排除验证码或站点问题。
 
 ## 单步工具示例
 

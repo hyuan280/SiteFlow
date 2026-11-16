@@ -489,7 +489,7 @@ class AssistantBrowser:
         self._stopping = False
         self.tombstones: dict[str, tuple[bytes, float]] = {}
         self._queues: dict[str, list[BrowserSession]] = {}
-        self._open_errors: dict[str, tuple[int, str]] = {}
+        self._open_errors: dict[str, tuple[int, str, str]] = {}
         self._cookie_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._cookie_states: dict[str, CookieState] = {}
 
@@ -536,11 +536,12 @@ class AssistantBrowser:
             for session in list(self.sessions.values()):
                 if session.closed or session.deadline <= time.monotonic():
                     if session.open_wait_for_lane and session.admitted_at is None and not session.closed:
-                        self._open_errors[session.session_id] = (504, "browser_queue_timeout")
+                        self._open_errors[session.session_id] = (504, "browser_queue_timeout", "acquire")
                     await self._dispose(session)
 
     async def _dispose(self, session: BrowserSession) -> None:
         session.closed = True
+        session.ready = False
         session.cookies = None
         session.snapshots.clear()
         session.latest_snapshots.clear()
@@ -743,6 +744,11 @@ class AssistantBrowser:
         return error
 
     async def _response(self, session: BrowserSession, event: dict[str, Any]) -> None:
+        # Cleanup owns the target now. A stale callback must not await or restart
+        # disposal, which may itself be waiting for the opening/execution task.
+        if session.closed:
+            return
+        stage = "response_event"
         blocked_url = event.get("request", {}).get("url", "")
         blocked_method = event.get("request", {}).get("method", "")
         try:
@@ -806,14 +812,24 @@ class AssistantBrowser:
                     _error(403, code, lane_key=session.lane_key, stage="redirect")
                 else:
                     session.failure = _error(403, code, lane_key=session.lane_key, stage="redirect").detail
+                stage = "fail_request"
                 await session.cdp.send("Fetch.failRequest", {
                     "requestId": event["requestId"], "errorReason": "BlockedByClient",
                 })
                 return
+            if session.closed:
+                return
+            stage = "continue_response"
             await session.cdp.send("Fetch.continueResponse", {"requestId": event["requestId"]})
-        except Exception:
-            session.closed = session.quarantined = True
-            await self._dispose(session)
+        except (Exception, asyncio.CancelledError) as exc:
+            if not session.closed:
+                code = "browser_response_interception_failed"
+                self._open_errors[session.session_id] = (502, code, stage)
+                _error(502, code, lane_key=session.lane_key, stage=stage)
+                session.quarantined = True
+                self._schedule_dispose(session)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
 
     def _prune_tombstones(self) -> None:
         now = time.monotonic()
@@ -827,6 +843,14 @@ class AssistantBrowser:
         if session_id not in self.tombstones and len(self.tombstones) >= MAX_TOMBSTONES:
             raise _error(503, "browser_lane_unavailable")
         self.tombstones[session_id] = (digest, time.monotonic() + TTL_SECONDS)
+
+    def _closed_error(self, session_id: str, *, lane_key: str = "none",
+                      stage: str = "session") -> HTTPException:
+        status, code, stage = self._open_errors.get(session_id, (410, "browser_closed", stage))
+        error = _error(status, code, lane_key=lane_key, stage=stage)
+        if code == "browser_response_interception_failed":
+            error.detail["stage"] = stage
+        return error
 
     def _id(self, session_id: str) -> str:
         try:
@@ -864,13 +888,13 @@ class AssistantBrowser:
         if tombstone is not None:
             if not secrets.compare_digest(tombstone[0], digest):
                 raise HTTPException(404, "Browser session unavailable")
-            raise _error(410, "browser_closed", lane_key=lane_key, stage="open")
+            raise self._closed_error(session_id, lane_key=lane_key, stage="open")
         session = self.sessions.get(session_id)
         if session is not None:
             if not secrets.compare_digest(session.token_digest, digest):
                 raise HTTPException(404, "Browser session unavailable")
             if session.closed:
-                raise _error(410, "browser_closed", lane_key=lane_key, stage="open")
+                raise self._closed_error(session_id, lane_key=lane_key, stage="open")
             if session.deadline <= time.monotonic():
                 await self._dispose(session)
                 if session.open_wait_for_lane and session.admitted_at is None:
@@ -922,9 +946,10 @@ class AssistantBrowser:
             async with asyncio.timeout_at(deadline):
                 await asyncio.shield(session.opening)
             if session.closed:
-                raise _error(410, "browser_closed", lane_key=lane_key, stage="open")
+                raise self._closed_error(session_id, lane_key=lane_key, stage="open")
             return session.view()
         except BaseException as exc:
+            failure = self._open_errors.get(session_id)
             # Retain cleanup as a session-owned task if the absolute open budget
             # expires; the host's known ID remains closable and the reaper retries.
             disposal = asyncio.create_task(self._dispose(session))
@@ -933,6 +958,9 @@ class AssistantBrowser:
                     await asyncio.shield(disposal)
             except (TimeoutError, asyncio.CancelledError):
                 pass
+            if failure is not None and (not isinstance(exc, asyncio.CancelledError)
+                                        or not asyncio.current_task().cancelling()):
+                raise self._closed_error(session_id, lane_key=lane_key, stage="open") from None
             if isinstance(exc, TimeoutError):
                 raise _error(504, "browser_open_timeout", lane_key=lane_key, stage="open") from None
             if isinstance(exc, (HTTPException, asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
@@ -952,11 +980,12 @@ class AssistantBrowser:
                 "browser_navigation_failed", "browser_cookie_import_failed",
             }:
                 code, status = candidate, error.status_code
-        self._open_errors[session.session_id] = (status, code)
+        self._open_errors[session.session_id] = (status, code, "acquire" if code == "browser_queue_timeout" else "open")
         self._schedule_dispose(session)
 
     def _schedule_dispose(self, session: BrowserSession) -> None:
         session.closed = True
+        session.ready = False
         if session.disposal is None or session.disposal.done():
             session.disposal = asyncio.create_task(self._dispose(session))
             session.disposal.add_done_callback(lambda task: None if task.cancelled() else task.exception())
@@ -1097,9 +1126,13 @@ class AssistantBrowser:
         try:
             await page.goto(session.initial_url, wait_until="domcontentloaded", timeout=30000)
         except Exception:
+            if session.closed:
+                raise self._closed_error(session.session_id, lane_key=session.lane_key) from None
             if session.failure:
                 raise HTTPException(403, session.failure) from None
             raise _error(502, "browser_navigation_failed", lane_key=session.lane_key, stage="open") from None
+        if session.closed:
+            raise self._closed_error(session.session_id, lane_key=session.lane_key)
         if session.failure:
             raise HTTPException(403, session.failure)
         await self._current(session)
@@ -1175,23 +1208,21 @@ class AssistantBrowser:
         if expected is None or not secrets.compare_digest(expected, digest):
             raise HTTPException(404, "Browser session unavailable")
         if session_id in self._open_errors:
-            status, code = self._open_errors[session_id]
-            raise _error(status, code, stage="acquire" if code == "browser_queue_timeout" else "open")
+            raise self._closed_error(session_id, lane_key=session.lane_key if session else "none")
         if session is None or session.closed:
             raise _error(410, "browser_closed", stage="open-status")
         if session.deadline <= time.monotonic():
             code = ("browser_queue_timeout" if session.open_wait_for_lane and session.admitted_at is None
                     else "browser_session_expired")
             status = 504 if code == "browser_queue_timeout" else 410
-            self._open_errors[session_id] = (status, code)
+            self._open_errors[session_id] = (status, code, "acquire" if status == 504 else "open-status")
             self._schedule_dispose(session)
             raise _error(status, code, lane_key=session.lane_key,
                          stage="acquire" if status == 504 else "open-status")
         if not session.ready and session.opening is not None and session.opening.done():
             self._opened(session, session.opening)
             if session_id in self._open_errors:
-                status, code = self._open_errors[session_id]
-                raise _error(status, code, lane_key=session.lane_key, stage="open-status")
+                raise self._closed_error(session_id, lane_key=session.lane_key, stage="open-status")
             raise _error(410, "browser_closed", lane_key=session.lane_key, stage="open-status")
         if session.ready:
             await self._current(session)
@@ -1200,18 +1231,29 @@ class AssistantBrowser:
 
     async def _session(self, session_id: str, token: str) -> BrowserSession:
         session_id = self._id(session_id)
+        self._prune_tombstones()
         session = self.sessions.get(session_id)
         digest = hashlib.sha256(token.encode()).digest()
-        if session is None or not secrets.compare_digest(session.token_digest, digest):
+        tombstone = self.tombstones.get(session_id)
+        expected = session.token_digest if session is not None else tombstone[0] if tombstone else None
+        if expected is None or not secrets.compare_digest(expected, digest):
             raise HTTPException(404, "Browser session unavailable")
+        if session is None or session.closed:
+            raise self._closed_error(session_id, lane_key=session.lane_key if session else "none")
         if session.deadline <= time.monotonic():
+            self._open_errors[session_id] = (410, "browser_session_expired", "session")
             await self._dispose(session)
             raise _error(410, "browser_session_expired", lane_key=session.lane_key, stage="session")
-        if session.closed or not session.ready:
+        if not session.ready:
             raise HTTPException(409, "Browser session unavailable")
         return session
 
     async def _current(self, session: BrowserSession) -> str:
+        if session.closed:
+            raise self._closed_error(session.session_id, lane_key=session.lane_key)
+        if session.page is None or getattr(session.page, "is_closed", lambda: False)():
+            self._schedule_dispose(session)
+            raise self._closed_error(session.session_id, lane_key=session.lane_key, stage="current")
         self._guard_secret_url(session, session.page.url, "GET")
         host, origin, _ = _url(session.page.url, document=False)
         if (session.executing or session.same_origin_only) and origin != session.origin:
@@ -1219,6 +1261,11 @@ class AssistantBrowser:
         if origin not in session.approved_origins:
             raise await self._navigation_error(session, session.page.url, session.initial_url)
         await session.dns.check(host)
+        if session.closed:
+            raise self._closed_error(session.session_id, lane_key=session.lane_key)
+        if getattr(session.page, "is_closed", lambda: False)():
+            self._schedule_dispose(session)
+            raise self._closed_error(session.session_id, lane_key=session.lane_key, stage="current")
         return session.page.url
 
     async def observe(self, session_id: str, token: str, offset: int = 0,
@@ -1227,12 +1274,12 @@ class AssistantBrowser:
         async with session.lock:
             try:
                 if session.closed:
-                    raise HTTPException(404, "Browser session unavailable")
+                    raise self._closed_error(session.session_id, lane_key=session.lane_key)
                 return await self._collect(session, offset, limit, frame_id)
             except HTTPException:
                 raise
             except Exception:
-                raise HTTPException(502, "Browser observation unavailable") from None
+                raise _error(502, "browser_observation_unavailable", lane_key=session.lane_key, stage="observe") from None
 
     async def _frames(self, session: BrowserSession) -> tuple[list[dict], dict[str, dict], bool]:
         """Only CDP-discovered frame IDs are accepted as observation targets."""
@@ -1390,7 +1437,7 @@ class AssistantBrowser:
         async with session.lock:
             try:
                 if session.closed:
-                    raise HTTPException(404, "Browser session unavailable")
+                    raise self._closed_error(session.session_id, lane_key=session.lane_key)
                 await self._current(session)
                 frames, _, frames_truncated = await self._frames(session)
                 snapshot = session.snapshots.get(snapshot_id)
@@ -1408,7 +1455,7 @@ class AssistantBrowser:
             except HTTPException:
                 raise
             except Exception:
-                raise HTTPException(502, "Browser observation unavailable") from None
+                raise _error(502, "browser_observation_unavailable", lane_key=session.lane_key, stage="inspect") from None
 
     async def check_selector(self, session_id: str, token: str, selector: str,
                              frame_id: str | None = None) -> dict[str, Any]:
@@ -1416,7 +1463,7 @@ class AssistantBrowser:
         async with session.lock:
             try:
                 if session.closed:
-                    raise HTTPException(404, "Browser session unavailable")
+                    raise self._closed_error(session.session_id, lane_key=session.lane_key)
                 await self._current(session)
                 frames, registry, _ = await self._frames(session)
                 frame_id = self._frame(frames, frame_id)["frame_id"]
@@ -1449,7 +1496,7 @@ class AssistantBrowser:
             except HTTPException:
                 raise
             except Exception:
-                raise HTTPException(502, "Browser observation unavailable") from None
+                raise _error(502, "browser_observation_unavailable", lane_key=session.lane_key, stage="check-selector") from None
 
     async def execute(self, session_id: str, request: Any) -> dict[str, Any]:
         from worker.assistant_step import validate_step
@@ -1746,7 +1793,7 @@ class AssistantBrowser:
             try:
                 async with asyncio.timeout(10):
                     if session.closed:
-                        raise HTTPException(404, "Browser session unavailable")
+                        raise self._closed_error(session.session_id, lane_key=session.lane_key)
                     # A frame can appear during capture and disappear before the
                     # final tree read. Tree equality alone cannot detect that ABA.
                     for event in ("frameattached", "framedetached", "framenavigated"):
@@ -1855,11 +1902,13 @@ class AssistantBrowser:
             try:
                 async with asyncio.timeout(30):
                     if session.closed:
-                        raise HTTPException(404, "Browser session unavailable")
+                        raise self._closed_error(session.session_id, lane_key=session.lane_key)
                     url = await self._current(session)
                     session.failure = None
                     # reload can replay POST; a fragment-only goto can skip GET.
                     await session.page.goto(url.split("#", 1)[0], wait_until="domcontentloaded", timeout=30000)
+                    if session.closed:
+                        raise self._closed_error(session.session_id, lane_key=session.lane_key)
                     if session.failure:
                         raise HTTPException(403, session.failure)
                     await self._current(session)
@@ -1870,6 +1919,8 @@ class AssistantBrowser:
             except HTTPException:
                 raise
             except Exception:
+                if session.closed:
+                    raise self._closed_error(session.session_id, lane_key=session.lane_key) from None
                 if session.failure:
                     raise HTTPException(403, session.failure) from None
                 raise _error(502, "browser_navigation_failed", lane_key=session.lane_key, stage="refresh") from None
@@ -1879,7 +1930,7 @@ class AssistantBrowser:
         async with session.lock:
             try:
                 if session.closed:
-                    raise HTTPException(404, "Browser session unavailable")
+                    raise self._closed_error(session.session_id, lane_key=session.lane_key)
                 host, origin, _ = _url(url)
                 self._guard_secret_url(session, url, "GET")
                 if (session.same_origin_only or session.executing) and origin != session.origin:
@@ -1889,6 +1940,8 @@ class AssistantBrowser:
                 await session.dns.check(host)
                 session.failure = None
                 await session.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if session.closed:
+                    raise self._closed_error(session.session_id, lane_key=session.lane_key)
                 if session.failure:
                     raise HTTPException(403, session.failure)
                 await self._current(session)
@@ -1896,6 +1949,8 @@ class AssistantBrowser:
             except HTTPException:
                 raise
             except Exception:
+                if session.closed:
+                    raise self._closed_error(session.session_id, lane_key=session.lane_key) from None
                 if session.failure:
                     raise HTTPException(403, session.failure) from None
                 raise _error(502, "browser_navigation_failed", lane_key=session.lane_key, stage="navigate") from None
@@ -1919,7 +1974,7 @@ class AssistantBrowser:
                                       "expected_url": frame["url"]}}],
         })
         if "exceptionDetails" in result:
-            raise HTTPException(502, "Browser observation unavailable")
+            raise _error(502, "browser_observation_unavailable", lane_key=session.lane_key, stage="snapshot")
         value = result["result"].get("value")
         if isinstance(value, dict) and value.get("stale"):
             raise _error(409, "browser_snapshot_stale")

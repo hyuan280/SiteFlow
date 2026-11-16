@@ -79,6 +79,8 @@
 
 菜单「智能助手」（`/assistant`）可新建或继续旧会话，聊天载荷加密保存并按用户名归属，不随退出登录或关闭页面删除。管理员需设置 `SITEFLOW_CONFIG_AI_ENABLED=true`，配置支持工具调用的大模型，并配套升级 Web、API、Worker。
 
+新模型输出的语言优先级为「真实用户明确要求 > 真实用户消息语言 > 安装级 `Settings.scheduler_timezone`（`SITEFLOW_SCHEDULER_TIMEZONE`）白名单默认语言」，不是用户确认的国籍/所在地，也不由站点时区切换；站点时区只用于接管任务本地日分组。上海默认简体中文，台北/香港/澳门为繁体中文，东京日语、首尔韩语、指定英美时区英语、巴黎法语、柏林德语；无效或未映射时区（含新加坡）保留简体中文。自动英文接管指令、网页、工具/日志及助手输出不构成人类偏好。策略涵盖最终回复、可见工具标题、提案说明和接管结论模型正文；固定欢迎语/宿主 UI、中文通知前缀/标题及独立会话标题生成器不变，历史结论和冻结通知不翻译/回填、不加翻译或模型调用。这是提示指令，不是语言校验或送达保证；精确映射见[回复语言](ai-assistant.md#回复语言)。
+
 当前共 **23 项内置功能**可编写提案并用于授权完整运行，包括公开非秘密 `action.fill` 和四项购买/补签 `post.*`；孤立单步为 **18 项**，排除 `flow.jump` 和四项 `post.*`，插件仍不开放。普通交互工具为 **38**，包括 Cookie 清除、站点转模板、全局调度、任务取消、历史版本和 artifact 读取；另有 1 个接管专用结论工具，注册表合计 39 个，自动接管只开放受限子集。目录与 schema 按当前代码及服务端策略提供，不保证生产站点适用或业务成功。
 
 页面顶部依次为「助手接管」「助手设置」「新建会话」，无需创建会话即可打开前两项。「助手设置」是所有用户、所有会话共用的全局设置，保存于 `AppSetting` 的 `assistant.settings`，不是单会话偏好；打开、刷新、保存和恢复默认均不调用模型。接管是独立持久委托，不沿用下表的自动授权默认值。
@@ -244,6 +246,8 @@
 运行时 `diagnostics.blocked_requests` 最多 5 项，只含安全 `code`、HTTP `method`、投影 `url` 及脱敏标记，不含 POST body、请求头、凭据、浏览器令牌或重试授权密钥；普通查询可保留，秘密值擦除或整个地址为 `[redacted]`。旧 `browser_credential_endpoint_not_approved` 是端点诊断，不代表缺 site ID 或 Bitwarden 未配置。真实 JS/Chromium 本地 fixtures 验证同源 JS/native POST、查询保留、拒绝边界及截图/刷新，但**不等于已验证实际 Fengchao 登录**或端到端业务成功。
 
 浏览器失败时按工具返回的安全 `code`、`lane_key`、`reason` 排查：`browser_dns_denied` 为 DNS/公共地址检查，**不证明需要代理**；`browser_url_denied` / `browser_redirect_denied` 为 URL/重定向边界，`browser_lane_busy` / `browser_lane_unavailable` 为所选交互车道占用或不可用，不应猜测为通用车道停止。读取 DNS/策略失败若返回 `page_retained: true`，表示没有证据但页面保留，可排查后再读，不代表登录失败；含已知秘密的当前 URL 拒绝仍会关闭会话。此前生产环境两次打开返回 403，根因未确认，没有证据归因于 `general`，也不能声称已完整修复；缺少具体原因时应说明未知，不粘贴原始异常或凭据。
+
+打开/轮询成功 `ready` 不保证页面在后续异步拦截中仍存活。`browser_response_interception_failed` 保留安全阶段 `response_event`、`continue_response` 或 `fail_request`，仍 fail closed 清理，不自动重试或放宽请求策略。关闭后的有界 tombstone 先验令牌：正确令牌可取得已知原因或 410 `browser_closed`，错误令牌仍只获通用 404；API 将 Worker 404 映射为 `browser_session_unavailable`，不再笼统归为 `browser_worker_error`。Cookie generation 握手/私有导入失败也保留静态原因。来源任务认证选择器失败与后续实时浏览器失败应分开说明；精确生产异常未记录时，不能断言 CDP 不支持、需要代理或 URL 有错，观察不可用也不能排除验证码/站点问题。完整隐私与生命周期边界见[生命周期诊断](ai-assistant.md#生命周期诊断)，结论/通知边界见[运行通知](run-notifications.md#output-language)。
 
 不要发送密码、Cookie、令牌或 TOTP 秘密；可见个人资料仍可能进入模型。浏览器限制不是完整网络沙箱，仍有 DNS rebinding、service worker、弹窗首请求等残余风险，建议配置浏览器/代理出站策略；代理车道也要求 Worker 本地 DNS 可解析。**GET 导航也可能签到或触发其他副作用**，观察授权不是任意路径的执行许可。操作、API、权限和限制见 [智能助手](ai-assistant.md)。
 

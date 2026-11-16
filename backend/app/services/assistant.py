@@ -786,6 +786,9 @@ class AssistantManager:
                         "browser_lane_busy", "browser_lane_unavailable", "browser_navigation_failed",
                         "browser_open_timeout", "browser_session_expired", "browser_closed",
                         "browser_queue_timeout",
+                        "browser_response_interception_failed", "browser_cookies_invalid",
+                        "browser_cookie_import_failed", "browser_observation_unavailable",
+                        "browser_snapshot_unavailable", "browser_snapshot_limit",
                         "browser_snapshot_stale", "browser_selector_invalid", "browser_frame_unavailable",
                         "browser_frame_unreadable",
                         "browser_screenshot_limit", "browser_screenshot_unavailable",
@@ -797,6 +800,7 @@ class AssistantManager:
                             break
                         error_body.extend(chunk)
                     reason = None
+                    diagnostics = {}
                     try:
                         detail = _strict_json(error_body.decode()).get("detail")
                         if (response.status_code == 403 and isinstance(detail, dict)
@@ -805,12 +809,17 @@ class AssistantManager:
                             raise AssistantError("browser_trust_required", 403, details=projected)
                         if isinstance(detail, dict) and detail.get("code") in reasons:
                             reason = detail["code"]
+                            if (reason == "browser_response_interception_failed"
+                                    and detail.get("stage") in {
+                                        "response_event", "continue_response", "fail_request"}):
+                                diagnostics["stage"] = detail["stage"]
                     except (ValueError, UnicodeError, TypeError, AttributeError, KeyError, RecursionError):
                         pass
-                    reason = reason or {403: "browser_access_denied", 409: "browser_lane_busy",
+                    reason = reason or {403: "browser_access_denied", 404: "browser_session_unavailable",
+                                        409: "browser_lane_busy",
                                         410: "browser_session_expired", 504: "browser_open_timeout"}.get(
                                             response.status_code, "browser_worker_error")
-                    raise AssistantError("browser_unavailable", 502, reason=reason)
+                    raise AssistantError("browser_unavailable", 502, reason=reason, details=diagnostics)
                 if response.headers.get("content-encoding", "identity").lower() != "identity":
                     raise AssistantError("browser_unavailable", 502)
                 body = bytearray()
@@ -925,8 +934,17 @@ class AssistantManager:
                                 "url": target["base_url"], "lane_key": lane,
                             })
                             generation = raw_generation["generation"]
-                        except Exception:
-                            return failure("cookie_restore_unavailable")
+                            if not isinstance(generation, str) or UUID(generation).version != 4:
+                                raise ValueError
+                        except Exception as exc:
+                            reason = exc.reason if isinstance(exc, AssistantError) and exc.reason in {
+                                "browser_lane_busy", "browser_lane_unavailable", "browser_url_denied",
+                                "browser_dns_denied", "browser_access_denied", "browser_session_unavailable",
+                                "browser_worker_error", "browser_open_timeout", "browser_cookies_invalid",
+                                "browser_cookie_import_failed",
+                            } else "browser_connection_failed"
+                            return {**failure("cookie_restore_unavailable"), "reason": reason,
+                                    "lane_key": lane, "stage": "cookie_restore"}
                         # The generation must precede the snapshot; no DB state
                         # from before worker I/O may authorize cookie decryption.
                         with self.session_factory() as db:
@@ -1063,8 +1081,19 @@ class AssistantManager:
             reason = exc.reason if isinstance(exc, AssistantError) and exc.reason else "browser_connection_failed"
             if isinstance(exc, TimeoutError) and active_takeover:
                 reason = "browser_open_timeout"
+            diagnostics = {}
+            if (isinstance(exc, AssistantError) and reason == "browser_response_interception_failed"
+                    and exc.details.get("stage") in {
+                        "response_event", "continue_response", "fail_request"}):
+                diagnostics["stage"] = exc.details["stage"]
+            notice = "Only this interaction lane is used; general/proxy_general state is unrelated. Do not infer a stopped lane from this failure."
+            if reason in {"browser_response_interception_failed", "browser_session_unavailable"}:
+                notice = ("Only this interaction lane is used; general/proxy_general state is unrelated. "
+                          "This failure does not establish a URL policy violation, proxy requirement, "
+                          "stopped lane, or worker restart. Use the static diagnostic; "
+                          "do not infer action outcome.")
             return {**failure("browser_unavailable"), "lane_key": lane, "reason": reason,
-                    "notice": "Only this interaction lane is used; general/proxy_general state is unrelated. Do not infer a stopped lane from this failure."}
+                    **diagnostics, "notice": notice}
 
     async def browser_recovery(self, owner, session_id, operation):
         if operation not in {"screenshot", "refresh"}:
@@ -1256,7 +1285,10 @@ class AssistantManager:
                 repaired.append((batch_id, {"role": "tool", "tool_call_id": call_id,
                                            "content": _json(failure("interrupted"))}))
             records = repaired
-        head = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + URL_NOTICE},
+        from app.services.assistant_language import output_language_instruction
+
+        head = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n"
+                  + output_language_instruction(self.settings.scheduler_timezone) + "\n\n" + URL_NOTICE},
                 {"role": "system", "content": "Host-confirmed target (null means unconfirmed): "
                   + _json(self._public_target(target))}]
         from app.services.assistant_retry import model_retry_status

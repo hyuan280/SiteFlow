@@ -49,6 +49,24 @@ UI 的「每轮并行工具调用数」标签容易误解：它只限制**模型
 
 这些设置仅影响持久化助手，不修改提供商 URL、API Key、模型连接，也不改变单次「AI 生成配置」接口及其限制。整个模型请求 **1536 KiB**、主模型响应 **256 KiB**、单步活动 **90 秒**、人工助手浏览器准入/创建起固定 **15 分钟 TTL** 等仍是固定边界，不是可调设置；消息不会续租，自动接管结束则提前释放本轮浏览器，见[排队与所有权](#排队与所有权)。调高 Token 预算不能绕过序列化线协议字节上限，也不保证上游模型接受百万 Token。
 
+## 回复语言
+
+`backend/app/services/assistant_language.py` 为新模型输出提供提示词策略，优先级为：**真实用户明确要求的语言 > 真实用户消息使用的语言 > 安装级时区对应的默认语言**。默认值读取 `Settings.scheduler_timezone`（`SITEFLOW_SCHEDULER_TIMEZONE`），仅按以下白名单映射，不表示用户确认了国籍或所在地，也不是新增的会话语言设置：
+
+| 安装级时区 | 默认语言 |
+| --- | --- |
+| `Asia/Shanghai`、`Asia/Chongqing`、`Asia/Harbin`、`Asia/Urumqi` | 简体中文 |
+| `Asia/Taipei`、`Asia/Hong_Kong`、`Asia/Macau` | 繁体中文 |
+| `Asia/Tokyo` | 日语 |
+| `Asia/Seoul` | 韩语 |
+| `Europe/London`、`America/New_York`、`America/Chicago`、`America/Denver`、`America/Los_Angeles` | 英语 |
+| `Europe/Paris` | 法语 |
+| `Europe/Berlin` | 德语 |
+
+无效、无法加载或未映射的时区，以及未映射的多语言地区（例如 `Asia/Singapore`），均保留简体中文默认值；不按地域猜语言。站点 `timezone` 用于接管任务的[本地日分组](#每日会话与知识)，不得切换输出语言。自动生成的英文接管指令即使存为 `role=user`，也不是真实用户语言偏好；网站正文/标签、工具结果、日志及助手自身输出同样不能作为偏好。
+
+策略适用于后续生成的最终回复、用户可见工具 `title`、提案 `explanation` 及 `submit_takeover_conclusion` 的模型正文。固定欢迎语、宿主 UI、宿主生成的中文通知前缀/标题及独立会话标题生成器保持原有机制，不由此统一翻译。历史结论、复用结论和已冻结通知不翻译、不回填，不增加翻译器或额外模型调用。这是模型提示指令，不是语言校验器，也不保证模型遵循或通知送达；通知冻结和派发边界见[运行通知](run-notifications.md#output-language)。
+
 ## 页面操作
 
 1. 打开「智能助手」，点击「新建会话」即直接创建并选中会话，**没有标题或同意弹窗，也无需预填目标设置**。初始标题为「新会话」，第一条 assistant 欢迎语由服务端固定写入，不调用模型；创建不代表已访问网站。也可从左侧选择旧会话继续；刷新列表和刷新会话均只读取状态。
@@ -263,7 +281,7 @@ SSE 仍约每 0.5 秒复查认证和归属、构造完整详情；只有编码�
 
 ### 每日会话与知识
 
-`DailyConversation` 对应实际表 `assistant_takeover_daily_conversations`，唯一键是 **owner + 站点历史 UUID `site_history_key` + `local_date`**。日期来自来源 **SiteJob.finished_at**，按站点 `timezone` 换算；时区无效时依次回退调度时区、UTC，不取后台处理/模型完成时间。同一 owner、同一站点历史身份、同一本地日复用一个聊天及其规范历史；跨午夜另建，不是每周同一星期几复用。路由还保存时区、来源结束时间及首个 action 锚点，不是委托或重放许可。
+`DailyConversation` 对应实际表 `assistant_takeover_daily_conversations`，唯一键是 **owner + 站点历史 UUID `site_history_key` + `local_date`**。日期来自来源 **SiteJob.finished_at**，按站点 `timezone` 换算；时区无效时依次回退调度时区、UTC，不取后台处理/模型完成时间。同一 owner、同一站点历史身份、同一本地日复用一个聊天及其规范历史；跨午夜另建，不是每周同一星期几复用。路由还保存时区、来源结束时间及首个 action 锚点，不是委托或重放许可。站点时区不决定[回复语言](#回复语言)，语言默认值取安装级调度时区。
 
 自动轮次结束清除本轮 action 委托及重试权限，但有效的 `live_access` 站点授权会保留在**同一个会话**，供 owner 后续人工聊天复用浏览、执行、可用凭据和截图权限；关闭接管策略也不撤销这些已授予的人工权限。**无论自动阶段是 analysis 还是 autofix，实时授权的人工后续目标均保留 `workflow_consent=true`**，可在用户明确要求后执行普通导入/完整运行，不受自动 analysis 模式永久限制。自动 analysis 的保存禁令仍由 action/工具门禁约束，不能据人工权限在无人值守阶段导入或完整运行。没有实时授权时，临时能力不保留，人工按正常交互取得所需权限；每日会话仍不借用全局自动授权默认值。仅询问能力不会新授权限或自动打开浏览器，身份、origin 或绑定变化须重确认。
 
@@ -790,10 +808,23 @@ Worker 的 `/assistant-browser/*` 是 API 持有能力令牌调用的内部接�
 | `browser_lane_busy` | 所选交互车道占用或获取容量超时；核对该车道，不是通用车道 |
 | `browser_lane_unavailable` | 所选车道租约、启动或浏览器上下文不可用；检查该车道及 Worker 配套版本 |
 | `browser_access_denied` | Worker 返回 403，但未提供可识别的更具体安全原因；不能据此断言 DNS、代理或车道停止 |
+| `browser_response_interception_failed` | CDP Fetch 响应拦截处理失败；仅保留静态阶段 `response_event`、`continue_response` 或 `fail_request`，不包含原始异常或秘密 |
+| `browser_session_unavailable` | API 收到 Worker 404 的安全归一化原因，不再笼统归为 `browser_worker_error`；不是重启、代理或 URL 策略故障的证据 |
+| `browser_closed` / `browser_session_expired` | 已关闭或租约到期；不证明之前的网站操作失败或没有副作用 |
+| `browser_observation_unavailable` | 本次观察不可用，不等于页面没有登录表单、验证码或站点问题 |
+| `browser_cookies_invalid` / `browser_cookie_import_failed` | 私有 Cookie 种子校验/导入失败的静态原因；不要把 Cookie 原文交给模型排查 |
+
+### 生命周期诊断
+
+`browser_open` 或轮询返回 `ready` 只证明当时就绪，不保证页面在后续异步响应拦截期间仍存活。Fetch 失败仍 **fail closed**：隔离并清理本会话页面、CDP 和租约，撤销 ready 状态，不自动重试，也不放宽请求方法、同源、URL/DNS 或授权策略。安全结果保留 `browser_response_interception_failed` 及上述阶段；不记录或回传原始 CDP 异常、响应头/正文、Cookie、令牌或未净化 URL。
+
+关闭后，在 Worker 保留的有界 tombstone 窗口内，仍先验证能力令牌：正确令牌可取得已知静态关闭原因，未记录具体原因时返回 410 `browser_closed`；错误令牌仍只返回通用 404，不泄露关闭原因。tombstone 过期后不保证原因仍可查。API 将 Worker 404 归一化为 `browser_session_unavailable`，并只透传允许的静态原因/拦截阶段，不把未知响应正文当诊断。
+
+来源任务的认证选择器失败，与接管期间实时浏览器失效是两件事，应分别说明证据。若生产现场的精确异常未记录，只能报告原因未知；不能由通用 worker 错误、会话消失或拦截阶段断言 CDP 不支持、需要代理或 URL 有错。无法观察也不能据此排除验证码或站点自身问题。发现流程中的使用方式见[URL 证据与跨源确认](assistant-discovery.md#url-证据与跨源确认)。
 
 此前生产环境观察到两次 `browser_open` 返回 403；没有证据表明由 `general` 停止导致，具体根因尚未确认。明确交互车道及增加安全诊断不等于已经完整修复该生产问题，也不能把离线测试通过当作生产复测成功。缺少具体原因时应明确原因未知，保留安全诊断供排查。
 
-Cookie 清除是上述重开建议的例外：`clear_bound_site_cookies` 返回 `browser_reopen_required` 时只说明缺少 READY 原始绑定浏览器，不自动 `browser_open`。`cookie_binding_changed` 需重新核对显式绑定，不能改用同主机其他站点；`cookie_restore_unavailable` 不能通过把原始 Cookie 交给模型解决。清除后的部分/未知结果及同 ID 重放按[绑定站点 Cookie](#绑定站点-cookie)处理，不套用 `retry_step`。
+Cookie 清除是上述重开建议的例外：`clear_bound_site_cookies` 返回 `browser_reopen_required` 时只说明缺少 READY 原始绑定浏览器，不自动 `browser_open`。`cookie_binding_changed` 需重新核对显式绑定，不能改用同主机其他站点；`cookie_restore_unavailable` 不能通过把原始 Cookie 交给模型解决。generation 握手失败现在保留安全的 `reason`、`lane_key` 和 `stage: "cookie_restore"`，握手失败不解密 Cookie；私有导入的 `browser_cookies_invalid` / `browser_cookie_import_failed` 也保留静态原因，而非一律丢失为通用 worker 错误。清除后的部分/未知结果及同 ID 重放按[绑定站点 Cookie](#绑定站点-cookie)处理，不套用 `retry_step`。
 
 新增测试包含**真实 JS/Chromium 本地 fixtures**：隐式 GET 表单由 JS fetch POST 到不同的原始同源路径、原生 POST、查询编码保留、凭据 GET 泄露阻断、可信观察源跨源 POST 拒绝、PUT/DELETE 拒绝、截图遮罩和刷新不重提 POST。它们验证通用机制，不是网站专用补丁，也**没有验证实际 Fengchao 网站登录**、真实凭据或端到端签到。相关测试见 `backend/tests/test_assistant_js_login.py`、`test_assistant_browser_recovery.py`、`test_assistant_recovery_integration.py`、`test_assistant_retry.py`、`test_assistant_login_recovery.py` 和 `frontend/tests/assistant-recovery.mjs`；本地缺少 Chromium 时相应测试可跳过，不能把 skip 当作实测成功。
 
