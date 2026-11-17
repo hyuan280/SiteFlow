@@ -79,7 +79,7 @@ def no_network(monkeypatch):
 def mocked_generation(monkeypatch):
     runtime = Mock(return_value=deepcopy(CONFIG))
     generate = AsyncMock(return_value=deepcopy(PROPOSAL))
-    monkeypatch.setattr(IntegrationService, "vision_runtime", runtime)
+    monkeypatch.setattr(IntegrationService, "model_runtime", runtime)
     monkeypatch.setattr(config_ai, "generate_site_draft", generate)
     return runtime, generate
 
@@ -131,7 +131,7 @@ def test_auth_is_non_touching_and_required_before_runtime(client, mocked_generat
     runtime, generate = mocked_generation
     if authorized:
         assert response.json() == PROPOSAL
-        runtime.assert_called_once_with()
+        runtime.assert_called_once_with("assistant")
         generate.assert_awaited_once()
     else:
         runtime.assert_not_called()
@@ -175,7 +175,7 @@ def test_all_23_builtins_pass_selection_without_changing_proposal_contract(clien
     assert len(features) == 23
     assert _post(client, _payload(allowed_features=features)).json() == PROPOSAL
     runtime, generate = mocked_generation
-    runtime.assert_called_once_with()
+    runtime.assert_called_once_with("assistant")
     generate.assert_awaited_once()
     assert generate.await_args.args[1].allowed_features == features
 
@@ -215,7 +215,7 @@ def test_field_limits_remain_accepted(client, mocked_generation):
     )
     assert _post(client, payload).json() == PROPOSAL
     runtime, generate = mocked_generation
-    runtime.assert_called_once_with()
+    runtime.assert_called_once_with("assistant")
     generate.assert_awaited_once()
     assert generate.await_args.args[1].model_dump(mode="json") == payload
 
@@ -273,7 +273,7 @@ def test_streamed_body_cap_uses_actual_bytes_and_caches_valid_body(
         generate.assert_not_called()
     else:
         assert response.json() == PROPOSAL
-        runtime.assert_called_once_with()
+        runtime.assert_called_once_with("assistant")
         generate.assert_awaited_once()
         assert generate.await_args.args[1].model_dump(mode="json") == _payload()
 
@@ -381,7 +381,7 @@ def test_mocked_async_success_passes_host_service_and_returns_only_proposal(
     for private in ("private-host-name", "host-password", "host-token", "host-fragment"):
         assert private not in response.text
     assert monitor_stopped.wait(1)
-    runtime.assert_called_once_with()
+    runtime.assert_called_once_with("assistant")
     generate.assert_awaited_once()
 
 

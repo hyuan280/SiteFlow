@@ -1,5 +1,21 @@
 import type { Feature, FeatureExecutionSettings } from "@/types/workflow";
 import type { IntegrationTestResult, VisionUpdate, VisionView } from "@/types/integrations";
+import { isModelRegistryView, type ModelDraftTest, type ModelRegistryUpdate } from "@/types/model-registry";
+
+export const getModelRegistry = async () => {
+  const value = await apiRequest<unknown>("/integrations/models");
+  if (!isModelRegistryView(value)) throw new ApiError(502, "模型设置响应格式无效。", "invalid_model_registry_response");
+  return value;
+};
+export const saveModelRegistry = async (payload: ModelRegistryUpdate) => {
+  const value = await apiRequest<unknown>("/integrations/models", { method: "PUT", body: JSON.stringify(payload) });
+  if (!isModelRegistryView(value)) throw new ApiError(502, "模型设置响应格式无效。", "invalid_model_registry_response");
+  return value;
+};
+export const testModel = (id: string, draft?: ModelDraftTest) =>
+  apiRequest<IntegrationTestResult>(`/integrations/models/${encodeURIComponent(id)}/test`, {
+    method: "POST", ...(draft ? { body: JSON.stringify(draft) } : {}),
+  });
 
 export const saveFeatureSettings = (key: string, defaults: Record<string, unknown>, required_fields: string[], execution_settings: FeatureExecutionSettings | null) =>
   apiRequest<Feature>(`/features/${encodeURIComponent(key)}/settings`, {

@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 from functools import wraps
 
 
+LIFECYCLE_TIMEOUT_SECONDS = 10
+
+
 @asynccontextmanager
 async def hold_page_input(page):
     """Let sensitive actions authorize after waiting for the shared input gate."""
@@ -21,21 +24,97 @@ class _InputGuard:
     def __init__(self):
         self.lock = asyncio.Lock()
         self.owner = None
+        self.blocked = None
+        self._lifecycle_task = None
 
     @asynccontextmanager
-    async def hold(self, page=None):
+    async def hold(self, page=None, *, timeout=None):
         task = asyncio.current_task()
-        if self.owner is task:
+        if self.blocked is not None and self.blocked is not task:
+            raise TimeoutError("Browser lifecycle pending")
+        if self.owner is task or self.blocked is task:
             yield
             return
-        async with self.lock:
+        async with asyncio.timeout(timeout):
+            await self.lock.acquire()
+        try:
+            if self.blocked is not None:
+                raise TimeoutError("Browser lifecycle pending")
             self.owner = task
             try:
                 if page is not None:
-                    await page.bring_to_front()
+                    await self.lifecycle(page.bring_to_front)
                 yield
             finally:
                 self.owner = None
+        finally:
+            self.lock.release()
+
+    async def lifecycle(self, operation, *, creates_page=False):
+        """Bound gate occupancy, retaining unknown native work until it settles."""
+        caller = asyncio.current_task()
+        if caller is self._lifecycle_task:
+            # The SDK's instance wrapper can call the guarded class method.
+            return await operation()
+
+        deadline = asyncio.get_running_loop().time() + LIFECYCLE_TIMEOUT_SECONDS
+        async with self.hold(timeout=LIFECYCLE_TIMEOUT_SECONDS):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("Browser lifecycle pending")
+
+            async def run():
+                return await operation()
+
+            task = self._lifecycle_task = asyncio.create_task(run())
+            children = getattr(caller, "_siteflow_lifecycle_tasks", None)
+            if children is None:
+                children = caller._siteflow_lifecycle_tasks = set()
+            children.add(task)
+            # Let a job owner retain native work even after its caller times out.
+            register = getattr(caller, "_siteflow_lifecycle_register", None)
+            if register is not None:
+                register(task)
+            self.owner = task
+
+            def settled(done):
+                children.discard(done)
+                if self.blocked is done:
+                    self.blocked = None
+                if self._lifecycle_task is done:
+                    self._lifecycle_task = None
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(settled)
+            try:
+                remaining = max(0, deadline - asyncio.get_running_loop().time())
+                await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                if not task.done():
+                    self.blocked = task
+                if not creates_page:
+                    raise
+                # Defer creator cancellation until its result reaches JobPages.
+            finally:
+                self.owner = caller
+            if not task.done():
+                # An outstanding native call may still steal focus. Free the
+                # lock, but fail closed until it settles instead of cancelling
+                # it or admitting conflicting input after a timeout.
+                self.blocked = task
+
+        if not creates_page and not task.done():
+            raise TimeoutError("Browser lifecycle pending")
+        # Creation must return its late page to the tracked JobPages creator,
+        # never turn a dispatched creation into an unowned timeout result.
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    return task.result()
+                if not creates_page:
+                    raise
 
 
 def _install_input_guard():
@@ -54,7 +133,10 @@ def _install_input_guard():
             gate = getattr(context, "_siteflow_input_guard", None)
             if gate is None:
                 return await method(self, *args, **kwargs)
-            async with gate.hold(page if focus else None):
+            if not focus:
+                return await gate.lifecycle(lambda: method(self, *args, **kwargs),
+                                            creates_page=kind == "BrowserContext")
+            async with gate.hold(page):
                 return await method(self, *args, **kwargs)
 
         guarded._siteflow_input_guard = True
@@ -67,14 +149,14 @@ def _install_input_guard():
         *((kind, actions) for kind in ("Page", "Frame", "Locator", "ElementHandle")),
         ("Mouse", ("move", "click", "dblclick", "down", "up", "wheel")),
         ("Keyboard", ("type", "press", "down", "up", "insert_text")),
-        ("Page", ("bring_to_front", "close")),
+        ("Page", ("bring_to_front",)),
         ("BrowserContext", ("new_page",)),
     ):
         cls = getattr(async_api, kind)
         for name in names:
             if hasattr(cls, name):
                 setattr(cls, name, guard(getattr(cls, name), kind,
-                                        name not in {"bring_to_front", "close", "new_page"}))
+                                        name not in {"bring_to_front", "new_page"}))
 
 
 def _install_hover_recovery():
@@ -109,7 +191,8 @@ def humanize_actions(context):
     _install_hover_recovery()
     patch_context_async(context, resolve_config("default"))
     # CDP mouse moves can stall on background tabs. Keep a complete public
-    # input action foregrounded; new/closed tabs must not steal it mid-action.
+    # input action foregrounded; serialize only short creation/focus transitions.
+    # Close cleanup must not hold the shared gate while a tab/browser hangs.
     gate = getattr(context._impl_obj, "_siteflow_input_guard", None)
     if gate is None:
         gate = context._impl_obj._siteflow_input_guard = _InputGuard()
@@ -119,8 +202,7 @@ def humanize_actions(context):
 
         @wraps(new_page)
         async def guarded_new_page(*args, **kwargs):
-            async with gate.hold():
-                return await new_page(*args, **kwargs)
+            return await gate.lifecycle(lambda: new_page(*args, **kwargs), creates_page=True)
 
         context.new_page = guarded_new_page
     _install_input_guard()

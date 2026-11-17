@@ -33,16 +33,16 @@ class Settings(BaseSettings):
         default=True, validation_alias="SITEFLOW_ARTIFACT_CLEANUP_ENABLED"
     )
     request_timeout: float = 10.0
-    vision_base_url: str | None = Field(default=None, validation_alias="SITEFLOW_VISION_BASE_URL")
-    vision_api_key: SecretStr | None = Field(default=None, validation_alias="SITEFLOW_VISION_API_KEY")
-    vision_model: str | None = Field(default=None, validation_alias="SITEFLOW_VISION_MODEL")
+    vision_base_url: str | None = Field(default=None, validation_alias="SITEFLOW_MODEL_BASE_URL")
+    vision_api_key: SecretStr | None = Field(default=None, validation_alias="SITEFLOW_MODEL_API_KEY")
+    vision_model: str | None = Field(default=None, validation_alias="SITEFLOW_MODEL_ID")
     vision_max_tokens: int | None = Field(
-        default=None, ge=0, validation_alias="SITEFLOW_VISION_MAX_TOKENS"
+        default=None, ge=0, validation_alias="SITEFLOW_MODEL_MAX_TOKENS"
     )
-    vision_timeout: float = Field(default=30, gt=0, le=300, validation_alias="SITEFLOW_VISION_TIMEOUT")
+    vision_timeout: float = Field(default=30, gt=0, le=300, validation_alias="SITEFLOW_MODEL_TIMEOUT")
     config_ai_enabled: bool = Field(default=False, validation_alias="SITEFLOW_CONFIG_AI_ENABLED")
     vision_supports_vision: bool | None = Field(
-        default=None, validation_alias="SITEFLOW_VISION_SUPPORTS_VISION"
+        default=None, validation_alias="SITEFLOW_MODEL_SUPPORTS_VISION"
     )
 
     notification_email_enabled: bool | None = Field(

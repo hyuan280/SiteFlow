@@ -96,7 +96,8 @@ def test_artifact_pixels_encrypted_replayed_independent_of_browser_target(
     assistant_client, provider, monkeypatch, auto_compact,
 ):
     client = assistant_client
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: {**CONFIG, "supports_vision": True})
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False:
+                        {**CONFIG, "supports_vision": True} if usage == "assistant" else None)
     save(client, auto_title=False, auto_compact=auto_compact)
     manager = client.app.state.assistant_manager
     sid = create(client)

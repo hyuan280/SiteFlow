@@ -36,7 +36,9 @@ VISION = {"base_url": "http://solver.internal/v1", "api_key": VISION_KEY,
 
 @pytest.fixture
 def integrations(monkeypatch):
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: deepcopy(VISION))
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False:
+                        deepcopy(VISION) if usage == "feature_cards"
+                        and (not requires_vision or VISION["supports_vision"]) else None)
     for method, value in {
         "resolve_cfbox_url": "http://cfbox.internal", "resolve_cfbox_api_key": CFBOX_KEY,
         "resolve_twofauth_url": "http://twofauth.internal", "resolve_twofauth_token": TOTP_TOKEN,

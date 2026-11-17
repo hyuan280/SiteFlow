@@ -166,9 +166,15 @@ def _known_keys(db, tools):
         value = getattr(settings, name, None)
         keys.append(value.get_secret_value() if hasattr(value, "get_secret_value") else value)
     # Decrypt only configured secret values for literal replacement, never emit them.
-    from app.services.integrations import IntegrationService
+    from app.services.integrations import IntegrationService, IntegrationValidationError
+    from app.services.model_registry import ModelRegistryError, ModelRegistryService
 
     service = IntegrationService(db, settings, tools.manager.crypto)
+    try:
+        keys.extend(ModelRegistryService(db, settings, tools.manager.crypto).known_api_keys())
+    except ModelRegistryError:
+        # Notification consumers already fail closed on integration validation errors.
+        raise IntegrationValidationError("Model keys are unavailable") from None
     for row in db.scalars(select(IntegrationConfig).where(IntegrationConfig.key.in_(
         ("vision.api_key", "cfbox.api_key", "twofauth.token", "bitwarden.token"),
     ))):

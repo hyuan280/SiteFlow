@@ -82,7 +82,7 @@ def test_invalid_cap_api_and_service(client, value):
 @pytest.mark.parametrize("cap", [0, 9876])
 def test_environment_precedence_and_lock(client, monkeypatch, cap):
     assert client.put(PATH, json={**CONNECTION, "max_tokens": 456}).status_code == 200
-    monkeypatch.setenv("SITEFLOW_VISION_MAX_TOKENS", str(cap))
+    monkeypatch.setenv("SITEFLOW_MODEL_MAX_TOKENS", str(cap))
     settings = Settings(_env_file=None)
     assert settings.vision_max_tokens == cap
     client.app.state.settings.vision_max_tokens = settings.vision_max_tokens
@@ -90,7 +90,7 @@ def test_environment_precedence_and_lock(client, monkeypatch, cap):
     assert view["max_tokens"] == {
         "value": cap, "source": "env", "editable": False, "error": None,
     }
-    assert client.put(PATH, json={"model": "vision-model", "api_key": None}).status_code == 200
+    assert client.put(PATH, json={"model": "vision-model", "api_key": None}).status_code == 409
     for value in (None, "", 0, 123):
         assert client.put(PATH, json={"max_tokens": value}).status_code == 409
     assert client.delete(PATH).status_code == 409
@@ -113,7 +113,7 @@ def test_settings_reject_invalid_cap(value):
 
 @pytest.mark.parametrize("value", ["-1", "1.5", "1.0", "true"])
 def test_environment_rejects_invalid_cap(monkeypatch, value):
-    monkeypatch.setenv("SITEFLOW_VISION_MAX_TOKENS", value)
+    monkeypatch.setenv("SITEFLOW_MODEL_MAX_TOKENS", value)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 
@@ -121,7 +121,7 @@ def test_environment_rejects_invalid_cap(monkeypatch, value):
 @pytest.mark.parametrize("value", ["", " ", "\t"])
 def test_blank_environment_explicitly_disables_cap(client, monkeypatch, value):
     assert client.put(PATH, json={**CONNECTION, "max_tokens": 8192}).status_code == 200
-    monkeypatch.setenv("SITEFLOW_VISION_MAX_TOKENS", value)
+    monkeypatch.setenv("SITEFLOW_MODEL_MAX_TOKENS", value)
     settings = Settings(_env_file=None)
     assert settings.vision_max_tokens == 0
     client.app.state.settings.vision_max_tokens = settings.vision_max_tokens

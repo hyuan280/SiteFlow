@@ -56,7 +56,9 @@ def assistant_client(tmp_path, monkeypatch):
         await manager.shutdown()
 
     app.router.lifespan_context = lifespan
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: dict(CONFIG))
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False:
+                        dict(CONFIG) if usage in {"assistant", "feature_cards"}
+                        and (not requires_vision or CONFIG["supports_vision"]) else None)
     with TestClient(app) as client:
         login_client(client)
         yield client
@@ -330,7 +332,7 @@ def test_disabled_and_unconfigured_runtime_are_static(assistant_client, monkeypa
     assert client.post(ROOT, json={}).status_code == 200
     send(client, identifier, status=503)
     client.app.state.settings.config_ai_enabled = True
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: None)
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False: None)
     assert send(client, identifier, status=503).json() == {"detail": {"code": "model_unavailable"}}
 
 
@@ -673,7 +675,9 @@ def test_cancel_during_title_propagates_and_prevents_title_write(assistant_clien
 
 def test_title_request_preserves_configured_token_budget(assistant_client, provider, title_provider, monkeypatch):
     config = {**CONFIG, "max_tokens": 1777}
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: config)
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False:
+                        config if usage == "assistant"
+                        and (not requires_vision or config["supports_vision"]) else None)
     identifier = create(assistant_client)
     provider[0].append(text("Reply"))
     title_provider[0].append(text('{"title":"Generated"}'))

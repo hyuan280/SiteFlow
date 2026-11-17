@@ -54,7 +54,8 @@ def raw_image(scope, image=None):
 
 
 def vision(monkeypatch):
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: {**CONFIG, "supports_vision": True})
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False:
+                        {**CONFIG, "supports_vision": True} if usage == "assistant" else None)
 
 
 @pytest.mark.parametrize("auto_compact", [False, True])

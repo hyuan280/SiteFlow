@@ -9,6 +9,11 @@ DEFAULT_PROMPT = "Read the captcha in this image. Return only its characters, wi
 
 
 def validate_base_url(value: str) -> str:
+    # Check the original input: urlparse strips controls and loses empty delimiters.
+    if (any(char in value for char in "?#\\")
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
+        raise ValueError("Vision base_url must not contain query/fragment delimiters, controls or backslashes")
+    value = value.strip()
     parsed = urlparse(value)
     if (parsed.scheme not in {"http", "https"} or not parsed.hostname
             or parsed.username or parsed.password or parsed.query or parsed.fragment

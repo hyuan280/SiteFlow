@@ -457,7 +457,12 @@ class AssistantExecution:
                 if needs_vision and defaults.get("llm_prompt"):
                     behavior = behavior.model_copy(update={"llm_prompt": defaults["llm_prompt"]})
             if needs_vision:
-                vision = integrations.vision_runtime()
+                try:
+                    vision = integrations.model_runtime(
+                        "feature_cards", requires_vision=feature != "flow.result" or behavior.use_vision,
+                    )
+                except Exception:
+                    raise _Denied("provider_unavailable") from None
                 if not vision:
                     raise _Denied("provider_unavailable")
                 vision = {key: vision[key] for key in (

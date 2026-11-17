@@ -247,11 +247,13 @@ def test_executor_result_settings_payload(
     assert ("flow.result" in execution_settings) is include_result
     if include_result:
         assert execution_settings["flow.result"] == behavior
-    assert (payload["vision"] is not None) is include_vision
+    assert payload["vision"] is None
+    assert bool(payload["feature_model_runtimes"]) is include_vision
     if include_vision:
-        assert payload["vision"]["model"] == "shared-model"
-        assert payload["vision"]["api_key"] == "shared-key"
-        assert payload["vision"]["base_url"] == "https://llm.example/v1"
+        for runtime in payload["feature_model_runtimes"].values():
+            assert runtime["model"] == "shared-model"
+            assert runtime["api_key"] == "shared-key"
+            assert runtime["base_url"] == "https://llm.example/v1"
     if other_feature:
         assert set(execution_settings[other_feature]) == {"llm_prompt"}
     for step in payload["steps"]:
@@ -294,7 +296,7 @@ def test_executor_inherited_result_opt_in(client, site_opt_in):
     payload = _execute_payload(client, response.json()["id"])
     expected_opt_in = site_opt_in is not False
     assert ("flow.result" in payload["feature_execution_settings"]) is expected_opt_in
-    assert (payload["vision"] is not None) is expected_opt_in
+    assert ("flow.result" in payload["feature_model_runtimes"]) is expected_opt_in
     assert payload["steps"][0]["config"]["llm_enabled"] is expected_opt_in
     assert payload["steps"][0]["config"]["llm_prompt"] == (
         "Template prompt" if site_opt_in is None else ""
@@ -326,4 +328,4 @@ def test_executor_result_gates_apply_to_same_step(client, eligible_opt_in):
     assert response.status_code == 201, response.text
     payload = _execute_payload(client, response.json()["id"])
     assert ("flow.result" in payload["feature_execution_settings"]) is eligible_opt_in
-    assert (payload["vision"] is not None) is eligible_opt_in
+    assert ("flow.result" in payload["feature_model_runtimes"]) is eligible_opt_in

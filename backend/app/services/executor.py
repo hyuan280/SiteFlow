@@ -589,14 +589,28 @@ class ExecutionManager:
                 ):
                     continue
                 feature_execution_settings[key] = behavior.model_dump(mode="json")
-            needs_vision_runtime = "flow.result" in feature_execution_settings or any(
-                step.enabled
-                and (
-                    "vision" in step.requires
-                    or step.config.get("captcha_method") == "vision"
-                )
-                for step in resolved.steps
-            )
+            model_requirements = {}
+            for step in resolved.steps:
+                if not step.enabled:
+                    continue
+                key = step.feature_type
+                if key == "flow.result":
+                    if key in feature_execution_settings:
+                        model_requirements[key] = feature_execution_settings[key]["use_vision"]
+                elif "vision" in step.requires or step.config.get("captcha_method") == "vision":
+                    model_requirements[key] = True
+            from app.services.model_registry import ModelRegistryError
+
+            try:
+                feature_model_runtimes = {
+                    key: integrations.model_runtime("feature_cards", requires_vision=requires_vision)
+                    for key, requires_vision in sorted(model_requirements.items())
+                }
+            except ModelRegistryError:
+                self._finish_job(job, "fail", "Model runtime configuration unavailable",
+                                 {"reason": "model_registry_unavailable"})
+                session.commit()
+                return
             payload = {
                 "job_id": job.id,
                 "run_id": run.id,
@@ -611,7 +625,8 @@ class ExecutionManager:
                 "cookies": cookies,
                 "cfbox": cfbox,
                 "feature_execution_settings": feature_execution_settings,
-                "vision": integrations.vision_runtime() if needs_vision_runtime else None,
+                "feature_model_runtimes": feature_model_runtimes,
+                "vision": None,
                 "resign_pending_dates": resign_pending,
                 "resign_today": datetime.now(resign_service.timezone).date().isoformat(),
                 "resign_unresolved_dates": list(session.scalars(

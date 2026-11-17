@@ -41,6 +41,8 @@ web (Caddy)
 - 前端点击「启动浏览器」或任务 lease 才通过后端启动专用 profile；显示号动态分配。
 - 状态包含：`status`、`browser`、`display`、`vnc_available`、`in_use`、`can_start`、`can_stop`、`error`。
 
+通用车道并行的是任务，不是同时前台输入；完整输入动作和短暂创建/焦点转换共享输入门，关闭任务页不占该门。当前输入、执行限流、生命周期隔离或真实资源仍可让其他任务等待，详见[多标签等待排查](usage.md#多标签等待排查)。
+
 ## 3. 状态 API
 
 ```http
@@ -84,7 +86,7 @@ POST /api/v1/lanes/{key}/stop
 
 - `start` 幂等：已运行时直接返回；并发点击由 worker 内部 per-lane 锁串行化，不会重复启动。
 - `stop` 幂等：已停止时直接返回。
-- 任务运行中（`in_use > 0`）时 `stop` 返回 409，前端「关闭浏览器」按钮禁用。
+- 存在任务租约（`in_use > 0`，包括未确认关闭的清理租约）时 `stop` 返回 409，前端「关闭浏览器」按钮禁用；这不一定表示业务仍在执行。
 - 前端按钮：
   - `can_start=true` → 启动浏览器
   - `running` 且 `can_stop=true` → 关闭浏览器
@@ -98,7 +100,7 @@ POST http://worker:6300/lanes/{key}/lease     # 自动启动车道并占用
 POST http://worker:6300/lanes/{key}/release   # 释放；不会自动关闭浏览器
 ```
 
-任务执行器必须先 `lease`，任务结束后 `release`。release 后车道保持运行，便于人工检查或通过 VNC 接管；需要释放资源时由前端或后续空闲策略关闭。
+任务执行器必须先 `lease`，确认任务自有页面关闭且无未决创建后才 `release`。未确认时保留租约，由 reaper 重试，不能为显示空闲强行清零 `in_use`。release 后车道保持运行，便于人工检查或通过 VNC 接管；需要释放资源时由前端或后续空闲策略关闭。缺少远端目标身份的遗留可能需要管理员核查，不保证自动恢复，见[任务生命周期](browser-backends.md#job-lifecycle)。
 
 ## 3.2 空闲自动关闭
 
@@ -166,7 +168,7 @@ WS /api/v1/lanes/{lane_key}/vnc
 - 左侧约 1/3 显示该站点任务的状态步骤，右侧嵌入 VNC 画面。
 - worker 为每个运行中的任务保存 `task_pages[job_id]`；`POST /api/v1/lanes/{key}/focus` 调用 `page.bring_to_front()` 切到任务标签页。
 - 进入页面后，如果任务处于 `running`，前端自动重试定位标签页；也可点击「定位任务标签页」手动触发。
-- 任务结束后标签页关闭，定位接口返回 404，VNC 仍可查看车道欢迎页或重新连接。
+- 确认任务自有页面关闭并移除映射后，定位接口返回 404；未确认清理时可能保留映射，定位失败也不证明租约已释放。清理不会主动切回欢迎页，VNC 可能显示其他任务或欢迎页。
 - 该布局供后续人工接管复用。
 
 Vite 构建目标为 `es2022`，因为 `@novnc/novnc` 1.7 使用 top-level await。

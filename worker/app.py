@@ -208,17 +208,59 @@ class LaneManager:
         self._idle_task = asyncio.create_task(self._idle_monitor(), name="lane-idle-monitor")
 
     async def stop(self) -> None:
-        if self._idle_task is not None:
-            self._idle_task.cancel()
+        from worker.page_lifecycle import (
+            SHUTDOWN_CANCEL_TIMEOUT_SECONDS, SHUTDOWN_TIMEOUT_SECONDS, shutdown_job_cleanup,
+        )
+
+        async def shutdown():
             try:
-                await self._idle_task
-            except asyncio.CancelledError:
-                pass
-            self._idle_task = None
-        for lane in self.lanes.values():
-            async with lane.lock:
-                await self._stop_lane_locked(lane, force=True)
-        await self.backend.close()
+                if self._idle_task is not None:
+                    self._idle_task.cancel()
+                    try:
+                        await self._idle_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._idle_task = None
+                await shutdown_job_cleanup(self)
+            finally:
+                try:
+                    for lane in self.lanes.values():
+                        async with lane.lock:
+                            retained = {owner._cleanup_args[1] for owner in getattr(self, "_job_cleanup_owners", ())
+                                        if owner.lane is lane and not owner._released}
+                            await self._stop_lane_locked(lane, force=True)
+                            lane.leases.update(retained)
+                finally:
+                    try:
+                        await shutdown_job_cleanup(self, finalize=True)
+                    finally:
+                        async with asyncio.timeout(20):
+                            await self.backend.close()
+
+        if getattr(self, "_stop_task", None) is None:
+            self._stop_task = asyncio.create_task(shutdown())
+        try:
+            await asyncio.shield(self._stop_task)
+        except asyncio.CancelledError:
+            # Keep the same shutdown owner alive through repeated caller cancellation.
+            deadline = asyncio.get_running_loop().time() + (
+                20 * (len(self.lanes) + 1)
+                + SHUTDOWN_TIMEOUT_SECONDS + 2 * SHUTDOWN_CANCEL_TIMEOUT_SECONDS
+            )
+            while not self._stop_task.done():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait({self._stop_task}, timeout=remaining)
+                except asyncio.CancelledError:
+                    continue
+            if self._stop_task.done() and not self._stop_task.cancelled():
+                self._stop_task.exception()
+            else:
+                self._stop_task.add_done_callback(
+                    lambda task: None if task.cancelled() else task.exception())
+            raise
 
     def update_settings(
         self,

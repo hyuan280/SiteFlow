@@ -64,10 +64,13 @@ automatic adoption by name or deletion. Back up both data volumes together.
 SiteFlow configures Windows/Intel persona, zh-CN, Asia/Shanghai, 1920x1080,
 and humanized input settings. Remote CDP clients do not inherit Manager's Python
 wrappers, so the adapter uses the upstream MIT Python SDK's humanization helpers.
-Input actions share a reentrant per-context foreground guard with tab creation,
-closure and explicit focus changes. This prevents another concurrent task from
-backgrounding a page mid-action and stalling CDP mouse movement. Navigation and
-observations remain parallel; each input action foregrounds its target page.
+Input actions share a reentrant per-context foreground guard with tab creation
+and explicit focus changes, not `Page.close()`. A complete public input action
+foregrounds its target and holds the guard so another guarded operation does not
+background it mid-action and stall CDP mouse movement. This serializes input and
+short lifecycle transitions, not whole jobs; navigation and observations remain
+parallel. Lane/global limits, current input and real browser resources can still
+make another job wait. Multiple tabs do not imply simultaneous foreground input.
 The SDK remains an adapter dependency; no downloader or launch helper is used.
 `worker/browser_input.py` restores native Playwright `input_value`, `text_content`,
 `inner_text`, `inner_html` and `get_attribute` on Page, Frame, Locator and
@@ -89,6 +92,68 @@ zero. Task leases and active viewers prevent idle stop; releasing either refresh
 the countdown. Profile data and identity survive browser stop. A failed provider
 stop is reported as an error, not falsely acknowledged as stopped.
 
+## Job Lifecycle
+
+Job setup reports `cookies` (when supplied), `new_page` and `focus` stages in
+progress and `job.log`, with artifact metadata available before workflow steps.
+Each setup stage has a 10-second caller budget. Separately, guarded creation/focus
+has one 10-second budget for gate acquisition plus the native call, not a fresh
+10 seconds for each part or a limit on the entire input action. Static setup
+diagnostics use `browser_setup_timeout` / `browser_setup_failed` and the stage;
+they do not copy native exception text or cookie values.
+
+A timeout/cancel cannot prove a dispatched native call stopped remotely. Pending
+creation/focus quarantines the context's input guard: the lock is freed, but later
+conflicting input/creation/focus fails closed with `Browser lifecycle pending`
+until the native call settles. Reads and close cleanup do not take this guard.
+Dispatched page creation is retained uncanceled until its late page can be owned
+and cleaned up, rather than losing ownership at a setup timeout. Quarantine can
+block future input; this is not an unconditional throughput/recovery guarantee.
+The existing 600-second execution HTTP read timeout remains unchanged: it limits
+stream inactivity, not job/step-wide duration or lifecycle quarantine settlement.
+Native guard child tasks are registered with their exact originating job owner,
+so shutdown can track pending native work after its setup caller exits without
+canceling unrelated lifecycle tasks across the context.
+
+`JobPages` closes only a job's root and popup descendants, with 3 seconds for native
+close followed by 3 seconds for CDP fallback per page. CDP must obtain the exact
+owned page's target identity before `Target.closeTarget`. Job cleanup never closes
+context siblings, refocuses the home page or calls `browser.close()` on a shared
+lane. Unconfirmed closure/creation retains its owner/listeners and lane lease;
+the reaper retries after 5 seconds between rounds. Logs distinguish
+`browser_cleanup_quarantined` from `browser_cleanup_released`. The execution slot
+can become available while `in_use` still includes that cleanup lease; it must not
+be reported as zero without release. Idle/manual stop remain blocked by leases.
+
+Completed business results are handed off **before optional Cookie export** and
+cleanup. Export is a read-only cookie query using `JobPages.setup()`'s 10-second
+budget; static `cookie_export_timeout` / `cookie_export_failed` warnings do not
+change the completed business result. Successful export adds cookies and refreshes
+the retained snapshot; interruption before it completes does not require fresh
+cookies to preserve success. A completed successful Claim stays successful in the
+worker even if export or cleanup is interrupted or cleanup is quarantined.
+This neither rewrites old database results nor automatically replays any workflow.
+Graceful `LaneManager.stop()` retains a single shielded shutdown task, reused across
+stop calls. Caller cancellation during the prelude cannot bypass teardown;
+nested `finally` blocks still attempt profile stop, owner reconciliation and
+backend close. A canceled caller waits within a bounded settlement budget, while
+the retained task can continue if it outlives that wait. Shutdown brackets
+mapped-profile teardown with bounded owner/reaper cancellation and final
+reconciliation (1-second cancellation waits,
+5-second final wait), including each owner's registered native guard children.
+Pages returned by a late creator during/after shutdown stay with that owner and
+receive one bounded close through final reconciliation or a late-return callback,
+not a new job or indefinite reaper. Only confirmed owners release leases; local
+cancellation or provider teardown alone is not an all-clear, and the full stop has separate provider
+deadlines. Remote creation that never returns a page/target identity can leave a
+retained lease requiring operator reconciliation, not arbitrary-target cleanup.
+
+The motivating production observations are investigation evidence only. Existing
+mocked regression scenarios do not constitute a production retest or prove native
+remote cancellation/recovery. This is workspace documentation, not a deployed fix
+or automatic repair of old database results. Full semantics, evidence limits and
+test references are in [Cancellation and Owned Pages](execution.md#cancellation-and-owned-pages).
+
 ## Desktop and Viewer
 
 `browser_x11` is a dedicated socket volume shared only between browser and worker.
@@ -109,9 +174,13 @@ does not modify RFB frames again. Viewer leases still prevent idle stop.
 
 ## Failure and Deployment
 
-Backend disconnects cancel in-flight work and release task pages/broker tokens.
-The worker reports failure and does not replay side effects. Subsequent jobs can
-reconnect after prior leases finish. Requests already submitted cannot be undone.
+Backend disconnects cancel in-flight work and revoke broker tokens; owned-page
+cleanup still requires closure confirmation before releasing its lease. An
+unfinished job reports interruption according to its policy; a completed business
+result already handed off before cleanup is preserved. The worker does not replay
+side effects. Subsequent jobs can reconnect after prior leases finish, but an
+unconfirmed owner can require operator reconciliation. Requests already submitted
+cannot be undone.
 Graceful worker shutdown stops its mapped active lane profiles. Abrupt crashes
 may leave profiles running until Worker startup reconciliation or explicit stop.
 

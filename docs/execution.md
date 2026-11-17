@@ -28,10 +28,13 @@ Web POST /api/v1/runs
   → POST worker:/execute
   → worker.lease_lane()
   → 独立标签页逐步骤执行 / 条件与信号判断
+  → 保留已完成业务结果；成功时尝试有界只读 Cookie 导出
+  → 尝试清理自有页；确认后释放租约，否则后台重试
   → 返回步骤结果
   → API 写入 job_steps / 汇总 runs
-  → 关闭任务标签页 + worker.release_lane()
 ```
+
+清理与结果发布的具体顺序及未确认关闭时的租约保留见 [Cancellation and Owned Pages](#cancellation-and-owned-pages)；业务完成不等于浏览器资源已经释放。
 
 系统调度器每 30 秒检查一次调度设置：
 
@@ -116,7 +119,7 @@ post.resign_dialog
 - `post.resign_dialog`（弹窗按钮补签）：在当前页面点击入口并等待唯一弹窗，按配置的正则提取按钮日期，只点击 pending 对应的唯一过去日期。日期点击前完成持久化预留；支持成功提示短暂出现后刷新，必须同时核验目标 done 或本次新提示及卡数恰好减少 1。可配置按钮缺失时记为已签到，但须有日期列表就绪证据，推断结果不能覆盖已有 unknown；历史 unknown 仍只接受日期绑定的 done。每次提交最多点击一次，刷新后可重新打开弹窗处理下一日期，不自动重放消费。字段及配置示例见[使用指南](usage.md#弹窗按钮补签)。
 - 页面补签每次提交前调用内部持久化检查点接口，以任务级 token 原子预留 `(site_id, date)`，事务提交并收到 ACK 后才点击。已有未决或终态日期不能重复预留，排队旧任务也不能绕过；页面确认后再次持久化确认。原生弹窗默认拒绝，跨源/新窗口/日期歧义/结果不明时转人工，不被 `on_error=continue` 放行。取消或断连保留已确认部分结果；后续任务对未决日期先只读检查 done，没有明确完成标记则停止，不再消费卡片。预留 ACK 丢失时可能保留“未点击但未决”的保守记录，需要人工核验；这不是远端事务或 exactly-once 保证。
 - 待补签日期由 API 按站点「支持补签最大天数」生成并注入 worker：从该站点最早有运行记录的日期开始，窗口内没有成功运行或成功补签记录的日期都算缺失；今天等当日结束后再判定。补签结果写入 `site_resign_records`，同时合并到状态矩阵和趋势。
-- 站点 Cookie 由系统主动维护：任务开始前注入，站点任务成功后从浏览器导出当前站点 Cookie 并加密更新；失败时保留原配置。
+- 站点 Cookie 由系统主动维护：任务开始前注入，站点任务成功后尝试从浏览器导出当前站点 Cookie，取得有效结果后加密更新；任务失败或导出超时/失败时保留原配置，导出失败不改变已完成业务结果。
 - `post.resign` 的历史日期范围继续使用站点最大补签天数；购卡自动数量由该范围内的待补签日期决定，固定数量由 `purchase_quantity` 决定。
 - 魔力值不足时 `post.buy_card` 只购买可负担部分并继续，`post.resign` 按现有卡数补签，剩余日期保留到下次。
 - 模板和站点解析信号始终包含系统信号「断签」(`sys_resign_pending`)；worker 用待补签日期数量计算真假，站点不支持补签时恒为假。条件日志会输出待补签天数。
@@ -180,7 +183,7 @@ post.resign_dialog
 
 原状态和 `reason` 不变：字符验证码模型失败为 `fail` / `provider_failed`，图片答题与九宫格为 `waiting_human` / `vision_failed`，结果判断为 `fail` / `model_judgment_failed` 且不产生布尔结论。不新增失败重试、不回退模型或 OCR；原有识别不清刷新、校验刷新及重试预算保持不变。助手私有单步和完整运行反馈仍采用既有静态/类型受控投影，不自动发送这些供应商文字。
 
-外层步骤 `timeout_seconds` 与模型请求 `SITEFLOW_VISION_TIMEOUT`（默认 30 秒）是不同期限；外层先超时仍记录 `stage=step_execution`、`reason=execution_timeout`，助手副作用运行沿用结果不确定语义，未必能取得模型错误详情。模型 `timeout_phase` 只反映可识别的阶段，`request` 可能是粗粒度标签，不能强猜连接或读取阶段；`timeout_seconds` 诊断值是配置请求超时，不是实际耗时。此次仅增加诊断，不调整默认超时、响应大小、`max_tokens` 或任何预算。
+外层步骤 `timeout_seconds` 与模型请求 `SITEFLOW_MODEL_TIMEOUT`（所有模型共用，默认 30 秒、最大 300 秒）是不同期限；该全局超时不构成环境变量模型条目。旧模型环境变量前缀已停用，部署方须重命名，没有旧名回退。外层先超时仍记录 `stage=step_execution`、`reason=execution_timeout`，助手副作用运行沿用结果不确定语义，未必能取得模型错误详情。模型 `timeout_phase` 只反映可识别的阶段，`request` 可能是粗粒度标签，不能强猜连接或读取阶段；`timeout_seconds` 诊断值是配置请求超时，不是实际耗时。此次仅增加诊断，不调整默认超时、响应大小、`max_tokens` 或任何预算。
 
 所有实际执行的 `sign.*`、`post.buy_card` 和 `post.resign` 步骤也会输出：
 
@@ -191,7 +194,7 @@ message: 步骤结果信息
 
 输出同时写入步骤数据和站点任务的 `result_json.outputs`；失败步骤输出 `false`。
 
-每个站点任务在车道内创建独立标签页，任务结束后关闭该标签页。车道启动时保留一个欢迎页作为常驻标签页，因此关闭最后一个任务标签页不会关闭浏览器。
+每个站点任务在车道内创建独立标签页，任务结束后尝试有界关闭该页及其后代弹窗；未确认关闭时保留清理所有权和租约，而不是假报已释放。车道启动时保留一个欢迎页作为常驻标签页，因此关闭最后一个任务标签页不会关闭浏览器。
 
 ## 5. 条件与信号
 
@@ -223,7 +226,7 @@ GET  /api/v1/analytics/failures      失败分析
 ## 7. 配置
 
 ```dotenv
-SITEFLOW_EXECUTION_TIMEOUT=600       # 单站点任务最长等待秒数
+SITEFLOW_EXECUTION_TIMEOUT=600       # API 到 worker 的 HTTP 超时，流式读取时限制无数据等待
 SITEFLOW_EXECUTION_MAX_RUNS=2       # 同时执行的运行数
 SITEFLOW_EXECUTION_MAX_JOBS=10      # 同时执行的站点任务数
 SITEFLOW_LANE_GENERAL_CONCURRENCY=5
@@ -253,6 +256,8 @@ SITEFLOW_SCHEDULER_RANGES=08:00-10:00,18:00-20:00
 随机调度的每个范围每天最多触发一次，具体时间在范围内随机且当天稳定。环境变量存在时页面只读并显示「环境变量」来源。
 
 worker 不可达时，站点任务标记为 `error`；不会自动重试。
+
+`SITEFLOW_EXECUTION_TIMEOUT` 的现有默认值仍为 600 秒，本次不改变其读取超时行为；它不是任务总时长，也不是每个步骤的总时限。API 使用 HTTPX 流式读取 worker，持续收到数据可使运行超过 600 秒；长时间没有数据仍可能触发读取超时。步骤有自己的 `timeout_seconds`，浏览器设置与焦点转换另有下述 10 秒预算，不能靠增大 600 秒来安全解除生命周期阻塞。
 
 Turnstile 点击先用 Playwright 截图和鼠标点击。只有页面上的可见挑战消失后步骤才结束，不能仅凭 `cf-turnstile-response` token 或 URL 变化提前开始下一步。检测只认可见的 Turnstile 组件、挑战文案或挑战 URL；隐藏的 response input 和隐藏的 Cloudflare iframe 不算挑战。
 
@@ -303,6 +308,64 @@ CFbox 的非空 `challenges` 数组始终参与聚合，包括顶层 confidence 
 CFbox 检测到未解决挑战、页面仍有未解决挑战或读取失败时不放行。未配置 CFbox 返回 `waiting_human`；截图/请求/响应失败或缺失、非法状态返回 `fail`，总等待超时返回 `unknown`，不能作为“未检测到”成功。截图、页面检查、网络请求和轮询均受步骤 `wait_seconds` 总时限约束。正常稳定清除约需三次识别，成功后不再请求。
 # Cancellation and Owned Pages
 
+## Concurrency and Foreground Input
+
+`general` and `proxy_general` admit multiple jobs, subject to API/global limits,
+the lane execution limiter and available browser/CPU/network resources. They do
+not serialize an entire job behind the previous job. Each job runs its own steps
+in order in a separate tab, but tabs share a browser context and foreground input.
+
+Humanized public input actions hold a reentrant per-context gate for the complete
+action and foreground their target. New-page creation and explicit focus changes
+also use that gate so they do not background another tab mid-action. These are
+intended to be short serialized transitions, not a whole-job lock; an input action
+can nevertheless take time. A later job can wait for current input or the lane
+limiter even when several tabs exist. Navigation, DOM observations, waits and
+screenshots do not acquire this input gate. Parallel admission does not promise
+perfectly simultaneous foreground interaction or protection from manual VNC input.
+
+`Page.close()` no longer acquires the shared input gate. A suspended tab close
+therefore does not itself hold up another job's creation, focus or input. This
+does not eliminate other resource contention or the fail-closed quarantine below.
+
+## Setup and Pending Native Calls
+
+After lane acquisition, `JobPages.setup()` allows **10 seconds per setup stage**,
+not 10 seconds for the whole job or browser startup. The stages are `cookies`
+(when seed cookies exist), `new_page` and `focus`. Before each operation the worker
+writes `browser_setup_<stage>` to `job.log` and emits running progress with `stage`
+and artifact metadata, allowing diagnostics before any workflow step has started.
+Timeout returns static `reason`/`message=browser_setup_timeout`; other setup errors
+use `browser_setup_failed`, with the stage retained. Cookie setup failure is
+`fail`; page creation/focus failure is `error`. These diagnostics do not expose
+cookie values, browser URLs or native exception text.
+
+Separately, the input guard has a **10-second combined budget** for acquiring the
+gate and running a native creation/focus transition, including focus before an
+input action. This is not a 10-second limit on the complete click/fill action.
+Timing out before dispatch does not cancel the current input owner. If a dispatched
+native lifecycle call is still pending after timeout or caller cancellation, it
+may still change focus remotely: the lock is freed, but the context is quarantined.
+New conflicting input, creation and focus fail closed with the static
+`Browser lifecycle pending` error until that native call settles. They do not
+silently unlock and continue, nor wait for the legacy 600-second HTTP timeout.
+Reads and close cleanup remain outside the gate; quarantine may still prevent
+future jobs in that context from performing input.
+
+Dispatched `new_page()` work is not canceled on a job setup timeout/cancellation.
+Its tracked creator is retained until the returned page is attached to its
+`JobPages` owner, even if the job has already exited; cleanup then closes that late
+page. A 10-second caller budget does not prove that remote creation was aborted.
+Non-creation setup wrappers can be canceled, but a pending native focus call still
+keeps the input quarantine until settlement.
+
+Native guard child tasks are registered with the exact `JobPages` owner that
+dispatched them, including children outliving a timed-out setup wrapper. Shutdown
+tracks those children as well as their callers, not a context-wide sweep that
+could cancel another job's lifecycle work.
+
+## Owned Cleanup
+
 Each admitted job owns its new root page and popup descendants through `JobPages`.
 Context siblings and the lane home page are never adopted. A loaded same-origin
 popup becomes the active page for subsequent built-in and plugin steps, failure
@@ -312,10 +375,94 @@ unloadable popups are closed rather than handed to the workflow. Browser actions
 outside the broker's origin are denied. This is not a browser network firewall:
 a click/navigation may already have sent a request before its new origin is known.
 
-All owned pages close on job exit, including success, failure, timeout and cancel.
-Popup listeners stay installed while roots close to capture queued late popups,
-then are removed; lifecycle tasks are awaited. Closing a job does not close sibling
-jobs or refocus the home page while another task is still mapped.
+On success, failure, timeout or cancellation, cleanup attempts only owned pages.
+For each page it allows **3 seconds for native `page.close()`**, then, if closure
+is unconfirmed, **3 seconds for a CDP fallback**. The fallback attaches to that exact
+owned page, reads `Target.getTargetInfo`, requires a nonempty page target identity,
+and sends `Target.closeTarget` only for that target. Confirmation is a successful
+native close, `is_closed() is True`, or an explicit CDP close success, not a truthy
+placeholder. Cleanup never enumerates and closes other context pages, refocuses
+the home page, or calls `browser.close()` to resolve a single job's cleanup.
+
+If any page/creator remains unresolved, its owner, popup listeners, any existing task mapping
+and lane lease remain tracked. A background reaper logs
+`browser_cleanup_quarantined` and retries after **5 seconds** between rounds;
+confirmed cleanup releases the lease and logs `browser_cleanup_released`.
+Lease release has its own **5-second wait budget**, reusing an outstanding release
+task rather than duplicating it. Listeners/mappings are removed only after owned
+closure and creation settle. The execution slot is freed when the admitted job
+returns, so an unresolved cleanup lease does not consume all future job capacity.
+`in_use` counts leases, including quarantined cleanup, not just executing jobs:
+it must not be forced to zero while ownership is unresolved. Normal stop and idle
+stop remain blocked by those leases. Input quarantine is a separate constraint
+and can still block new input despite available execution slots.
+
+There is no universal automatic all-clear. In particular, remote creation can
+have produced a target without returning its page/target identity. If it never
+returns, or shutdown cancellation leaves that creation unconfirmed, the worker
+cannot safely identify a target to close or prove it absent. It retains the lease
+and ownership uncertainty; the reaper cannot discover that identity by closing
+arbitrary tabs. An operator must investigate/reconcile the owned backend/profile
+in a controlled maintenance window without disrupting other jobs. A timeout,
+disconnected client, stopped local task or elapsed retry interval is not proof
+that remote resources have disappeared.
+
+## Business Results and Shutdown
+
+The executor hands off a snapshot of the completed business result, including
+steps, outputs and artifacts, **before optional Cookie export**, not after it.
+For a successful job, export is a read-only context-cookie query through
+`JobPages.setup()` with a **10-second caller budget**; it neither creates a page
+nor acquires foreground input. Timeout logs the static `cookie_export_timeout`,
+and other export failures log `cookie_export_failed`, without changing the
+completed business status/message or exposing native exception text. A successful
+export adds cookies to the result and refreshes the retained snapshot; interruption
+before that point preserves the business result without requiring fresh cookies.
+
+Export or cleanup timeout, failure, cancellation or backend loss after the initial
+handoff must not turn a completed successful Claim into a failed/canceled worker
+result or replay it. This applies to a fully completed job, not merely an earlier
+successful step in an unfinished workflow. Terminal progress is published after
+optional export and the initial cleanup attempt or interruption, without exposing
+the internal handoff marker. Business success and
+`browser_cleanup_quarantined` can therefore coexist. A lost response still cannot
+guarantee API persistence, and an explicitly canceled parent Run can retain its
+own cancellation status. This behavior does not repair historical database rows
+or automatically rerun any job; verify remote effects before a fresh manual run.
+
+`LaneManager.stop()` retains one shielded shutdown task, reused by repeated stop
+calls. Caller cancellation, including during the idle-monitor/cleanup prelude,
+does not cancel that task or bypass the teardown path: nested `finally` blocks
+still attempt mapped-profile stop, final owner reconciliation and backend close.
+The canceled caller allows a bounded settlement wait before re-raising cancellation;
+if shutdown outlives that wait, the same retained task continues rather than
+starting a second teardown.
+
+The shutdown task invokes `shutdown_job_cleanup()` before backend teardown to stop
+reapers and cancel tracked owner work, including native guard children and shielded
+creation, close and release tasks, with a **1-second cancellation settlement wait**.
+After stopping the mapped lane profiles it runs final reconciliation with a **5-second wait**,
+then another bounded cancellation pass. Only confirmed closed pages with no
+unresolved creator may release their leases. Unconfirmed owners/leases are retained,
+not cleared just because teardown ran. If a dispatched creator returns a page
+during or after shutdown, that page is first attached to its original owner; final
+reconciliation or its late-return callback schedules one bounded owned-page close
+and releases only after confirmation. It does not restart a job or an indefinite
+reaper after shutdown. A missing identity or unconfirmed close still retains the
+lease. These are cleanup-hook budgets, not a 5-second guarantee for the entire
+shutdown: provider stop has its own deadline,
+and uncooperative native/remote work may outlive local cancellation.
+
+The production investigation motivating this change is evidence of the reported
+multi-tab wait and completion/cleanup ambiguity, not a production retest of the
+fix. Mocked regression coverage in `backend/tests/test_browser_input.py` and
+`backend/tests/test_job_lifecycle.py` exercises stalled close, late creation,
+quarantine, result preservation and shutdown. It does not establish real-site
+success, native cancellation guarantees or automatic recovery for every remote
+target. This documents workspace behavior, not a deployed fix; no production
+rerun or automatic historical database result repair is implied.
+
+## Cancellation Boundaries
 
 Cancellation interrupts the admitted coroutine instead of waiting for the next
 step. A plugin step's exit invalidates its broker token before RPC thread settlement;

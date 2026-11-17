@@ -520,7 +520,7 @@ class AssistantManager:
             raise AssistantError("generation_disabled", 503)
         try:
             with self.session_factory() as db:
-                config = IntegrationService(db, self.settings, self.crypto).vision_runtime()
+                config = IntegrationService(db, self.settings, self.crypto).model_runtime("assistant")
             if not config:
                 raise ValueError
             validate_base_url(config["base_url"])

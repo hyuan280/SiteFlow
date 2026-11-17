@@ -11,8 +11,8 @@ Statements below about no persisted chat/browser and disconnect cancellation
 apply to `/config-ai/generate`, not `/assistant`.
 
 The backend implements an opt-in, bounded, text-only model/tool loop for proposing
-the local workflow of **one new site without a template**. It reuses the configured
-Vision/OpenAI-compatible model connection and runs read-only discovery,
+the local workflow of **one new site without a template**. It selects an eligible
+OpenAI-compatible connection with registry usage `assistant` and runs read-only discovery,
 validation and submission tools inside `POST /api/v1/config-ai/generate`.
 Submission returns a proposal for human review, not a saved site or approval to
 execute it.
@@ -41,8 +41,9 @@ frontend entry point or automatic editor handoff.
 commented setting. Set it to `true` to opt in. Discovery GET routes remain
 available when generation is disabled.
 
-The persistent assistant reuses this same flag and Vision connection, including
-global `max_tokens`; it has no separate provider configuration. Deploy its Web,
+The persistent assistant reuses this same flag and ordered model registry, selecting
+usage `assistant` once per turn and inheriting that entry's `max_tokens` unless
+assistant settings override it; it has no separate provider configuration. Deploy its Web,
 API and Worker together. Unlike the single-request API, an accepted assistant turn continues
 after tab closure or SSE disconnect and requires explicit cancellation. Its SSE
 sends full snapshots, not provider tokens (`stream: false`); request UUID replay
@@ -70,7 +71,7 @@ These capabilities belong only to `/assistant`, **not** `/config-ai/generate`:
 - New session creation directly sends `{}`, with no creation dialog or model call. The server writes a fixed initial assistant greeting and the default title. Only successful main turns among the first three accepted user messages may trigger a separate, small, tool-free title request using the same configured model. Failed/cancelled user turns still consume that window; title failure preserves the title and is not retried. Manual rename permanently locks automatic updates. Title lock/revision/attempt fields use existing encrypted JSON, requiring no column migration; old sessions missing those fields are treated as locked. The title request has at most 10 seconds within the remaining 180-second turn budget, not an extra budget.
 - `list_sites`, `get_site_config`, `list_templates`, `get_template_config`, `list_recent_runs`, `get_run_summary` and `get_system_status` return non-secret site/template metadata, sanitized local/resolved workflows and signals, run/job metadata, integration configuration sources and lane status. Inline fill/static-field values and sensitive config keys are omitted; URL credentials/query/fragment are stripped. This is a dedicated projection, not the raw administrator preview and not generic free-text DLP. These metadata tools do not return raw logs or screenshot pixels; separate historical artifact tools below do. No tool permits arbitrary SQL, shell, JavaScript, file paths or secret retrieval.
 - Site list/detail metadata includes `history_key` (in `_SITE_FIELDS`), as does template metadata, for UUID-based historical discovery. `list_sites` / `list_templates` accept name `query`, `offset` (default 0), and `limit` 1-100 (default 100), ordered by name/id ascending. `list_recent_runs` accepts offset and limit 1-20 (default 20); `get_run_summary` accepts offset and limit 1-100 (default 100) to page **jobs**, retaining overall run metadata/counts. Responses include offset/limit/next_offset (null at the end) and `truncated` (`jobs_truncated` for summary), with no total guarantee. These are live offsets, not snapshots: concurrent changes can overlap/skip rows; deduplicate IDs and refresh. See [data contracts](ai-assistant.md#数据查询).
-- In `get_system_status`, CFbox is configured with a URL alone; its API Key is optional. Non-Bitwarden integrations remain metadata-only, with `available: null` and `health_checked: false`, not a health verdict or integration decryption. Top-level model fields explicitly carry `model_config_scope: "environment_only"`, not the DB-resolved effective model or current assistant overrides. The separate safe Bitwarden health projection retains its documented boundary.
+- In `get_system_status`, CFbox is configured with a URL alone; its API Key is optional. Non-Bitwarden integrations remain metadata-only, with `available: null` and `health_checked: false`, not a health verdict or integration decryption. Top-level model fields explicitly carry `model_config_scope: "environment_only"`, not the DB-resolved effective model or current assistant overrides. The tool does not enumerate registry entries, priority, names, usages, connections or all-model metadata. The separate safe Bitwarden health projection retains its documented boundary.
 - `GET /api/v1/assistant/sessions` accepts offset>=0 (default 0), limit 1-100 (default 100), and returns the same paging metadata without a total guarantee. The UI can load more sessions, not just the first 100; updated_at/id descending offsets are live, with ID deduplication and refresh needed for concurrent changes. Detail/SSE still show the latest 200 messages, not old-message pagination. `browser_navigate` requires exactly one address: path up to 2048 or full URL up to 4096 characters, aligned in runtime and schema. These contract changes add no tools: 38 ordinary, 39 registered.
 - Host target settings bind the origin, credential mode, proxy and optional saved `site_id`. The user confirms unified execution permission in the host UI; the API derives `execution_consent`, the frozen reviewed `execution_features`, credential-source-dependent `credential_consent`, and `allow_sign` for signing, clicks, public fills and challenges. Old targets retain only their saved permissions until the user reconfirms; neither an upgrade nor a retry expands the initial scope. Model text, chat approval, DOM, feature schemas and step conditions cannot grant permissions. Extra `trusted_origins` authorize navigation/observation only, never cross-origin execution or secret use.
 - Manual stored-account tests require a persisted site with exactly the same origin (scheme, host and effective port). The API freezes its ID, history identity and configuration revision and rechecks them before execution; changes require reconfirmation. Bitwarden can privately resolve credentials for an unsaved new target using full-domain matching, not inherited root/custom matching, with explicit credential authorization. All credential modes may privately seed saved cookies from a validated explicit saved-site binding before a new browser's first navigation: `workflow_site_id` takes precedence over credential `site_id`, with no fallback from a stale preferred binding and no hostname lookup. This grants no auth, OTP or full-run permission; `cookie`, `none` and unbound manual targets still cannot authorize the two auth features or `challenge.2fa`. Manual login in a separate same-lane user tab remains an alternative, not the only Cookie-mode path.
@@ -179,7 +180,13 @@ feedback access.
 At the user's request, `read_artifact_log({artifact_id, offset, limit})` reads the
 **actual historical log file**, capped at **2 MiB**, not the curated `get_run_log`
 events. Known model/integration secrets and credential/private-value patterns are
-redacted across the **entire text before pagination**. Offsets/limits count
+redacted across the **entire text before pagination**. Known model keys include
+all legacy/new model entries, disabled/unused/reserved entries and the encrypted
+retired-key archive, not just the selected chat model. Retired keys are retained
+solely for historical redaction (deduplicated, at most 512, also subject to the
+registry document size limit), never provider runtimes or API/tool output; deleting
+or clearing a connection is not a promise of permanent key erasure. Provider
+secrets and the private archive are not plaintext assistant history. Offsets/limits count
 sanitized Unicode characters, not raw bytes; limit is 1-16000, default 16000.
 Follow `next_offset` and check `snapshot_sha256` before combining pages. This is
 not general DLP: other personal information can remain. The file resolver checks
@@ -335,23 +342,95 @@ removed entirely; selectors and conditions require target-specific review.
 
 ### Model Connection
 
-Generation resolves the existing Vision connection through
-`IntegrationService.vision_runtime()`, using its configured base URL, model, API
-key, global `max_tokens` and `vision_timeout`. No separate provider configuration is accepted in the
-request. The provider URL must be an HTTP(S) `/v1` root without URL credentials,
-query or fragment. Requests go to its `/chat/completions` endpoint with bearer
-authentication, `tool_choice: "auto"` and `stream: false`. Every round sends the
-same positive global `max_tokens` integer unchanged; unset/null, blank (normalized
-on update), or 0 omits the parameter, using upstream defaults rather than
-guaranteeing unlimited output. See [Vision settings](vision-feature-settings.md#vision-integration)
-for update/clear semantics and the optional `SITEFLOW_VISION_MAX_TOKENS` override;
-even environment value 0 overrides and locks the DB setting. Thinking models may
-consume the budget on reasoning, so leave enough for final tool calls. Reasoning
-is never treated as an answer or proposal, and the model is never switched
-automatically. Existing timeout and response-byte budgets are unchanged.
-The model must support OpenAI-compatible function/tool calling; a successful
-ordinary text or image test does not establish that capability. Images are not
-sent, and `supports_vision=false` does not block this text-only use.
+Generation resolves `IntegrationService.model_runtime("assistant")` once before
+the loop, selecting the first saved entry that is enabled, configured and assigned
+usage `assistant`. It does **not** call the legacy-entry compatibility resolver
+`vision_runtime()`, use `feature_cards` or accept a registry ID/provider connection
+in the generation request. Disabled/wrong-usage entries do not block
+other eligible entries. No eligible entry or an unreadable/corrupt registry returns
+static 503 `model_unavailable`, without provider calls. This endpoint remains
+**text-only**: images are not sent and `supports_vision=false` is eligible.
+
+The selected base URL, model, API Key and per-entry `max_tokens` are frozen for all
+generation rounds; requests use global `SITEFLOW_MODEL_TIMEOUT` (default 30 seconds,
+maximum 300). The provider URL
+must be an HTTP(S) `/v1` root without credentials, query or fragment. Calls go to
+`/chat/completions` with bearer authentication, `tool_choice: "auto"` and
+`stream: false`. Positive `max_tokens` is sent unchanged; unset/null or 0 omits it,
+using upstream defaults, not guaranteed unlimited output. Registry PUT omits a
+field to keep it and uses null/0 to clear its cap (0-2147483647); the modal turns a
+cleared input into null, while the legacy `/vision` PUT also accepts blank strings.
+Persistent assistant Token overrides do not apply to this single-request API.
+
+One optional ordinary environment entry uses `SITEFLOW_MODEL_BASE_URL`,
+`SITEFLOW_MODEL_ID` (upstream model name), `SITEFLOW_MODEL_API_KEY`,
+`SITEFLOW_MODEL_SUPPORTS_VISION` and `SITEFLOW_MODEL_MAX_TOKENS`. Any one present,
+including false/0, locks **the entire connection**, not just that field. The row
+has the UI source label **环境变量**, `source="env"` and `config_editable=false`;
+it has no editable frontend modal and cannot be deleted. Order/enable state remain
+saveable in the UI; name/usage metadata can only be updated through the API,
+not edited in the UI. Even an
+incomplete ENV connection must be repaired in deployment settings. Other entries
+are DB-only and do not inherit these values. `SITEFLOW_MODEL_TIMEOUT` is global;
+setting it alone does not create or lock an ENV entry. **Old `SITEFLOW_VISION_*`
+names are ignored without alias fallback; rename deployment variables.**
+
+The environment cap is an optional nonnegative integer output limit: 4096 sends
+`max_tokens=4096`; 0 omits the parameter and uses provider defaults, not unlimited
+output. Leave its line commented to retain the DB cap; an empty value becomes 0
+and creates/locks the entry. Effective legacy values still merge per field with
+DB, but all connection fields remain locked while any ENV connection setting
+exists. Omit the vision flag unless an ENV entry is desired; it uses the saved DB
+flag or defaults to true. To clear the DB cap in the UI, remove all five ENV
+connection settings first, then save blank/0.
+
+With no registry, reads expose revision 0 and an empty list unless legacy DB rows
+or environment connection settings exist; those expose one ordinary enabled entry
+for `feature_cards` and `assistant`, with MCP off. A missing ENV entry is appended
+to an existing registry, not forced first. No migration writes or changes to
+existing `vision.*` ciphertext/AAD or cookies occur. Internal ID `primary` and
+legacy encryption keys are compatibility details, not a model role. Deleting the
+legacy DB entry removes its active connection too, preventing resurrection; archived
+keys are used only for log redaction, never runtime or entry recovery. There are no
+new SQL columns; upgrade API, Worker and Web together and rename deployment variables.
+
+The persistent assistant likewise selects once per accepted turn, reusing the
+connection for conversation, title, summary and failure takeover. A text-only
+assistant cannot auto-switch to another entry for live/historical images; current
+vision and host-consent gates still apply. Host-private feature execution instead
+selects `feature_cards` by each feature's vision need, and full workflows use a
+private per-feature runtime map: text result judgement may use an earlier text
+model while a later image CAPTCHA uses a visual entry. `ddddocr` invokes no LLM.
+The `flow.result` model override remains only an upstream model-name string on the
+selected provider, never a registry ID/provider selector.
+
+Selection is not health checking or request-failure fallback. Provider HTTP/network
+failures, timeouts or invalid output never try the next model automatically.
+Thinking models may spend the budget on reasoning; reserve enough for final tool
+calls. Reasoning is never an answer/proposal, and existing timeout/response-byte
+budgets are unchanged. A successful image/text self-test does not establish the
+required OpenAI-compatible tool-calling capability.
+
+Registry usages do not grant tool or website permissions. `mcp` is reserved only,
+not an implemented runtime/server, external identity or authorization grant. The
+full-width Settings **大模型** card provides explicitly saved ordering/temporary
+disable metadata and DB connection modals (**0-20 DB models including any legacy
+DB entry, plus one optional environment model, at most 21 total**, with no
+mandatory model). The environment model consumes no DB slot: all 21 rows remain
+visible when it appears alongside 20 DB models, without truncation, dropped rows
+or disabled list operations. DB additions are limited by DB count, not total rows.
+The concise hint is
+**保存前请测试连通性，测试不代表保存配置**. Row tests use a specific saved ID, not drafts
+or the first selected model; modal tests can preview unsaved connection drafts.
+New/typed keys use browser-direct tests with no backend fallback; blank existing
+keys use the API's in-memory merge for that saved ID. Testing never saves, and
+browser CORS/30-second limits and API-versus-Worker reachability boundaries apply.
+Whole-list PUT uses revision CAS; conflicts preserve drafts with no automatic
+retry, and confirmed refresh discards drafts before re-editing. Legacy-entry
+PUT/DELETE also advance that revision. See [model registry](vision-feature-settings.md#model-registry)
+for API, legacy clearing/deletion, encryption, repairable legacy field errors and retired-key
+redaction limits. These contracts do not claim production deployment or live-site
+validation.
 
 ## Generation API
 

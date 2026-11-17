@@ -396,6 +396,7 @@ def test_settings_never_probe_or_modify_global_model_configuration(tmp_path, mon
         pytest.fail("Assistant settings must not probe model/runtime/providers")
 
     monkeypatch.setattr(IntegrationService, "vision_runtime", forbidden)
+    monkeypatch.setattr(IntegrationService, "model_runtime", forbidden)
     monkeypatch.setattr(client.app.state.assistant_manager, "_runtime", forbidden)
     with client.app.state.session_factory() as db:
         integrations = db.execute(select(IntegrationConfig.__table__)).all()

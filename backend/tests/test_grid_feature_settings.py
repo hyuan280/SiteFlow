@@ -192,11 +192,12 @@ def test_grid_executor_forwards_credentials_only_when_enabled(client, enabled):
     payload = manager._post_execute.call_args.args[0]
     assert (KEY in payload["feature_execution_settings"]) is enabled
     assert "flow.result" not in payload["feature_execution_settings"], "global result gate stays off"
-    assert (payload["vision"] is not None) is enabled
+    assert payload["vision"] is None
+    assert (KEY in payload["feature_model_runtimes"]) is enabled
     if enabled:
         assert payload["feature_execution_settings"][KEY] == {"llm_prompt": prompt}
-        assert payload["vision"]["api_key"] == "grid-secret"
-        assert payload["vision"]["model"] == "grid-model"
+        assert payload["feature_model_runtimes"][KEY]["api_key"] == "grid-secret"
+        assert payload["feature_model_runtimes"][KEY]["model"] == "grid-model"
     grid = next(step for step in payload["steps"] if step["feature_type"] == KEY)
     assert grid["requires"] == ["vision"]
     assert grid["config"] == DEFAULTS

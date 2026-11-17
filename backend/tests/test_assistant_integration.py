@@ -403,11 +403,11 @@ def test_general_stopped_status_reaches_model_without_blocking_interaction_brows
                 if message.get("tool_call_id") == "status")["content"] == logs[0]["content"]
     prompt = model_request["messages"][0]["content"]
     section = " ".join(prompt.split("BROWSER LANES AND FAILURES:\n", 1)[1].split("\n\n", 1)[0].split())
-    assert "A stopped general lane does not prevent assistant browsing" in section
     assert all(phrase in section for phrase in (
-        "Assistant browsing never uses general/proxy_general",
-        "Call browser_open to start the selected lane",
-        "Diagnose failures from the returned lane/reason/diagnostics, not guesses",
+        "never general/proxy_general/model-selected",
+        "browser_open starts lanes, not users",
+        "stopped general lanes cannot block browsing",
+        "Diagnose returned lane/reason/diagnostics; no guessed causes/stages",
     ))
     worker_requests = [request for request in provider[1]
                        if "/assistant-browser/" in str(request.url)]

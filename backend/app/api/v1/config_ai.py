@@ -107,7 +107,7 @@ async def generate(
         except ValueError:
             raise HTTPException(422, detail={"code": "invalid_selection"}) from None
         try:
-            config = IntegrationService(service.session, service.settings, service.crypto).vision_runtime()
+            config = IntegrationService(service.session, service.settings, service.crypto).model_runtime("assistant")
         except Exception:
             raise HTTPException(503, detail={"code": "model_unavailable"}) from None
         if config is None:

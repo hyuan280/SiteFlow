@@ -121,7 +121,9 @@ def test_token_snapshot_used_for_conversation_summary_and_title_without_mutating
     if global_tokens is not None:
         config["max_tokens"] = global_tokens
     original = dict(config)
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: config)
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False:
+                        config if usage == "assistant"
+                        and (not requires_vision or config["supports_vision"]) else None)
     save(client, max_tokens=override, auto_title=True)
     identifier = create(client)
     manager = client.app.state.assistant_manager
@@ -226,7 +228,9 @@ def test_configured_turn_deadline_and_provider_timeout(
 ):
     client = runtime_client
     save(client, turn_timeout_seconds=turn_timeout)
-    monkeypatch.setattr(IntegrationService, "vision_runtime", lambda self: {**CONFIG, "timeout": provider_timeout})
+    monkeypatch.setattr(IntegrationService, "model_runtime", lambda self, usage, *, requires_vision=False:
+                        {**CONFIG, "timeout": provider_timeout} if usage == "assistant"
+                        and (not requires_vision or CONFIG["supports_vision"]) else None)
     deadlines = []
     original = asyncio.timeout_at
 

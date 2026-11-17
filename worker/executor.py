@@ -184,6 +184,7 @@ def _safe_name(value: Any) -> str:
 
 class JobArtifacts:
     def __init__(self, payload: dict[str, Any]) -> None:
+        self.pages = None
         self.enabled = False
         self.directory: Path | None = None
         self.log_path: Path | None = None
@@ -2895,8 +2896,8 @@ async def _export_site_cookies(
             urls.add(f"{scheme}://{domain}/")
     try:
         cookies = await context.cookies(sorted(urls))
-    except Exception as exc:
-        log("WARN", f"导出站点 Cookie 失败：{type(exc).__name__}: {exc}")
+    except Exception:
+        log("WARN", "cookie_export_failed")
         return None
     if not isinstance(cookies, list):
         return None
@@ -4690,9 +4691,15 @@ async def execute_job(
                 await asyncio.sleep(.2)
 
         last_progress: dict[str, Any] = {}
+        business_result: dict[str, Any] | None = None
 
         async def track_progress(progress: dict[str, Any]) -> None:
-            nonlocal last_progress
+            nonlocal last_progress, business_result
+            if progress.get("_business_complete") is True:
+                # Internal handoff only: terminal publication waits for cleanup.
+                business_result = copy.deepcopy({key: value for key, value in progress.items()
+                                                 if key != "_business_complete"})
+                return
             if payload.get("assistant_consumption_plan") is not None or any(row.get("feature_type") in CHECKPOINT_RESIGN_FEATURES and
                    isinstance(row.get("data", {}).get("resign"), dict)
                    for row in progress.get("steps", [])):
@@ -4701,6 +4708,8 @@ async def execute_job(
                 await on_step(progress)
 
         def interrupted_result(status: str, message: str) -> dict[str, Any]:
+            if business_result is not None:
+                return copy.deepcopy(business_result)
             if payload.get("assistant_consumption_plan") is not None:
                 return {**copy.deepcopy(last_progress), "status": "unknown",
                         "message": "Consumption run interrupted; verify before a fresh request",
@@ -4732,7 +4741,7 @@ async def execute_job(
         except asyncio.CancelledError:
             execution.cancel()
             await asyncio.gather(execution, return_exceptions=True)
-            if last_progress:
+            if business_result is not None or last_progress:
                 return interrupted_result("canceled", "已取消")
             raise
         finally:
@@ -4741,6 +4750,9 @@ async def execute_job(
                 watcher.cancel()
             backend_watcher.cancel()
             await asyncio.gather(execution, backend_watcher, *([watcher] if watcher is not None else []), return_exceptions=True)
+            if business_result is not None:
+                await _emit_progress(on_step, business_result["status"], business_result["message"],
+                                     business_result["steps"], business_result["artifacts"])
 
 
 async def _execute_admitted_job(
@@ -4809,6 +4821,16 @@ async def _execute_admitted_job(
                 return {"status": "fail", "message": "Consumption approval plan missing or changed",
                         "steps": [], "reason": "assistant_configuration_changed"}
     consumed_steps: set[str] = set()
+    # Presence is authoritative: only old payloads may use the shared runtime.
+    model_runtimes = payload.get("feature_model_runtimes")
+    if "feature_model_runtimes" in payload and (
+        not isinstance(model_runtimes, dict)
+        or any(runtime is not None and not isinstance(runtime, dict)
+               for runtime in model_runtimes.values())
+    ):
+        return {"status": "fail", "message": "Invalid feature model runtimes",
+                "steps": [], "reason": "model_runtime_invalid"}
+    model_runtimes = copy.deepcopy(model_runtimes)
     signal_rows = payload.get("signals") or []
     signals = {
         str(item.get("signal_key")): item
@@ -4851,50 +4873,43 @@ async def _execute_admitted_job(
         f"browser={_lane.get('browser') or '-'} lease={lease_id[:12]} "
         f"profile={_lane.get('profile') or '-'}",
     )
+    from worker.page_lifecycle import JobPages
+
+    job_artifacts.pages = JobPages(None, lane, str(payload.get("job_id") or ""))
     page = None
-    if lane.context is None:
-        await manager.release_lane(lane_key, lease_id)
-        job_artifacts.log("INFO", f"释放浏览器车道 lane={lane_key} lease={lease_id[:12]}")
-        return finish("error", "车道没有可用浏览器上下文", [], [])
-    cookie_rows = payload.get("cookies")
-    if isinstance(cookie_rows, list) and cookie_rows:
-        try:
-            await lane.context.add_cookies(cookie_rows)
-            job_artifacts.log("INFO", f"已注入站点 Cookie {len(cookie_rows)} 条")
-        except asyncio.CancelledError:
-            await manager.release_lane(lane_key, lease_id)
-            raise
-        except Exception as exc:
-            await manager.release_lane(lane_key, lease_id)
-            # Browser errors can include cookie values in their call logs.
-            job_artifacts.log(
-                "ERROR", f"导入站点 Cookie 失败: {type(exc).__name__}"
-            )
-            return finish(
-                "fail",
-                f"导入站点 Cookie 失败: {type(exc).__name__}",
-                [],
-                [],
-            )
+    stage = "cookies"
+
+    async def setup_progress(stage):
+        job_artifacts.log("INFO", f"browser_setup_{stage}")
+        if on_step is not None:
+            await on_step({"status": "running", "message": f"browser_setup_{stage}",
+                           "stage": stage, "steps": [], "artifacts": job_artifacts.snapshot()})
+
     try:
-        page = await lane.context.new_page()
-        from worker.page_lifecycle import JobPages
-        job_artifacts.pages = JobPages(page, lane, str(payload.get("job_id") or ""))
-        await page.bring_to_front()
+        if lane.context is None:
+            raise RuntimeError
+        cookie_rows = payload.get("cookies")
+        if isinstance(cookie_rows, list) and cookie_rows:
+            await setup_progress(stage)
+            await job_artifacts.pages.setup(lambda: lane.context.add_cookies(cookie_rows))
+        stage = "new_page"
+        await setup_progress(stage)
+        page = await job_artifacts.pages.setup(lane.context.new_page, creates_page=True)
+        stage = "focus"
+        await setup_progress(stage)
+        await job_artifacts.pages.setup(page.bring_to_front)
         job_key = str(payload.get("job_id") or "")
         if job_key:
             lane.task_pages[job_key] = page
         job_artifacts.log("INFO", "新建任务标签页并置前")
     except BaseException as exc:
-        if getattr(job_artifacts, "pages", None) is not None:
-            await job_artifacts.pages.close()
-        await manager.release_lane(lane_key, lease_id)
+        await job_artifacts.pages.cleanup(manager, lane_key, lease_id, job_artifacts.log)
         if isinstance(exc, asyncio.CancelledError):
             raise
-        job_artifacts.log("INFO", f"释放浏览器车道 lane={lane_key} lease={lease_id[:12]}")
-        return finish(
-            "error", f"创建任务标签页失败: {type(exc).__name__}: {str(exc)[:300]}", [], []
-        )
+        reason = "browser_setup_timeout" if isinstance(exc, asyncio.TimeoutError) else "browser_setup_failed"
+        final = finish("fail" if stage == "cookies" else "error", reason, [], [])
+        final.update(reason=reason, stage=stage)
+        return final
 
     results: list[dict[str, Any]] = []
     outputs: list[dict[str, Any]] = []
@@ -5008,9 +5023,15 @@ async def _execute_admitted_job(
                 )
                 results.append(_step_result(step, "running", "执行中", started=started))
                 await emit_progress()
+                feature_type = str(step.get("feature_type") or "")
+                runtime = (model_runtimes.get(feature_type) if model_runtimes is not None
+                           else payload.get("vision"))
+                if not isinstance(runtime, dict):
+                    runtime = {}
+                selected_model = {**runtime, "execution_settings":
+                                  (payload.get("feature_execution_settings") or {}).get(feature_type, {})}
                 timeout = step.get("timeout_seconds")
                 if timeout is None:
-                    feature_type = str(step.get("feature_type") or "")
                     if feature_type == "post.buy_card":
                         step_config = step.get("config")
                         if not isinstance(step_config, dict):
@@ -5027,7 +5048,7 @@ async def _execute_admitted_job(
                     elif feature_type == "challenge.grid_captcha":
                         grid_config = step.get("config") or {}
                         refreshes = max(0, min(int(grid_config.get("max_refresh", 3)), 10))
-                        model_timeout = float((payload.get("vision") or {}).get("timeout") or 30)
+                        model_timeout = float(selected_model.get("timeout") or 30)
                         success_wait = max(1, min(int(grid_config.get("success_wait_seconds", 10)), 120))
                         timeout = min(3600, (refreshes + 1) * (model_timeout + 20 + success_wait) + 30)
                     elif feature_type in {"flow.open", "action.navigate"}:
@@ -5044,7 +5065,7 @@ async def _execute_admitted_job(
                         (payload.get("feature_execution_settings") or {}).get(feature_type, {}).get("llm_enabled")
                         and (step.get("config") or {}).get("llm_enabled") is True
                     ):
-                        timeout = min(3600, max(30, float((payload.get("vision") or {}).get("timeout") or 30) + 35))
+                        timeout = min(3600, max(30, float(selected_model.get("timeout") or 30) + 35))
                     else:
                         timeout = 30
                 step_key_value = str(step.get("step_key") or "") or None
@@ -5101,8 +5122,7 @@ async def _execute_admitted_job(
                             lane_key,
                             job_artifacts.log,
                             list(payload.get("resign_pending_dates") or []),
-                            {**(payload.get("vision") or {}), "execution_settings":
-                             (payload.get("feature_execution_settings") or {}).get(step.get("feature_type"), {})},
+                            selected_model,
                             capture_captcha,
                             credential_task,
                             dict(payload.get("plugin_runtimes") or {}),
@@ -5338,30 +5358,29 @@ async def _execute_admitted_job(
             label = "任务失败" if reason == "失败" else "任务未成功"
             await job_artifacts.capture_failure(page, None, label, reason)
         final = finish(job_status, job_message, results, outputs)
+        if on_step is not None:
+            await on_step({**final, "_business_complete": True})
         if job_status == "success":
-            exported = await _export_site_cookies(
-                lane.context,
-                str(payload.get("base_url") or ""),
-                list(payload.get("cookies") or []),
-                job_artifacts.log,
-            )
+            exported = None
+            try:
+                exported = await job_artifacts.pages.setup(lambda: _export_site_cookies(
+                    lane.context,
+                    str(payload.get("base_url") or ""),
+                    list(payload.get("cookies") or []),
+                    job_artifacts.log,
+                ))
+            except asyncio.TimeoutError:
+                job_artifacts.log("WARN", "cookie_export_timeout")
+            except Exception:
+                job_artifacts.log("WARN", "cookie_export_failed")
             if exported is not None:
                 final["cookies"] = exported
-        await emit_progress()
+                if on_step is not None:
+                    await on_step({**final, "_business_complete": True})
         return final
     finally:
         if credential_task is not None:
             if not credential_task.done():
                 credential_task.cancel()
             await asyncio.gather(credential_task, return_exceptions=True)
-        job_key = str(payload.get("job_id") or "")
-        if job_key:
-            lane.task_pages.pop(job_key, None)
-        await job_artifacts.pages.close()
-        try:
-            if lane.page is not None and not lane.task_pages:
-                await lane.page.bring_to_front()
-        except Exception:
-            pass
-        await manager.release_lane(lane_key, lease_id)
-        job_artifacts.log("INFO", f"释放浏览器车道 lane={lane_key} lease={lease_id[:12]}")
+        await job_artifacts.pages.cleanup(manager, lane_key, lease_id, job_artifacts.log)

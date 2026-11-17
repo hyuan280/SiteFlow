@@ -7,7 +7,7 @@ import { ApiError, apiRequest } from "@/api/client";
 import StringListField from "@/components/StringListField.vue";
 import { useAuthStore } from "@/stores/auth";
 import { formatServerDateTime } from "@/utils/datetime";
-import VisionSettingsCard from "@/components/VisionSettingsCard.vue";
+import ModelSettingsCard from "@/components/ModelSettingsCard.vue";
 import type { VisionView } from "@/types/integrations";
 
 interface ProxyView {
@@ -653,7 +653,7 @@ onUnmounted(() => {
     <div>
       <p class="eyebrow">SETTINGS</p>
       <h1>系统设置</h1>
-      <p class="muted">调度、代理、Vision、2FAuth、CFbox、Bitwarden、日志与截图和账户安全设置。</p>
+      <p class="muted">调度、代理、大模型、2FAuth、CFbox、Bitwarden、日志与截图和账户安全设置。</p>
     </div>
   </section>
 
@@ -666,10 +666,12 @@ onUnmounted(() => {
     class="notice"
   />
 
-  <el-row :gutter="18" v-loading="loading">
-    <el-col :xs="24" :lg="12">
-      <VisionSettingsCard v-if="integrations" :vision="integrations.vision" @updated="integrations.vision = $event" />
+  <el-row :gutter="18">
+    <el-col :xs="24" :lg="24">
+      <ModelSettingsCard @unauthorized="handleUnauthorized" />
     </el-col>
+  </el-row>
+  <el-row :gutter="18" v-loading="loading">
     <el-col :xs="24" :lg="12">
       <el-card shadow="never" class="panel">
         <template #header>

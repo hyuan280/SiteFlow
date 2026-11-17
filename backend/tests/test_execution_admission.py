@@ -165,7 +165,8 @@ def test_cookie_injection_error_releases_lease_without_logging_values(monkeypatc
         monkeypatch.setattr(manager, "release_lane", release)
         result = await executor.execute_job(manager, {"job_id": 1, "cookies": cookies})
         assert result["status"] == "fail"
-        assert "RuntimeError" in result["message"]
+        assert result["message"] == "browser_setup_failed"
+        assert result["stage"] == "cookies"
         assert "private-cookie" not in str(result)
         release.assert_awaited_once()
         assert release.await_args.args[0] == "general"
@@ -177,7 +178,7 @@ def test_cookie_injection_error_releases_lease_without_logging_values(monkeypatc
     logs = list(tmp_path.rglob("job.log"))
     assert len(logs) == 1
     log = logs[0].read_text(encoding="utf-8")
-    assert "RuntimeError" in log
+    assert "browser_setup_failed" in log
     assert "private-cookie" not in log
     captured = capsys.readouterr()
     assert "private-cookie" not in captured.out + captured.err

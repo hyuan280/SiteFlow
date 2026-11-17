@@ -28,6 +28,7 @@ TWOFAUTH_URL_KEY = "twofauth.url"
 TWOFAUTH_TOKEN_KEY = "twofauth.token"
 CFBOX_URL_KEY = "cfbox.url"
 CFBOX_API_KEY_KEY = "cfbox.api_key"
+MODEL_CONFIG_FIELDS = ("base_url", "model", "api_key", "supports_vision", "max_tokens")
 
 PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
@@ -103,6 +104,15 @@ def mask_proxy_url(value: str) -> str:
 
 
 class IntegrationService:
+    def model_env_configured(self) -> bool:
+        for field in MODEL_CONFIG_FIELDS:
+            value = getattr(self.settings, f"vision_{field}")
+            if hasattr(value, "get_secret_value"):
+                value = value.get_secret_value()
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                return True
+        return False
+
     def resolve_vision(self, field: str) -> ResolvedValue:
         value = getattr(self.settings, f"vision_{field}")
         if field == "max_tokens":
@@ -146,6 +156,12 @@ class IntegrationService:
         if max_tokens.value:
             runtime["max_tokens"] = max_tokens.value
         return runtime
+
+    def model_runtime(self, usage, *, requires_vision=False) -> dict | None:
+        from app.services.model_registry import ModelRegistryService
+        return ModelRegistryService(self.session, self.settings, self.crypto).select_runtime(
+            usage, requires_vision=requires_vision,
+        )
 
     def _vision_max_tokens_view(self) -> NumericView:
         source = (
@@ -192,69 +208,82 @@ class IntegrationService:
             editable=supports.editable,
         )
         values["max_tokens"] = self._vision_max_tokens_view()
+        if self.model_env_configured():
+            for value in values.values():
+                value.editable = False
         return VisionView(**values, available=self.vision_runtime() is not None)
 
-    def update_vision(self, **fields) -> IntegrationsView:
+    def update_vision(self, *, _commit=True, **fields) -> IntegrationsView | None:
         from app.services.vision import validate_base_url
-        pending = {}
-        for field, value in fields.items():
-            if value is None and field != "max_tokens":
-                continue
-            resolved = (
-                self._vision_max_tokens_view()
-                if field == "max_tokens"
-                else self.resolve_vision_supports_vision()
-                if field == "supports_vision"
-                else self.resolve_vision(field)
-            )
-            if not resolved.editable:
-                raise ConfigLockedError(f"Vision {field} is locked by environment")
-            if field == "max_tokens":
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    value = 0
-                if type(value) is not int or value < 0:
-                    raise IntegrationValidationError("Vision max_tokens must be a nonnegative integer")
-                pending[field] = str(value)
-                continue
-            if field == "supports_vision":
-                pending[field] = "true" if bool(value) else "false"
-                continue
-            value = value.strip()
-            if not value:
-                raise IntegrationValidationError(f"Vision {field} must not be empty")
-            if field == "base_url":
-                try:
-                    value = validate_base_url(value)
-                except ValueError as exc:
-                    raise IntegrationValidationError(str(exc)) from None
-            pending[field] = value
-        for field, value in pending.items():
-            self._upsert(f"vision.{field}", value, "api")
-        self.session.commit()
-        return self.get_integrations()
+        try:
+            if fields and self.model_env_configured():
+                raise ConfigLockedError("Model configuration is locked by environment")
+            if _commit:
+                from app.services.model_registry import ModelRegistryService
+                ModelRegistryService(self.session, self.settings, self.crypto).touch_legacy(add_primary=True)
+            pending = {}
+            for field, value in fields.items():
+                if value is None and field != "max_tokens":
+                    continue
+                resolved = (
+                    self._vision_max_tokens_view()
+                    if field == "max_tokens"
+                    else self.resolve_vision_supports_vision()
+                    if field == "supports_vision"
+                    else self.resolve_vision(field)
+                )
+                if not resolved.editable:
+                    raise ConfigLockedError(f"Vision {field} is locked by environment")
+                if field == "max_tokens":
+                    if value is None or (isinstance(value, str) and not value.strip()):
+                        value = 0
+                    if type(value) is not int or value < 0:
+                        raise IntegrationValidationError("Vision max_tokens must be a nonnegative integer")
+                    pending[field] = str(value)
+                    continue
+                if field == "supports_vision":
+                    pending[field] = "true" if bool(value) else "false"
+                    continue
+                value = value.strip()
+                if not value:
+                    raise IntegrationValidationError(f"Vision {field} must not be empty")
+                if field == "base_url":
+                    try:
+                        value = validate_base_url(value)
+                    except ValueError as exc:
+                        raise IntegrationValidationError(str(exc)) from None
+                pending[field] = value
+            for field, value in pending.items():
+                self._upsert(f"vision.{field}", value, "api")
+            if _commit:
+                self.session.commit()
+                return self.get_integrations()
+        except Exception:
+            if _commit:
+                self.session.rollback()
+            raise
 
     def delete_vision(self) -> IntegrationsView:
-        fields = ("base_url", "model", "api_key", "supports_vision", "max_tokens")
-        if any(
-            not (
-                self._vision_max_tokens_view().editable
-                if field == "max_tokens"
-                else self.resolve_vision_supports_vision().editable
-                if field == "supports_vision"
-                else self.resolve_vision(field).editable
-            )
-            for field in fields
-        ):
-            raise ConfigLockedError("Vision configuration is locked by environment")
-        for field in fields:
-            self._delete(f"vision.{field}")
-        self.session.commit()
-        return self.get_integrations()
+        try:
+            if self.model_env_configured():
+                raise ConfigLockedError("Model configuration is locked by environment")
+            from app.services.model_registry import ModelRegistryService
+            ModelRegistryService(self.session, self.settings, self.crypto).touch_legacy()
+            self._delete_vision_config()
+            self.session.commit()
+            return self.get_integrations()
+        except Exception:
+            self.session.rollback()
+            raise
 
-    def test_vision(self) -> IntegrationTestResult:
+    def _delete_vision_config(self) -> None:
+        for field in MODEL_CONFIG_FIELDS:
+            self._delete(f"vision.{field}")
+
+    def test_vision(self, *, _config=...) -> IntegrationTestResult:
         import base64
         from app.services.vision import recognize, test_text
-        config = self.vision_runtime()
+        config = self.vision_runtime() if _config is ... else _config
         if not config:
             return IntegrationTestResult(ok=False, message="Vision is not configured or invalid")
         if not config.get("supports_vision", True):
