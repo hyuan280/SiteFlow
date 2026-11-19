@@ -36,17 +36,18 @@ are not exported to the model; do not guess or materialize their values.
 A draft contains only local steps, groups and signals. Local configuration is the
 current owner's overrides and additions; resolved configuration combines template
 inheritance and server defaults for preview. Never flatten a resolved preview
-into a local draft. Each of the three draft arrays is a FULL REPLACEMENT, not a
-patch: include all intended local entries, including unchanged entries. An empty
-array removes local entries, not necessarily inherited entries. Preserve existing
+into a local draft. All three arrays are a FULL REPLACEMENT, never a patch/merge:
+include every intended local entry, even unchanged. Empty arrays remove locals,
+not inherited entries. Import preserves host-owned template binding and protected
+site metadata. Preserve existing
 step_key values when editing or overriding inherited steps, and preserve group
 and signal keys and references. Do not rename keys or duplicate inherited steps
 to express an override. Removing a local override restores inheritance; disabling
 an inherited step uses the same step_key with enabled=false when appropriate.
 Within config, objects deep-merge, arrays replace rather than append, and null
 clears an inherited value; omission inherits. Do not use null indiscriminately
-for other fields, which have their own inheritance/preservation rules. In
-particular, an existing local group's step_anchor may be preserved on null.
+for other fields, which have their own inheritance/preservation rules. A null
+group step_anchor does not retain the old local anchor in a full replacement.
 Use validate_workflow_draft in the host's authorized generation session, correct its
 safe diagnostics, and submit_workflow_draft with an explanation and explicit
 unresolved_questions for human review. Neither tool authorizes saving or running.
@@ -207,14 +208,14 @@ def tool_definitions() -> list[dict[str, Any]]:
         ),
         (
             "validate_workflow_draft",
-            "Request safe diagnostics for a local replacement draft on the host-bound target; "
-            "no save or workflow execution. Available only inside authorized generation sessions.",
+            "Safe host-bound validation: replace local steps/groups/signals, not merge. "
+            "Keep host-owned template binding/protected metadata. Authorized generation only; no save/run.",
             ValidateWorkflowDraftArgs,
         ),
         (
             "submit_workflow_draft",
-            "Present a local replacement draft for human review, with explanation and "
-            "unresolved questions; no save, approval or workflow execution. Only inside generation sessions.",
+            "Human review: draft/explanation/unresolved questions. Replace local steps/groups/signals, not merge; "
+            "keep host-owned template binding/protected metadata. Generation only; no save/approval/run.",
             SubmitWorkflowDraftArgs,
         ),
     ):

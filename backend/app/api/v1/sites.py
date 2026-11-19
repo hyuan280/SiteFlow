@@ -112,6 +112,19 @@ def update_site(
         _raise(exc)
 
 
+@router.post("/{site_id}/config/import", response_model=SiteDetail)
+def import_site_config(
+    site_id: int,
+    payload: SiteWrite,
+    service: WorkflowService = Depends(get_service),
+    _current: AuthSession = Depends(require_csrf),
+) -> SiteDetail:
+    try:
+        return service.import_site_config(site_id, payload)
+    except (WorkflowNotFoundError, WorkflowConflictError, WorkflowValidationError) as exc:
+        _raise(exc)
+
+
 @router.delete("/{site_id}", status_code=204)
 def delete_site(
     site_id: int,

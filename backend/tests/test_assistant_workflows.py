@@ -657,11 +657,15 @@ def test_corrected_import_creates_new_run_only_after_prior_run_finishes(context)
     assert tools.manager.executor.submit.call_count == 2
 
 
-def test_import_finalization_failure_rolls_back_site_history_and_action(context, monkeypatch):
+@pytest.mark.parametrize("existing", [False, True])
+def test_import_finalization_failure_rolls_back_site_history_and_action(context, monkeypatch, existing):
     from app.services.assistant_workflows import AssistantWorkflows
 
-    tools = configure(context)
+    site = make_site(context, steps=[{"step_key": "old", "feature_type": "action.wait"}]) if existing else None
+    tools = configure(context, **({"workflow_site_id": site.id} if site else {}))
     proposal_id = submit(tools)
+    with tools.manager.session_factory() as db:
+        before = tools.manager._decrypt(db.get(AssistantSession, tools.session_id))
     original = AssistantWorkflows._seal
 
     def fail_completion(self, action, value):
@@ -672,8 +676,53 @@ def test_import_finalization_failure_rolls_back_site_history_and_action(context,
     monkeypatch.setattr(AssistantWorkflows, "_seal", fail_completion)
     assert not call(tools, "import_workflow_draft", {"proposal_message_id": proposal_id})["ok"]
     with tools.manager.session_factory() as db:
-        for model in (Site, WorkflowHistory, AssistantWorkflowAction):
-            assert db.scalar(select(func.count()).select_from(model)) == 0
+        assert db.scalar(select(func.count()).select_from(Site)) == int(existing)
+        assert db.scalar(select(func.count()).select_from(WorkflowHistory)) == int(existing)
+        assert db.scalar(select(func.count()).select_from(AssistantWorkflowAction)) == 0
+        assert tools.manager._decrypt(db.get(AssistantSession, tools.session_id)) == before
+        if site:
+            assert db.get(Site, site.id).config_revision == 1
+            assert [step.step_key for step in db.scalars(select(WorkflowStep))] == ["old"]
+
+
+def test_existing_assistant_import_uses_replacement_service_without_commit(context, monkeypatch):
+    manager, _ = context
+    with manager.session_factory() as db:
+        template = WorkflowService(db, manager.settings, manager.crypto).create_template(TemplateWrite(
+            name="inherited", steps=[{"step_key": "base", "feature_type": "action.wait"}]))
+    site = make_site(context, template_id=template.id, notes="protected metadata", groups=[
+        {"group_key": "keep", "name": "Keep", "step_anchor": 6000},
+        {"group_key": "old", "name": "Old"},
+    ], steps=[{"step_key": "old", "feature_type": "action.wait"}], signals=[
+        {"signal_key": "old", "label": "Old", "include_texts": ["old"]},
+    ])
+    tools = configure(context, workflow_site_id=site.id)
+    original = WorkflowService.import_site_config
+    calls = []
+
+    def record(service, site_id, candidate, *, _commit=True):
+        assert _commit is False
+        assert candidate.template_id == template.id and candidate.notes == "protected metadata"
+        assert candidate.expected_revision == 1 and str(candidate.expected_history_key) == site.history_key
+        assert {"steps", "groups", "signals"} <= candidate.model_fields_set
+        calls.append(site_id)
+        return original(service, site_id, candidate, _commit=_commit)
+
+    monkeypatch.setattr(WorkflowService, "import_site_config", record)
+    imported, proposal_id = import_draft(tools, {
+        "steps": [{"step_key": "new", "feature_type": "action.wait", "position": 3000}],
+        "groups": [{"group_key": "keep", "name": "Keep", "step_anchor": None}], "signals": [],
+    })
+    assert calls == [site.id]
+    assert call(tools, "import_workflow_draft", {"proposal_message_id": proposal_id}) == {**imported, "replayed": True}
+    assert calls == [site.id]
+    with manager.session_factory() as db:
+        current = WorkflowService(db, manager.settings, manager.crypto).get_site(site.id)
+        assert current.template_id == template.id and current.notes == "protected metadata"
+        assert [step.step_key for step in current.steps] == ["new"]
+        assert [step.step_key for step in current.resolved.steps] == ["base", "new"]
+        assert current.signals == []
+        assert len(current.groups) == 1 and current.groups[0].step_anchor is None
 
 
 def test_new_tool_definitions_are_unique_titled_bounded_and_valid():

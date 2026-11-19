@@ -31,7 +31,7 @@ class _AssistantWorkflowService(WorkflowService):
 
         candidate, owner_id = workflow_candidate(self, self.target, {
             field: getattr(payload, field) for field in ("steps", "groups", "signals")})
-        result = super().validate_draft(owner_type, candidate, owner_id)
+        result = super().validate_draft(owner_type, candidate, owner_id, replace_local=True)
         try:
             validate_workflow_urls(result["resolved"], self.target)
         except WorkflowDenied as exc:

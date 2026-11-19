@@ -237,6 +237,16 @@ export interface SiteDetail extends SiteSummary {
   resolved: ResolvedWorkflow | null;
 }
 
+export interface SiteConfig extends Pick<SiteSummary,
+  "name" | "base_url" | "enabled" | "template_id" | "lane_policy" |
+  "support_resign" | "resign_max_days" | "bitwarden_enabled" | "credential_provider_id" |
+  "bitwarden_match_mode" | "bitwarden_custom_match" | "checkin_after" | "timezone" |
+  "tags" | "trusted_urls" | "notes"> {
+  steps: Omit<StepView, "feature_version" | "category" | "source">[];
+  groups: GroupView[];
+  signals: SignalView[];
+}
+
 export type StepEnabled = "inherit" | "on" | "off";
 
 export interface GroupForm extends GroupView {
@@ -257,6 +267,8 @@ export interface StepForm {
   on_error: string;
   timeout_seconds: number | undefined;
   isNew?: boolean;
+  importedEmptyLabel?: boolean;
+  importedEmptyCondition?: boolean;
 }
 
 export interface RunSummary {

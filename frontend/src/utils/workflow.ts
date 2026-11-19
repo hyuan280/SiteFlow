@@ -106,7 +106,8 @@ export function mergeConfig(base: ConfigObject, override: ConfigObject): ConfigO
   return result;
 }
 
-export function stepToForm(step: StepView): StepForm {
+export function stepToForm(step: Omit<StepView, "feature_version" | "category" | "source"> &
+  Partial<Pick<StepView, "feature_version" | "category" | "source">>): StepForm {
   return {
     uid: newStepUid(),
     step_key: step.step_key,

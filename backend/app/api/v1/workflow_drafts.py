@@ -50,23 +50,49 @@ def get_service(
 router = APIRouter(prefix="/api/v1", tags=["workflow"], route_class=_DraftRoute)
 
 
-def _validate(service, owner_type, payload, owner_id=None):
+def _validate(service, owner_type, payload, owner_id=None, *, replace_local=False):
     try:
-        return service.validate_draft(owner_type, payload, owner_id)
+        return service.validate_draft(owner_type, payload, owner_id, replace_local=replace_local)
     except WorkflowError as exc:
         _raise(exc)
 
 
 @router.post("/sites/validate", response_model=WorkflowDraftValidation)
-def validate_site_draft(payload: SiteWrite, service: WorkflowService = Depends(get_service)):
-    return _validate(service, "site", payload)
+def validate_site_draft(
+    payload: SiteWrite, replace_local: bool = False,
+    service: WorkflowService = Depends(get_service),
+):
+    return _validate(service, "site", payload, replace_local=replace_local)
 
 
 @router.post("/sites/{site_id}/validate", response_model=WorkflowDraftValidation)
 def validate_site_update_draft(
-    site_id: int, payload: SiteWrite, service: WorkflowService = Depends(get_service),
+    site_id: int, payload: SiteWrite, replace_local: bool = False,
+    service: WorkflowService = Depends(get_service),
 ):
-    return _validate(service, "site", payload, site_id)
+    return _validate(service, "site", payload, site_id, replace_local=replace_local)
+
+
+@router.post("/sites/config/export", response_model=SiteWrite)
+def export_site_draft(
+    payload: SiteWrite, replace_local: bool = False,
+    service: WorkflowService = Depends(get_service),
+):
+    try:
+        return service.export_site_config(payload, replace_local=replace_local)
+    except WorkflowError as exc:
+        _raise(exc)
+
+
+@router.post("/sites/{site_id}/config/export", response_model=SiteWrite)
+def export_site_update_draft(
+    site_id: int, payload: SiteWrite, replace_local: bool = False,
+    service: WorkflowService = Depends(get_service),
+):
+    try:
+        return service.export_site_config(payload, site_id, replace_local=replace_local)
+    except WorkflowError as exc:
+        _raise(exc)
 
 
 @router.post("/templates/validate", response_model=WorkflowDraftValidation)

@@ -24,6 +24,7 @@ import type {
   RunDetail,
   SignalForm,
   SiteCredential,
+  SiteConfig,
   SiteDetail,
   SiteSummary,
   StepForm,
@@ -69,6 +70,8 @@ interface EditorForm {
   tagsText: string;
   trusted_urls: string[];
   notes: string;
+  importedConfig?: boolean;
+  importedAutoLane?: boolean;
   steps: StepForm[];
   groups: GroupForm[];
   signals: SignalForm[];
@@ -154,6 +157,12 @@ const copyOpen = ref(false);
 const copying = ref(false);
 const siteImportInput = ref<HTMLInputElement | null>(null);
 const siteImporting = ref(false);
+const configImportOpen = ref(false);
+const configText = ref("");
+const configError = ref("");
+const configBusy = ref(false);
+const configFileInput = ref<HTMLInputElement | null>(null);
+let configGeneration = 0;
 
 const isEditing = computed(() => editingId.value !== null);
 const title = computed(() => (isEditing.value ? "编辑站点" : "新建站点"));
@@ -593,19 +602,28 @@ async function loadChain(templateId: number | undefined): Promise<TemplateDetail
 }
 
 async function loadTemplateChain(): Promise<void> {
+  const generation = configGeneration;
+  const templateId = form.template_id;
   if (!form.template_id) {
     chain.value = [];
     return;
   }
   try {
-    chain.value = await loadChain(form.template_id);
+    const loaded = await loadChain(templateId);
+    if (generation === configGeneration && form.template_id === templateId && editorOpen.value) chain.value = loaded;
   } catch (cause) {
     if (await handleUnauthorized(cause)) return;
-    chain.value = [];
+    if (generation === configGeneration && form.template_id === templateId && editorOpen.value) chain.value = [];
   }
 }
 
 function resetEditor(): void {
+  configGeneration += 1;
+  configImportOpen.value = false;
+  configText.value = "";
+  configError.value = "";
+  delete form.importedConfig;
+  delete form.importedAutoLane;
   editingRevision.value = null;
   editingHistoryKey.value = null;
   Object.assign(form, emptyForm());
@@ -776,7 +794,7 @@ function validate(): void {
   ) {
     throw new Error("凭据提供商自定义匹配方式需要填写匹配值");
   }
-  if (!form.template_id && !form.steps.length) {
+  if (!form.importedConfig && !form.template_id && !form.steps.length) {
     throw new Error("未选择模板时至少需要一个功能步骤");
   }
   const signalKeys = new Set<string>();
@@ -816,7 +834,142 @@ function lanePolicy(): string {
   if (form.use_proxy) {
     return form.prefer_interaction ? "proxy_interaction" : "proxy_general";
   }
-  return form.prefer_interaction ? "interaction" : "general";
+  return form.prefer_interaction ? "interaction" : form.importedAutoLane ? "auto" : "general";
+}
+
+function openConfigImport(): void {
+  configGeneration += 1;
+  configText.value = "";
+  configError.value = "";
+  configImportOpen.value = true;
+}
+
+async function readConfigFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  const generation = configGeneration;
+  const previousText = configText.value;
+  try {
+    const text = await file.text();
+    if (generation === configGeneration && configImportOpen.value && configText.value === previousText) {
+      configText.value = text;
+      configError.value = "";
+    }
+  } catch (cause) {
+    if (generation === configGeneration && configImportOpen.value) {
+      configError.value = cause instanceof Error ? cause.message : "读取配置文件失败";
+    }
+  }
+}
+
+async function exportFullConfig(): Promise<void> {
+  if (configBusy.value || loadingForm.value || saving.value) return;
+  configBusy.value = true;
+  editorError.value = "";
+  const generation = configGeneration;
+  try {
+    const url = editingId.value === null ? "/sites/config/export" : `/sites/${editingId.value}/config/export`;
+    const payload = await apiRequest<SiteConfig>(`${url}${form.importedConfig ? "?replace_local=true" : ""}`, {
+      method: "POST", body: JSON.stringify(buildPayload()),
+    });
+    if (generation !== configGeneration || !editorOpen.value) return;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = `siteflow-site-${payload.name.replace(/[\\/:*?"<>|]/g, "_")}-full.json`;
+    link.click();
+    URL.revokeObjectURL(objectUrl);
+    ElMessage.success("已导出包含模板和覆盖结果的独立配置，不含账户密码和 Cookie");
+  } catch (cause) {
+    if (await handleUnauthorized(cause)) return;
+    if (generation === configGeneration && editorOpen.value) {
+      editorError.value = cause instanceof Error ? cause.message : "导出完整配置失败";
+    }
+  } finally {
+    configBusy.value = false;
+  }
+}
+
+async function importConfig(): Promise<void> {
+  if (configBusy.value || loadingForm.value || saving.value) return;
+  configError.value = "";
+  const generation = configGeneration;
+  const before = JSON.stringify(form);
+  const current = () => generation === configGeneration && editorOpen.value && configImportOpen.value;
+  configBusy.value = true;
+  try {
+    let raw = JSON.parse(configText.value) as unknown;
+    // Accept a single entry from the existing site export as well as a plain configuration.
+    if (raw && typeof raw === "object" && !Array.isArray(raw) && "sites" in raw) {
+      const rows = parseExportFile(configText.value, "sites", "站点");
+      if (rows.length !== 1) throw new Error("整体替换导入只能包含一个站点，请使用单站点配置");
+      raw = rows[0];
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("配置必须是 JSON 对象");
+    const payload: Record<string, unknown> = { ...raw };
+    for (const key of ["steps", "groups", "signals"]) {
+      if (!Array.isArray(payload[key])) throw new Error(`完整替换配置必须提供 ${key} 数组，可为空数组`);
+    }
+    if ("template_name" in payload) {
+      const name = payload.template_name;
+      if (name !== null && typeof name !== "string") throw new Error("模板名称必须是字符串或 null");
+      const template = name ? templates.value.find(item => item.name === name) : undefined;
+      if (name && !template) throw new Error(`引用的模板不存在：${name}`);
+      payload.template_id = template?.id ?? null;
+      delete payload.template_name;
+    }
+    // File revisions belong to the source, never to the destination editor.
+    delete payload.expected_revision;
+    delete payload.expected_history_key;
+    if (editingId.value !== null) {
+      payload.expected_revision = editingRevision.value;
+      payload.expected_history_key = editingHistoryKey.value;
+    }
+    const url = editingId.value === null ? "/sites/validate" : `/sites/${editingId.value}/validate`;
+    const validated = await apiRequest<{ local: SiteConfig }>(`${url}?replace_local=true`, {
+      method: "POST", body: JSON.stringify(payload),
+    });
+    if (!current()) return;
+    const detail = validated.local;
+    const loadedChain = detail.template_id ? await loadChain(detail.template_id) : [];
+    if (!current()) return;
+    if (JSON.stringify(form) !== before) throw new Error("加载期间配置已修改，请重新导入以避免覆盖新修改");
+    try {
+      await ElMessageBox.confirm(
+        "将完整替换编辑器中的站点信息、模板绑定、步骤、分组、信号和运行设置，不合并旧配置。账户密码和 Cookie 不变。导入后仍需点击保存站点。",
+        "导入配置", { type: "warning", confirmButtonText: "替换配置", cancelButtonText: "取消" },
+      );
+    } catch { return; }
+    if (!current()) return;
+    if (JSON.stringify(form) !== before) throw new Error("配置已修改，请重新导入");
+    Object.assign(form, {
+      name: detail.name, base_url: detail.base_url, template_id: detail.template_id ?? undefined,
+      enabled: detail.enabled, prefer_interaction: ["interaction", "proxy_interaction"].includes(detail.lane_policy),
+      use_proxy: ["proxy_general", "proxy_interaction"].includes(detail.lane_policy),
+      support_resign: detail.support_resign, resign_max_days: detail.resign_max_days,
+      bitwarden_enabled: detail.bitwarden_enabled, credential_provider_id: detail.credential_provider_id ?? null,
+      bitwarden_match_mode: detail.bitwarden_match_mode, bitwarden_custom_match: detail.bitwarden_custom_match ?? "",
+      checkin_after: detail.checkin_after ?? "", timezone: detail.timezone, tagsText: detail.tags.join(", "),
+      trusted_urls: [...detail.trusted_urls], notes: detail.notes,
+      steps: detail.steps.map(step => ({ ...stepToForm(step),
+        importedEmptyLabel: step.label === "", importedEmptyCondition: step.condition === "",
+      })), groups: detail.groups.map(groupToForm), signals: detail.signals.map(signalToForm),
+      importedConfig: true, importedAutoLane: detail.lane_policy === "auto",
+    });
+    configGeneration += 1;
+    chain.value = loadedChain;
+    interactionStarted.value = true;
+    configImportOpen.value = false;
+    ElMessage.success("配置已完整替换到编辑器，请检查后保存站点");
+  } catch (cause) {
+    if (await handleUnauthorized(cause)) return;
+    if (current()) configError.value = cause instanceof Error ? cause.message : "导入配置失败";
+  } finally {
+    configBusy.value = false;
+  }
 }
 
 function buildPayload(): Record<string, unknown> {
@@ -864,12 +1017,12 @@ function buildPayload(): Record<string, unknown> {
     steps: form.steps.map((step) => ({
       step_key: step.step_key,
       feature_type: step.feature_type,
-      label: step.label.trim() || null,
+      label: step.label.trim() || (step.importedEmptyLabel ? "" : null),
       group_key: step.group_key || null,
       position: step.position ?? null,
       enabled: step.enabled === "inherit" ? null : step.enabled === "on",
       config: step.config,
-      condition: step.condition || null,
+      condition: step.condition || (step.importedEmptyCondition ? "" : null),
       on_error: step.on_error || null,
       timeout_seconds: step.timeout_seconds ?? null,
     })),
@@ -1037,7 +1190,7 @@ async function loadTimezone(): Promise<void> {
 }
 
 async function save(closeAfter = true, successMessage = "站点已保存"): Promise<void> {
-  if (saving.value || loadingForm.value) return;
+  if (saving.value || loadingForm.value || configBusy.value) return;
   editorError.value = "";
   try {
     if (editingId.value !== null && (editingRevision.value === null || !editingHistoryKey.value)) throw new Error("请重新打开站点以加载配置版本和对象身份");
@@ -1048,9 +1201,9 @@ async function save(closeAfter = true, successMessage = "站点已保存"): Prom
   }
   saving.value = true;
   try {
-    const url = editingId.value === null ? "/sites" : `/sites/${editingId.value}`;
+    const url = editingId.value === null ? "/sites" : `/sites/${editingId.value}${form.importedConfig ? "/config/import" : ""}`;
     const saved = await apiRequest<SiteDetail>(url, {
-      method: editingId.value === null ? "POST" : "PUT",
+      method: editingId.value === null || form.importedConfig ? "POST" : "PUT",
       body: JSON.stringify(buildPayload()),
     });
     editingId.value = saved.id;
@@ -1291,7 +1444,7 @@ onMounted(() => {
       </div>
       <div class="head-actions">
         <el-button @click="closeEditor">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="() => save()">保存站点</el-button>
+        <el-button type="primary" :loading="saving" :disabled="loadingForm || configBusy" @click="() => save()">保存站点</el-button>
       </div>
     </div>
 
@@ -1319,6 +1472,10 @@ onMounted(() => {
             >
               复制站点配置
             </el-button>
+          </div>
+          <div class="head-actions">
+            <el-button size="small" plain :disabled="loadingForm || saving || configBusy" @click="exportFullConfig">导出完整配置</el-button>
+            <el-button size="small" plain :disabled="loadingForm || saving || configBusy" @click="openConfigImport">导入配置</el-button>
           </div>
         </div>
       </template>
@@ -1768,6 +1925,18 @@ onMounted(() => {
     </el-card>
   </section>
 
+  <el-dialog v-model="configImportOpen" title="导入配置" width="min(760px, 96vw)" :close-on-click-modal="false">
+    <p class="muted">粘贴配置 JSON 或选择文件。支持完整解析后的独立配置，也支持包含模板和覆盖步骤的普通配置。导入会完整替换，不会合并现有配置。</p>
+    <el-alert v-if="configError" :title="configError" type="error" :closable="false" show-icon class="notice" />
+    <input ref="configFileInput" type="file" accept=".json,application/json" hidden @change="readConfigFile" />
+    <el-button :disabled="configBusy" @click="configFileInput?.click()">选择 JSON 文件</el-button>
+    <el-input v-model="configText" type="textarea" :rows="16" :disabled="configBusy" placeholder="粘贴站点配置 JSON" aria-label="站点配置 JSON" class="config-input" />
+    <template #footer>
+      <el-button :disabled="configBusy" @click="configImportOpen = false">取消</el-button>
+      <el-button type="primary" :loading="configBusy" :disabled="!configText.trim()" @click="importConfig">校验并导入</el-button>
+    </template>
+  </el-dialog>
+
   <CopyConfigDialog
     v-model="copyOpen"
     title="复制站点配置"
@@ -1807,6 +1976,11 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.config-input {
+  margin-top: 12px;
+  font-family: monospace;
+}
+
 .page-head {
   display: flex;
   align-items: flex-end;

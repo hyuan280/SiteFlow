@@ -271,7 +271,7 @@ class AssistantWorkflows:
                     raise WorkflowDenied("credential_site_required")
             service = self._service(db)
             candidate, owner_id = workflow_candidate(service, target, proposal.draft.model_dump(mode="json"))
-            preview = service.validate_draft("site", candidate, owner_id)
+            preview = service.validate_draft("site", candidate, owner_id, replace_local=True)
             validate_workflow_urls(preview["resolved"], target)
             # Reapply the authoring policy to the EXACT encrypted submission, not
             # model import arguments, against today's feature schemas and defaults.
@@ -291,7 +291,7 @@ class AssistantWorkflows:
             if owner_id is None:
                 saved = service.create_site(candidate, _commit=False)
             else:
-                saved = service.update_site(owner_id, candidate, _commit=False)
+                saved = service.import_site_config(owner_id, candidate, _commit=False)
             site = db.get(Site, saved.id)
             target = {**target, "workflow_site_id": site.id, "_workflow_binding": workflow_binding(site)}
             if target.get("site_id") == site.id:

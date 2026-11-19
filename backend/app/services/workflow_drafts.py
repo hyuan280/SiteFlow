@@ -85,10 +85,13 @@ def validate_draft(
     owner_id: int | None,
     *,
     preserve_local: bool = False,
+    replace_local: bool = False,
 ) -> dict:
     model = {OWNER_SITE: SiteWrite, OWNER_TEMPLATE: TemplateWrite}.get(owner_type)
     if model is None or not isinstance(payload, model):
         raise WorkflowValidationError("Invalid workflow type or payload")
+    if replace_local:
+        service._check_local_collections(payload)
 
     # No caches or mutable inputs from the caller participate in candidate resolution.
     context = _DraftWorkflowService(service.session, service.settings, service.crypto, service.actor)
@@ -119,12 +122,13 @@ def validate_draft(
     if isinstance(payload, SiteWrite):
         values["tags_json"] = json.dumps(values.pop("tags"), ensure_ascii=False)
         values["trusted_urls_json"] = json.dumps(values.pop("trusted_urls"), ensure_ascii=False)
-        if existing is not None and "trusted_urls" not in payload.model_fields_set:
+        if existing is not None and not replace_local and "trusted_urls" not in payload.model_fields_set:
             values["trusted_urls_json"] = existing.trusted_urls_json
     candidate = owner_model(id=candidate_id, **values)
 
     groups = sorted(context._group_rows(
-        owner_type, candidate_id, payload.groups, preserve_null=preserve_local), key=lambda row: row.position)
+        owner_type, candidate_id, payload.groups,
+        preserve_null=preserve_local or replace_local), key=lambda row: row.position)
     steps = context._step_rows(owner_type, candidate_id, payload.steps)
     signals = context._signal_rows(owner_type, candidate_id, payload.signals)
 

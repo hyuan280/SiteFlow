@@ -452,6 +452,7 @@ try {
       form, ApiError, nextTick: async callback => { callback?.(); },
       editorGeneration: 0, siteImportGeneration: 0, siteImportOpen: ref(false),
       siteImportLoading: ref(false), preserveImportedLocal: ref(false), disposed: false,
+      configGeneration: 0, configImportOpen: ref(false), configText: ref(""), configError: ref(""), configBusy: ref(false),
       editingId: ref(null), editingRevision: ref(null), editingHistoryKey: ref(null), editorOpen: ref(false),
       editorError: ref(""), loadingForm: ref(false), saving: ref(false), interactionStarted: ref(false),
       formBaseline: ref(""), credentialBaseline: ref(""), chain: ref([]), groupsLocked: ref(false),

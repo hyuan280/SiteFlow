@@ -23,7 +23,8 @@ const functions = ["emptyForm", "emptyCredential", "selectedTemplateId", "truste
 const variables = ["features", "editorOpen", "editingId", "editingRevision", "editingHistoryKey", "saving", "editorError",
   "formBaseline", "credentialBaseline", "loadingForm", "interactionStarted", "form", "chain", "credential",
   "credentialUsername", "credentialPassword", "credentialError", "cookieInput", "cookieError", "credentialTab",
-  "hasCredentialInputs", "formDirty", "credentialDirty", "dirty", "chainSignals", "signalOptions", "availableSignals"];
+  "hasCredentialInputs", "formDirty", "credentialDirty", "dirty", "chainSignals", "signalOptions", "availableSignals",
+  "configGeneration", "configImportOpen", "configText", "configError", "configBusy"];
 const declarations = ast.statements.filter(node =>
   ts.isFunctionDeclaration(node) && functions.includes(node.name?.text) ||
   ts.isVariableStatement(node) && node.declarationList.declarations.some(item => variables.includes(item.name.getText(ast))));

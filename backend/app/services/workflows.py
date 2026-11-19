@@ -1524,13 +1524,14 @@ class WorkflowService(WorkflowHistoryMixin):
 
     def validate_draft(
         self, owner_type: str, payload: SiteWrite | TemplateWrite, owner_id: int | None = None,
-        *, preserve_local: bool = False,
+        *, preserve_local: bool = False, replace_local: bool = False,
     ) -> dict:
         from app.services.workflow_drafts import validate_draft
 
         with self.session.no_autoflush:
             try:
-                return validate_draft(self, owner_type, payload, owner_id, preserve_local=preserve_local)
+                return validate_draft(self, owner_type, payload, owner_id,
+                                      preserve_local=preserve_local, replace_local=replace_local)
             except WorkflowError:
                 raise
             except (ValueError, KeyError, TypeError) as exc:
@@ -1740,8 +1741,69 @@ class WorkflowService(WorkflowHistoryMixin):
             raise WorkflowConflictError("站点名称冲突") from exc
         return result
 
+    @staticmethod
+    def _check_local_collections(payload: SiteWrite | TemplateWrite) -> None:
+        if not {"steps", "groups", "signals"} <= payload.model_fields_set:
+            raise WorkflowValidationError("steps, groups and signals must all be explicitly supplied")
+
+    def export_site_config(
+        self, payload: SiteWrite, site_id: int | None = None, *, replace_local: bool = False,
+    ) -> SiteWrite:
+        draft = self.validate_draft(OWNER_SITE, payload, site_id, replace_local=replace_local)
+        local = draft["local"]
+        resolved = draft["resolved"]
+        for key, model in (("steps", StepInput), ("groups", GroupInput), ("signals", SignalInput)):
+            local[key] = [
+                {field: item[field] for field in model.model_fields}
+                for item in resolved[key]
+                if key != "signals" or item["source"] != "system"
+            ]
+        local["template_id"] = None
+        steps, groups = local["steps"], local["groups"]
+        ungrouped_positions = [step["position"] for step in steps if step["group_key"] is None]
+        positions = [step["position"] for step in steps] + [
+            group[field] for group in groups for field in ("position", "step_anchor")
+            if group[field] is not None
+        ]
+        if (len(set(ungrouped_positions)) != len(ungrouped_positions)
+                or any(not 0 <= position <= 1_000_000_000 for position in positions)):
+            group_positions = {}
+            for step in steps:
+                key = step["group_key"]
+                group_positions[key] = min(group_positions.get(key, step["position"]), step["position"])
+            # Match _finalize's sorted anchor slots, including empty groups and ties.
+            anchors = sorted(
+                group["step_anchor"] if group["step_anchor"] is not None else
+                group_positions.get(group["group_key"], 0)
+                for group in groups
+            )
+            coordinates = sorted(
+                {(anchor, 0, 0) for anchor in anchors}
+                | {(step["position"], 1, index) for index, step in enumerate(steps)}
+            )
+            ranks = {coordinate: rank for rank, coordinate in enumerate(coordinates, 1)}
+            for index, group in enumerate(groups):
+                group["position"] = index + 1
+                group["step_anchor"] = ranks[(anchors[index], 0, 0)]
+            for index, step in enumerate(steps):
+                step["position"] = ranks[(step["position"], 1, index)]
+        result = SiteWrite.model_validate(local)
+        # Validate the standalone replacement, without retaining destination anchors.
+        self.validate_draft(OWNER_SITE, result.model_copy(update={
+            "expected_revision": payload.expected_revision,
+            "expected_history_key": payload.expected_history_key,
+        }), site_id, replace_local=True)
+        return result
+
     @atomic_workflow_write
-    def update_site(self, site_id: int, payload: SiteWrite, *, _restored_from=None, _revision_claimed=False, _commit: bool = True) -> SiteDetail:
+    def import_site_config(self, site_id: int, payload: SiteWrite, *, _commit: bool = True) -> SiteDetail:
+        self._check_local_collections(payload)
+        if payload.expected_revision is None or payload.expected_history_key is None:
+            raise WorkflowValidationError("Expected revision and history key are required")
+        return self.update_site(site_id, payload, _replace_local=True, _commit=_commit)
+
+    @atomic_workflow_write
+    def update_site(self, site_id: int, payload: SiteWrite, *, _restored_from=None, _revision_claimed=False, _replace_local: bool = False, _commit: bool = True) -> SiteDetail:
         site = self._get_site(site_id)
         if not _revision_claimed:
             self._cas_revision(site, payload.expected_revision, payload.expected_history_key)
@@ -1754,7 +1816,7 @@ class WorkflowService(WorkflowHistoryMixin):
         )
         site.name = payload.name
         site.base_url = payload.base_url
-        if "trusted_urls" in payload.model_fields_set:
+        if _replace_local or "trusted_urls" in payload.model_fields_set:
             site.trusted_urls_json = json.dumps(payload.trusted_urls, ensure_ascii=False)
         site.enabled = payload.enabled
         site.template_id = payload.template_id
@@ -1771,7 +1833,8 @@ class WorkflowService(WorkflowHistoryMixin):
         site.notes = payload.notes
         site.updated_at = _utcnow()
         try:
-            self._replace_groups(OWNER_SITE, site.id, payload.groups, preserve_null=_restored_from is not None)
+            self._replace_groups(OWNER_SITE, site.id, payload.groups,
+                                 preserve_null=_restored_from is not None or _replace_local)
             self._replace_steps(OWNER_SITE, site.id, payload.steps)
             self.session.flush()
             self._check_removed_signals(OWNER_SITE, site.id, payload.signals)

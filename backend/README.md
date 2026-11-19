@@ -66,6 +66,11 @@ GET    /api/v1/sites/{id}
 PUT    /api/v1/sites/{id}
 DELETE /api/v1/sites/{id}
 GET    /api/v1/sites/{id}/resolved
+POST   /api/v1/sites/validate
+POST   /api/v1/sites/{id}/validate
+POST   /api/v1/sites/config/export
+POST   /api/v1/sites/{id}/config/export
+POST   /api/v1/sites/{id}/config/import
 GET    /api/v1/sites/{id}/credential
 PUT    /api/v1/sites/{id}/credential
 DELETE /api/v1/sites/{id}/credential
@@ -78,6 +83,49 @@ POST   /api/v1/runs/{id}/cancel
 
 All workflow endpoints require a session; mutations also require
 `X-CSRF-Token`. See `docs/feature-model.md` for resolution semantics.
+
+## Site Configuration Transfer
+
+Export accepts the current unsaved `SiteWrite` body, not just a saved site ID,
+and returns `SiteWrite`. Use the ID route for an existing site's draft so its
+`expected_revision` and `expected_history_key` are checked against that site;
+use the route without an ID for a new draft. Export uses read-only draft
+resolution, returns `Cache-Control: no-store`, and does not write history or
+refresh authentication activity. Both routes require authentication and CSRF.
+
+The result materializes the complete template chain plus local overrides and
+effective feature defaults. It has `template_id=null` and null CAS fields, strips
+resolved-only metadata and system signals, and preserves group anchors, effective
+positions, disabled entries and ordering. System signal references in conditions
+remain valid because the server supplies those signals again on import. Like the
+manual editor, exported configuration can contain private authored values; treat
+it as sensitive rather than model-safe data.
+
+Import accepts `SiteWrite`, returns `SiteDetail`, and requires non-null
+`expected_revision` and `expected_history_key` for the destination. `steps`,
+`groups` and `signals` must each be explicitly supplied, including empty arrays
+when clearing them. All three local collections are replaced, not merged with
+old local entries. A null group `step_anchor` clears its old value. Omitted
+metadata uses `SiteWrite` defaults, including an empty `trusted_urls` list.
+`template_id` may remain bound for ordinary template-plus-overrides imports,
+or be null for standalone configuration. Inheritance still merges configuration
+objects, replaces arrays and removes keys marked null. Import uses the existing
+CAS/history transaction; conflicts return 409, invalid input returns 422, and
+failed writes leave the previous configuration and history intact.
+
+For import previews, call either site validation route with
+`?replace_local=true` (default is false). This also requires all three collections
+and returns a normalized complete `SiteWrite`-compatible `local` object without
+CAS fields. Fill the form from `local`, add the current destination CAS fields,
+and save existing sites through `/config/import`. New sites still save through
+normal `POST /api/v1/sites`. Ordinary PUT/validation preservation rules are unchanged.
+When exporting an imported draft before saving, pass `?replace_local=true` to
+the export route too, so old null-anchor preservation cannot affect the export.
+
+Assistant imports call `import_site_config(site_id, payload, _commit=False)`
+directly, retaining the outer consent/binding/receipt transaction and protected
+metadata checks. They preserve template binding; model tools cannot unbind a
+template. Import standalone `template_id=null` configuration manually instead.
 
 ## Container
 
