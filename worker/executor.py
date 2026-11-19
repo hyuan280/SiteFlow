@@ -4843,7 +4843,6 @@ async def _execute_admitted_job(
     if not isinstance(cfbox, dict):
         cfbox = None
 
-    job_artifacts = JobArtifacts(payload)
     credential_task: asyncio.Task[dict[str, str]] | None = None
     payment_steps: set[str] = set()
     resign_dispatched_steps: set[str] = set()
@@ -4864,18 +4863,31 @@ async def _execute_admitted_job(
             "artifacts": job_artifacts.snapshot(),
         }
 
-    job_artifacts.log("INFO", f"申请浏览器车道 lane={lane_key}")
-    lease_id, _lane = await manager.lease_lane(lane_key)
-    lane = manager.get(lane_key)
-    job_artifacts.log(
-        "INFO",
-        f"浏览器就绪 lane={lane_key} display={_lane.get('display') or '-'} "
-        f"browser={_lane.get('browser') or '-'} lease={lease_id[:12]} "
-        f"profile={_lane.get('profile') or '-'}",
-    )
     from worker.page_lifecycle import JobPages
 
-    job_artifacts.pages = JobPages(None, lane, str(payload.get("job_id") or ""))
+    lane = manager.get(lane_key)
+    pages = JobPages(None, lane, str(payload.get("job_id") or ""))
+    if "dispatch_reservation" in payload:
+        lease_id, _lane = await manager.dispatch.lease_job(
+            lane_key, payload.get("run_id"), payload["dispatch_reservation"],
+            job_id=payload.get("job_id"), attempt=payload.get("attempt"),
+        )
+    else:
+        lease_id, _lane = await manager.lease_lane(lane_key)
+    try:
+        # Claims must succeed before JobArtifacts can truncate an existing log.
+        job_artifacts = JobArtifacts(payload)
+        job_artifacts.pages = pages
+        job_artifacts.log("INFO", f"申请浏览器车道 lane={lane_key}")
+        job_artifacts.log(
+            "INFO",
+            f"浏览器就绪 lane={lane_key} display={_lane.get('display') or '-'} "
+            f"browser={_lane.get('browser') or '-'} lease={lease_id[:12]} "
+            f"profile={_lane.get('profile') or '-'}",
+        )
+    except BaseException:
+        await pages.cleanup(manager, lane_key, lease_id, lambda *_args: None)
+        raise
     page = None
     stage = "cookies"
 

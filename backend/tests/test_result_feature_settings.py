@@ -11,6 +11,8 @@ from app.services.execution import ExecutionService
 from app.services.executor import ExecutionManager
 
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
 SETTINGS_PATH = "/api/v1/features/flow.result/settings"
 DEFAULT_SETTINGS = {
     "llm_enabled": False,

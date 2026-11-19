@@ -84,10 +84,22 @@ def test_single_auth_exhaustion_denies_fullrun_before_creation_and_submit(fullru
     scope = BrowserScope(OWNER, str(uuid4()), "private-token", "proxy_interaction", "",
                          tools.turn["deadline"] + 900)
     tools.manager.browsers[tools.session_id] = scope
-    tools.manager._worker = AsyncMock(side_effect=lambda path, payload: response(scope, payload["operation_id"]))
+
+    def worker(path, payload):
+        if path == f"{scope.session_id}/close":
+            assert payload == {"token": scope.token}
+            return {"closed": True}
+        assert path == f"{scope.session_id}/execute"
+        return response(scope, payload["operation_id"])
+
+    tools.manager._worker = AsyncMock(side_effect=worker)
     helper = AssistantExecution(tools.manager, OWNER, tools.session_id, tools.target)
     assert asyncio.run(helper.execute(arguments("auth.form_login")))["ok"]
+    tools.manager._worker.assert_awaited_once()
     assert call(tools, "run_site") == {"ok": False, "code": "auth_budget_exhausted"}
+    assert tools.manager._worker.await_count == 2
+    assert tools.manager._worker.await_args.args == (f"{scope.session_id}/close", {"token": scope.token})
+    assert tools.session_id not in tools.manager.browsers
     executor.submit.assert_not_called()
     with tools.manager.session_factory() as db:
         assert db.scalar(select(func.count()).select_from(Run)) == 0

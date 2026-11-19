@@ -13,6 +13,8 @@ from app.services.executor import ExecutionManager
 from tests.helpers import login_client
 
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
 SITE = {"name": "trusted-site", "base_url": "https://site.example"}
 PATTERNS = [r"^https://login\.example/", r"^https://site\.example/\p{L}+$"]
 

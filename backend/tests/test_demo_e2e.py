@@ -99,15 +99,32 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         browser_port = probe.getsockname()[1]
-    browser_image = os.environ.get("SITEFLOW_DEMO_BROWSER_IMAGE", "cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989")
+    # Keep the license-free fixture reproducible; new images can be tested explicitly.
+    legacy_image = "cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989"
+    browser_image = os.environ.get("SITEFLOW_DEMO_BROWSER_IMAGE", legacy_image)
+    browser_options = []
+    binary_path = os.environ.get("SITEFLOW_DEMO_BROWSER_BINARY_PATH",
+        "/root/.cloakbrowser/chromium-146.0.7680.177.5/chrome" if browser_image == legacy_image else "")
+    if binary_path:
+        browser_options.extend(["-e", f"CLOAKBROWSER_BINARY_PATH={binary_path}"])
+    browser_env = dict(os.environ)
+    # Pass a dedicated test license via the subprocess environment, never argv/logs.
+    browser_env["CLOAKBROWSER_LICENSE_KEY"] = os.environ.get("SITEFLOW_DEMO_CLOAK_LICENSE_KEY", "")
     try:
-        subprocess.run(["docker", "run", "--rm", "-d", "--name", browser_name, "--network", "host",
-            "--shm-size", "1g", "--tmpfs", "/data", "--tmpfs", "/tmp",
-            "-v", f"{x11_volume}:/tmp/.X11-unix",
-            "-e", "AUTH_TOKEN=isolated-browser-token", "-e", "CLOAKBROWSER_AUTO_UPDATE=false",
-            "-e", "CLOAKBROWSER_BINARY_PATH=/root/.cloakbrowser/chromium-146.0.7680.177.5/chrome",
-            "--entrypoint", "uvicorn", browser_image, "backend.main:app", "--host", "127.0.0.1", "--port", str(browser_port)], check=True, capture_output=True)
-        for _ in range(120):
+        try:
+            started = subprocess.run(["docker", "run", "--rm", "-d", "--name", browser_name, "--network", "host",
+                "--shm-size", "1g", "--tmpfs", "/data", "--tmpfs", "/tmp",
+                "-v", f"{x11_volume}:/tmp/.X11-unix",
+                "-e", "AUTH_TOKEN=isolated-browser-token", "-e", "CLOAKBROWSER_AUTO_UPDATE=false",
+                "-e", "CLOAKBROWSER_LICENSE_KEY", *browser_options,
+                "--entrypoint", "uvicorn", browser_image, "backend.main:app", "--host", "127.0.0.1", "--port", str(browser_port)], check=False, capture_output=True, env=browser_env)
+        except OSError:
+            pytest.fail("isolated browser container could not be started", pytrace=False)
+        if started.returncode:
+            pytest.fail("isolated browser container could not be started", pytrace=False)
+        del browser_env
+        # Current images download the licensed browser during first startup.
+        for _ in range(1200 if browser_image != legacy_image else 120):
             try:
                 if httpx.get(f"http://127.0.0.1:{browser_port}/api/health").is_success:
                     break
@@ -115,7 +132,7 @@ def test_imported_demo_real_execution(tmp_path, monkeypatch):
                 pass
             time.sleep(0.5)
         else:
-            pytest.fail("isolated browser backend did not start: " + subprocess.check_output(["docker", "logs", browser_name], stderr=subprocess.STDOUT).decode())
+            pytest.fail("isolated browser backend did not become healthy; check its license and download access", pytrace=False)
         subprocess.run(["docker", "run", "--rm", "-d", "--name", name, "--network", "host",
             "-e", f"SITEFLOW_BROWSER_URL=http://127.0.0.1:{browser_port}", "-e", "SITEFLOW_BROWSER_TOKEN=isolated-browser-token",
             "-v", f"{x11_volume}:/tmp/.X11-unix:ro",

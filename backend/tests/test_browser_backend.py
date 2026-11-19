@@ -9,20 +9,35 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from worker.browser_backend import ManagerBackend, create_backend  # noqa: E402
+from worker.browser_backend import BrowserCapacityError, ManagerBackend, create_backend  # noqa: E402
 
 
-@pytest.mark.parametrize("tier,version", [("pro", "155"), ("keyless", "155")])
-def test_rejects_non_keyless_backend(tmp_path, tier, version):
+@pytest.mark.parametrize("status,message", [
+    ({"license_tier": "none", "binary_version": ""}, "requires a valid CloakBrowser license key"),
+    ({"license_tier": "unknown"}, "unsupported license tier"),
+    ({}, "unsupported license tier"),
+    ({"license_tier": None}, "unsupported license tier"),
+    ({"license_tier": ["free"]}, "unsupported license tier"),
+    ([], "invalid status"),
+])
+def test_rejects_unlicensed_or_invalid_backend_before_profile_mutation(tmp_path, status, message):
     async def run():
         backend = ManagerBackend(tmp_path)
+        calls = []
         async def request(*args, **kwargs):
-            return {"license_tier": tier, "binary_version": version}
+            calls.append((args, kwargs))
+            return status
         backend.request = request
-        # The version gate must precede profile creation and browser connection.
         try:
-            with pytest.raises(RuntimeError, match="keyless"):
+            with pytest.raises(RuntimeError, match=message) as error:
                 await backend.start("general", None)
+            if status == {"license_tier": "none", "binary_version": ""}:
+                assert "CLOAKBROWSER_LICENSE_KEY in the Compose .env" in str(error.value)
+                assert "docker compose up -d --force-recreate browser" in str(error.value)
+                assert "CloakBrowser Manager Settings" in str(error.value)
+                assert "SITEFLOW_BROWSER_TOKEN is not a license key" in str(error.value)
+            assert calls == [(("GET", "/api/status"), {})]
+            assert not backend.state_path.exists()
         finally:
             await backend.close()
     asyncio.run(run())
@@ -44,6 +59,91 @@ def test_remote_error_does_not_leak_response(tmp_path):
             with pytest.raises(RuntimeError) as error:
                 await backend.request("GET", "/api/status")
             assert str(error.value) == "Browser backend returned HTTP 403"
+        finally:
+            await backend.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("code,message", [
+    (402, "concurrent profile limit reached"),
+    (403, "license rejected"),
+    (409, "Browser backend returned HTTP 409"),
+])
+def test_launch_errors_are_static_and_private(tmp_path, code, message):
+    async def run():
+        backend = ManagerBackend(tmp_path)
+        await backend.client.aclose()
+        backend.client = httpx.AsyncClient(base_url="http://browser", transport=httpx.MockTransport(
+            lambda request: httpx.Response(code, json={"detail": {"message": "private-key-and-proxy"}})))
+        try:
+            with pytest.raises(RuntimeError, match=message) as error:
+                await backend.request("POST", "/api/profiles/owned/launch")
+            assert isinstance(error.value, BrowserCapacityError) is (code == 402)
+            assert "private-key-and-proxy" not in str(error.value)
+            if code == 403:
+                assert "CLOAKBROWSER_LICENSE_KEY" in str(error.value)
+                assert "recreate the browser service" in str(error.value)
+        finally:
+            await backend.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["launch", "connect", "context", "humanize", "cancel"])
+def test_licensed_launch_failure_cleans_only_owned_profile(monkeypatch, tmp_path, failure):
+    calls = []
+
+    class Browser:
+        contexts = [] if failure == "context" else [SimpleNamespace()]
+
+        async def close(self):
+            calls.append("disconnect")
+
+    async def connect(*args, **kwargs):
+        if failure == "connect":
+            raise RuntimeError("connect failed")
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        return Browser()
+
+    class Playwright:
+        async def start(self):
+            return SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=connect), stop=self.stop)
+
+        async def stop(self):
+            pass
+
+    def humanize(context):
+        if failure == "humanize":
+            raise RuntimeError("humanize failed")
+
+    monkeypatch.setitem(sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=Playwright))
+    monkeypatch.setitem(sys.modules, "worker.browser_input", SimpleNamespace(humanize_actions=humanize))
+
+    async def run():
+        backend = ManagerBackend(tmp_path)
+
+        async def request(method, path, **kwargs):
+            calls.append((method, path))
+            if path == "/api/status":
+                return {"license_tier": "free", "binary_version": "156.0.8078.47.1"}
+            if path == "/api/profiles":
+                return {"id": "owned/123"}
+            if path.endswith("/status"):
+                return {"status": "stopped"}
+            if path.endswith("/launch") and failure == "launch":
+                raise RuntimeError("license rejected")
+            return {}
+
+        backend.request = request
+        try:
+            error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+            with pytest.raises(error):
+                await backend.start("general", None)
+            assert calls[-2:] == [("POST", "/api/profiles/owned%2F123/stop"),
+                                  ("GET", "/api/profiles/owned%2F123/status")]
+            assert ("disconnect" in calls) == (failure in {"context", "humanize"})
+            assert all(not isinstance(call, tuple) or call[1] in {"/api/status", "/api/profiles", "/api/profiles/owned%2F123"}
+                       or call[1].startswith("/api/profiles/owned%2F123/") for call in calls)
         finally:
             await backend.close()
     asyncio.run(run())
@@ -107,15 +207,20 @@ def test_shutdown_only_disconnects_then_stops_mapped_profile(tmp_path):
         calls = []
         async def disconnect():
             calls.append("disconnect")
+        status = "running"
         async def request(method, path):
+            nonlocal status
             calls.append((method, path))
-            return {"status": "running"}
+            if method == "POST":
+                status = "stopped"
+            return {"status": status}
         backend.request = request
         try:
             await backend.stop(SimpleNamespace(browser=SimpleNamespace(close=disconnect), profile_id="owned"))
             assert calls == [
                 "disconnect", ("GET", "/api/profiles/owned/status"),
                 ("POST", "/api/profiles/owned/stop"),
+                ("GET", "/api/profiles/owned/status"),
             ]
         finally:
             await backend.close()
@@ -149,6 +254,7 @@ def test_provider_stop_is_idempotent(tmp_path, initial_status):
             expected = ["disconnect", ("GET", "/api/profiles/owned%2F123/status")]
             if initial_status == "running":
                 expected.append(("POST", "/api/profiles/owned%2F123/stop"))
+                expected.append(("GET", "/api/profiles/owned%2F123/status"))
             expected.extend(["disconnect", ("GET", "/api/profiles/owned%2F123/status")])
             assert calls == expected
         finally:
@@ -198,21 +304,33 @@ def test_provider_stop_runs_even_if_cdp_close_fails(tmp_path):
         async def disconnect():
             raise RuntimeError("CDP close failed")
 
+        status = "running"
         async def request(method, path):
+            nonlocal status
             calls.append((method, path))
-            return {"status": "running"}
+            if method == "POST":
+                status = "stopped"
+            return {"status": status}
 
         backend.request = request
         try:
             with pytest.raises(RuntimeError, match="CDP close failed"):
                 await backend.stop(SimpleNamespace(browser=SimpleNamespace(close=disconnect), profile_id="owned"))
-            assert calls == [("GET", "/api/profiles/owned/status"), ("POST", "/api/profiles/owned/stop")]
+            assert calls == [("GET", "/api/profiles/owned/status"), ("POST", "/api/profiles/owned/stop"),
+                             ("GET", "/api/profiles/owned/status")]
         finally:
             await backend.close()
     asyncio.run(run())
 
 
-def test_profile_creation_and_reuse_do_not_adopt_unrelated_profiles(monkeypatch, tmp_path):
+@pytest.mark.parametrize("tier,version", [
+    ("keyless", "146.0.7680.177.5"),
+    ("keyless", "155"),
+    ("free", "156.0.8078.47.1"),
+    ("pro", "156.0.8078.47.1"),
+    ("free", ""),
+])
+def test_profile_creation_and_reuse_do_not_adopt_unrelated_profiles(monkeypatch, tmp_path, tier, version):
     calls = []
 
     class Browser:
@@ -243,7 +361,7 @@ def test_profile_creation_and_reuse_do_not_adopt_unrelated_profiles(monkeypatch,
     async def request(method, path, **kwargs):
         calls.append((method, path, kwargs))
         if path == "/api/status":
-            return {"license_tier": "keyless", "binary_version": "146.0.7680.177.5"}
+            return {"license_tier": tier, "binary_version": version}
         if path == "/api/profiles":
             assert method == "POST"
             assert kwargs["json"]["proxy"] == "http://private-proxy:8080"
@@ -301,15 +419,20 @@ def test_prepare_stops_only_recorded_profiles_and_disables_autostart(tmp_path):
     async def run():
         backend = ManagerBackend(tmp_path)
         calls = []
+        status = "running"
         async def request(method, path, **kwargs):
+            nonlocal status
             calls.append((method, path, kwargs))
-            return {"status": "running"}
+            if method == "POST":
+                status = "stopped"
+            return {"status": status}
         backend.request = request
         try:
             await backend.prepare()
             assert calls == [
                 ("GET", "/api/profiles/owned/status", {}),
                 ("POST", "/api/profiles/owned/stop", {}),
+                ("GET", "/api/profiles/owned/status", {}),
                 ("PUT", "/api/profiles/owned", {"json": {
                     "auto_launch": False, "restore_session": False, "capture_preview": False,
                 }}),
@@ -432,11 +555,15 @@ def test_disconnected_monitor_stops_after_leases_drain_and_retries(monkeypatch, 
                 assert lane.leases == {"active"}
                 await manager.release_lane("general", "active")
             await tick()
+            assert stopped == []
+            assert lane.viewers == {"stale-viewer"}
+            await manager.viewer_release("general", "stale-viewer")
+            await tick()
             assert stopped == [session]
             assert lane.status == lane.browser == "error"
             assert lane.session is session
             assert lane.context is context and lane.page is page
-            assert lane.viewers == {"stale-viewer"}
+            assert not lane.viewers
             await tick()
             assert stopped == [session, session]
             assert lane.status == lane.browser == "stopped"

@@ -14,6 +14,7 @@ services:
       SITEFLOW_WORKER_URL: "http://worker:6300"
       SITEFLOW_ARTIFACT_ROOT: /app/artifacts
       SITEFLOW_CFBOX_API_KEY: "${SITEFLOW_CFBOX_API_KEY:-}"
+      CLOAKBROWSER_LICENSE_KEY: '${CLOAKBROWSER_LICENSE_KEY:-}'
       SITEFLOW_PLUGIN_TOKENS: '${SITEFLOW_PLUGIN_TOKENS:-{"demo":"siteflow-demo-token"}}'
     volumes:
       - siteflow_data:/app/data
@@ -83,6 +84,8 @@ services:
       SITEFLOW_BROWSER_BACKEND: cloak-manager
       SITEFLOW_BROWSER_URL: http://browser:8080
       SITEFLOW_BROWSER_TOKEN: "${SITEFLOW_BROWSER_TOKEN:?Set SITEFLOW_BROWSER_TOKEN}"
+      SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES: "${SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES:-1}"
+      CLOAKBROWSER_LICENSE_KEY: '${CLOAKBROWSER_LICENSE_KEY:-}'
     volumes:
       - worker_data:/app/data
       - siteflow_artifacts:/app/artifacts
@@ -105,14 +108,23 @@ services:
     restart: unless-stopped
 
   browser:
-    image: cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989
+    image: ${SITEFLOW_BROWSER_IMAGE:-cloakhq/cloakbrowser-manager@sha256:d3d9b86cfd94347f7356811cf8222c8bc48152725b053dc6ce2e68f541e00c14}
     environment:
       AUTH_TOKEN: "${SITEFLOW_BROWSER_TOKEN:?Set SITEFLOW_BROWSER_TOKEN}"
+      CLOAKBROWSER_LICENSE_KEY: '${CLOAKBROWSER_LICENSE_KEY:-}'
       CLOAKBROWSER_AUTO_UPDATE: "false"
-      CLOAKBROWSER_BINARY_PATH: /root/.cloakbrowser/chromium-146.0.7680.177.5/chrome
+      CLOAKBROWSER_CACHE_DIR: /var/cache/cloakbrowser
+      CLOAKBROWSER_BINARY_PATH: '${CLOAKBROWSER_BINARY_PATH:-}'
     volumes:
       - browser_data:/data
+      - browser_cache:/var/cache/cloakbrowser
       - browser_x11:/tmp/.X11-unix
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10m
     shm_size: "1gb"
     expose:
       - "8080"
@@ -183,4 +195,5 @@ volumes:
   siteflow_artifacts:
   bitwarden_data:
   browser_data:
+  browser_cache:
   browser_x11:

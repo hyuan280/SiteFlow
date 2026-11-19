@@ -6,7 +6,7 @@
 
 - 创建运行记录：全部启用站点或指定站点。
 - 每个站点生成一个 `site_job`，每个启用的工作流步骤生成 `job_steps`。
-- 不同车道可并发执行站点任务；普通车道默认并发 5，代理普通默认 3，交互车道固定 1。
+- Worker 按 `general`、`interaction`、`proxy_general`、`proxy_interaction` 优先级非抢占式分配 dispatch 预留槽；容量允许时同一 Run 可跨车道重叠执行。同车道共享任务并发上限：普通默认 5，代理普通默认 3（均可配置 1..10），交互固定 1。
 - 运行队列限制并发运行数和全局任务数。
 - 系统调度器支持 cron、固定间隔和随机时间范围。
 - 支持手动取消、取消当前步骤、超时和失败状态。
@@ -23,10 +23,11 @@
 Web POST /api/v1/runs
   → runs / site_jobs (queued)
   → ExecutionManager 运行队列 / 任务队列
-  → 按车道并发执行站点任务
+  → 一批注册所有初始非空车道的 dispatch ticket
+  → Worker 按优先级授予预留；获准车道才创建任务并竞争全局任务槽
   → 解析站点工作流 + 解密本地登录凭据（Bitwarden 延迟到登录步骤）
   → POST worker:/execute
-  → worker.lease_lane()
+  → Worker 校验 dispatch 预留并获取独立任务租约
   → 独立标签页逐步骤执行 / 条件与信号判断
   → 保留已完成业务结果；成功时尝试有界只读 Cookie 导出
   → 尝试清理自有页；确认后释放租约，否则后台重试
@@ -44,6 +45,131 @@ Web POST /api/v1/runs
 - 每次触发会收集所有已启用、已过 `checkin_after` 且当前没有运行中任务的站点。
 - 同一时间只允许一个调度运行在执行；站点配置只保留 `checkin_after` 单次时间。
 - cron 和随机范围按 `SITEFLOW_SCHEDULER_TIMEZONE` 计算，默认 `Asia/Shanghai`；不依赖容器系统时区。
+
+### Scheduled Browser Admission
+
+Automatic scheduling performs two-phase admission before creating any `Run`,
+`SiteJob` or job steps. The first synchronous scan resolves eligible sites with
+`WorkflowService.resolve_site()` and collects their saved execution lanes (default
+`general`). The production loop awaits `LaneService.scheduler_preflight()` and
+then repeats the scan with a one-use, at-most-10-second preflight proof. The second
+scan rechecks schedule settings, active runs, eligible sites and resolved lanes;
+new required lanes or a changed first required lane defer the entire batch.
+Database work and `ExecutionManager.submit()` stay on the event-loop thread;
+worker I/O is asynchronous.
+Direct synchronous `scan_once()` has no proof and fails closed by default.
+
+The production gate is authenticated `POST worker:/browser/preflight`, using the
+browser Bearer token, no Origin, and only `{"lanes":[...required lane keys...]}`.
+Required lanes are ordered `general`, `interaction`, `proxy_general`,
+`proxy_interaction`. Preflight starts or reuses **only the first required profile**,
+verifies its CDP connection and local `about:blank` home page, and checks the
+remaining required lanes for queue eligibility. It does not launch every lane,
+visit a business/site URL, execute workflow steps, or create a Run. Multiple
+required lanes do not fail admission merely because their count exceeds the
+profile cap: runtime dispatch queues them within the available capacity. No `Run`,
+`SiteJob` or job steps are created until the first-profile check succeeds.
+
+Worker preflight has a 120-second outer deadline; the API request allows 130
+seconds and the scheduler wrapper 135 seconds. Capacity protection is fail-fast
+for this gate, not a 120-second seat queue wait. No redirects or environment proxy
+trust are allowed; the uncompressed response is limited to 64 KiB. Admission
+requires backend `cloak-manager`, literal `ready=true`, the expected `first_lane`,
+and known, unique lane keys with literal boolean flags covering every required
+lane. Provider reasons, extra fields and seat-count claims are not evidence and
+are not logged. Remote HTTP 402/capacity rejection, failed startup/CDP/home-page
+checks, missing/false flags, unsupported backends, unknown/pending license state,
+missing authentication, malformed responses or request failures all defer with
+no Run and no business actions. Preflight does not write license settings.
+
+Existing authenticated `GET worker:/browser/readiness` remains **read-only metadata
+only**, based on backend status and all four lane flags. It does not create or
+launch profiles, acquire leases, or call `/api/settings`. A healthy response or
+eligible stopped lane is not launch proof; this GET is not the production
+scheduler admission gate. Recognized license tiers are `keyless`, `free` and `pro`;
+`none`/unknown tiers and pending or uncertain settings fail closed.
+
+Cron and interval deferrals preserve the original overdue `next_run_at`; recovery
+creates one current run, not a backlog. Random scheduling retries within the
+current due window with `next_run_at` set to the scan time, then recalculates the
+next window when that window expires. Each scheduler instance logs one warning
+when browser admission becomes deferred, using the static reason
+`browser_or_required_lane_unavailable` and only allowlisted required lane keys.
+Repeated deferrals and random-window expiry do not repeat the warning. One recovery
+message follows a successful first-profile preflight; it is not proof that all
+future lanes can launch. Provider and exception prose are not included in these logs.
+This admission gate applies only to automatic scheduled execution;
+manual runs and assistant execution use runtime lane admission. Preflight warms
+the first browser **without a lease or reservation**. Another run, assistant or
+viewer can contend before execution acquires it; success is point-in-time evidence,
+not a blanket guarantee of future capacity, connectivity or business success.
+
+### Lane Dispatch and Profile Queue
+
+The backend registers all initially nonempty lanes of a Run in one batch before
+creating execution tasks. Worker grants dispatch reservations from the shared
+finite profile pool with non-preemptive lane priority
+`general` -> `interaction` -> `proxy_general` -> `proxy_interaction`: priority
+orders waiting work, not eviction of active work. Only a granted ticket permits
+creation of that lane batch's execution tasks, which then compete for global job
+slots. Pending reservations do not occupy global job slots. With an effective cap
+of 2, two different lanes of the same Run can overlap; free tier's cap of 1 keeps
+different lanes sequential. Other Runs, assistants and viewers share this pool.
+
+Each lane's task concurrency is shared across Runs and assistants: general defaults
+to 5 and proxy general to 3, both configurable from 1 through 10; interaction lanes
+are fixed at 1. Tabs in one lane share a profile and the short foreground-input
+gate, not a whole-job lock. Profile capacity, lane concurrency and global job slots
+are separate limits.
+
+A granted reservation holds a pin lease until its whole lane batch joins, including
+jobs waiting for a global slot. Cross-lane fallback queues the job for the target
+lane and releases its source global job slot; it does not wait there for target
+capacity. After the source batch joins, a queued fallback joins a later target
+batch, reopening the target lane with a fresh ticket if its previous batch already
+finished. Existing explicitly allowed workflow retry/fallback policies remain in
+force; dispatch does not expand business retry budgets or authorize automatic
+replay of executed steps.
+
+Pending and granted tickets have a **60-second TTL**, renewed by the backend on a
+**1-second** cadence. Tickets are bound to an owner, Run and lane, and execution
+also checks the Worker generation and pinned session. Generation changes or lost
+reservations fail closed without automatic replay. Cancellation/finalization
+cleans up only that owner's reservations; delayed renewals cannot revive released
+tickets. Released identities remain fenced for the registry generation even after
+their detailed tombstones are compacted; bounded identity/claim storage fails
+closed on exhaustion. Each dispatched Run/job/attempt identity can be claimed
+only once, before artifact initialization or business work. Duplicate active
+requests cannot replace the original execution's cancellation handle or log.
+Expiry releases only dispatch pins, never ordinary job/cleanup leases,
+quarantined ownership or viewer protection. Public `in_use` includes dispatch pin
+leases as well as job/cleanup leases; it is not an exact running-task count.
+Dispatch shutdown uses a bounded drain and retains unfinished cleanup ownership
+so cancellation-resistant operations do not block all subsequent teardown.
+
+The worker-wide `SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES` accepts only integers 1..4
+and defaults to 1, never unlimited. Free licenses always cap it at 1 even if set
+higher. Pro/unknown capacity has no reliable Manager seat metadata, so the default
+is conservatively 1; keyless also defaults to 1. A finite operator override is a
+local resource budget, not proof of licensed entitlement or a bypass for unknown
+license tiers. Both Compose files explicitly pass this setting to Worker.
+
+An ordinary runtime lane-lease acquisition waits for capacity for at most
+**120 seconds**. A pending dispatch reservation can retry capacity acquisition
+while its ticket is renewed; 120 seconds is not a total dispatch queue deadline.
+Under pressure, the worker can immediately stop an idle SiteFlow-owned profile, even with
+`SITEFLOW_LANE_IDLE_STOP_SECONDS=0`, then reuse the freed slot for the next lane.
+It stops, never deletes: profile IDs and cookies persist for later reuse. It never
+evicts active leases, viewers, task pages or quarantined ownership; unconfirmed
+stop/launch cleanup continues to occupy capacity. Disabling timed idle shutdown
+does not pin a profile under pressure, but an open viewer does. If no safe slot
+becomes available, an ordinary bounded acquisition fails rather than evicting
+active work; a healthy pending dispatch ticket remains queued.
+
+UI manual lane start is fail-fast under capacity protection, not a queued task
+lease. Assistant full-run dispatch first closes only its own discovery browser
+session and releases its lease; it must not close other conversations' pages,
+viewers or jobs to make capacity. Later runtime contention remains possible.
 
 Turnstile/滑块/图形验证码优先在站点配置的车道用 Playwright 截图和鼠标点击执行。Turnstile 连续两次点击仍未生效时，任务自动改到交互车道重试，并使用浏览器后端的桌面能力（当前为 mss + xdotool）fallback。
 
@@ -229,6 +355,7 @@ GET  /api/v1/analytics/failures      失败分析
 SITEFLOW_EXECUTION_TIMEOUT=600       # API 到 worker 的 HTTP 超时，流式读取时限制无数据等待
 SITEFLOW_EXECUTION_MAX_RUNS=2       # 同时执行的运行数
 SITEFLOW_EXECUTION_MAX_JOBS=10      # 同时执行的站点任务数
+SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES=1  # Worker profile 上限，整数 1..4；free 始终为 1
 SITEFLOW_LANE_GENERAL_CONCURRENCY=5
 SITEFLOW_LANE_PROXY_GENERAL_CONCURRENCY=3
 SITEFLOW_ARTIFACT_ROOT=/app/artifacts
@@ -255,7 +382,7 @@ SITEFLOW_SCHEDULER_RANGES=08:00-10:00,18:00-20:00
 
 随机调度的每个范围每天最多触发一次，具体时间在范围内随机且当天稳定。环境变量存在时页面只读并显示「环境变量」来源。
 
-worker 不可达时，站点任务标记为 `error`；不会自动重试。
+已经提交执行的任务在 worker 不可达时标记为 `error`；不会自动重试。自动调度在创建运行前通过上述首个 profile 启动/CDP/本地空白主页预检，不可用时先延后，不创建失败记录。预检不预留容量，不保证后续车道或业务步骤成功；业务步骤执行后不会因容量问题自动重放。
 
 `SITEFLOW_EXECUTION_TIMEOUT` 的现有默认值仍为 600 秒，本次不改变其读取超时行为；它不是任务总时长，也不是每个步骤的总时限。API 使用 HTTPX 流式读取 worker，持续收到数据可使运行超过 600 秒；长时间没有数据仍可能触发读取超时。步骤有自己的 `timeout_seconds`，浏览器设置与焦点转换另有下述 10 秒预算，不能靠增大 600 秒来安全解除生命周期阻塞。
 
@@ -392,8 +519,8 @@ Lease release has its own **5-second wait budget**, reusing an outstanding relea
 task rather than duplicating it. Listeners/mappings are removed only after owned
 closure and creation settle. The execution slot is freed when the admitted job
 returns, so an unresolved cleanup lease does not consume all future job capacity.
-`in_use` counts leases, including quarantined cleanup, not just executing jobs:
-it must not be forced to zero while ownership is unresolved. Normal stop and idle
+`in_use` counts leases, including dispatch pins and quarantined cleanup, not just
+executing jobs: it must not be forced to zero while ownership is unresolved. Normal stop and idle
 stop remain blocked by those leases. Input quarantine is a separate constraint
 and can still block new input despite available execution slots.
 

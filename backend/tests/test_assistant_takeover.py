@@ -873,7 +873,7 @@ def test_api_auth_confirmation_cas_and_owner_scope(client, anon_client):
     assert client.get(root + "/actions").json() == {"items": []}
 
 
-def test_fake_model_turn_imports_without_rerun(ctx, monkeypatch):
+def test_fake_model_turn_imports_without_rerun(ctx, monkeypatch, fake_dispatch):
     grant(ctx, mode="autofix")
     takeover, manager, _ = ctx
     with manager.session_factory() as db:

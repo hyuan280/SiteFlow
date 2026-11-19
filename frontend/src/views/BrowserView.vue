@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 
 import { ApiError, apiRequest } from "@/api/client";
+import BrowserBackendSettingsCard from "@/components/BrowserBackendSettingsCard.vue";
 import VncViewer from "@/components/VncViewer.vue";
 import { useAuthStore } from "@/stores/auth";
 
@@ -257,6 +258,8 @@ onUnmounted(() => {
     </div>
     <el-button @click="loadLanes()">刷新状态</el-button>
   </section>
+
+  <BrowserBackendSettingsCard @unauthorized="handleUnauthorized" />
 
   <el-card shadow="never" class="panel" v-loading="lanesLoading">
     <el-alert

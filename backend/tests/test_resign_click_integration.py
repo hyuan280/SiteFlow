@@ -43,7 +43,7 @@ def _pending(manager, site_id):
 
 
 @pytest.fixture
-def integration(anon_client, monkeypatch):
+def integration(anon_client, monkeypatch, fake_dispatch):
     manager = anon_client.app.state.executor
     monkeypatch.setattr(manager, "schedule_run_notification", lambda _run_id: None)
     monkeypatch.setenv("SITEFLOW_RESIGN_CHECKPOINT_URL", BASE + CHECKPOINT_PATH)

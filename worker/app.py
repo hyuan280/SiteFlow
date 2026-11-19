@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -21,12 +22,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from worker.executor import execute_job
+from worker.dispatch import DispatchBoundary, DispatchRegistry, router as dispatch_router
 from worker.assistant_browser import (
     AssistantBrowser, CheckSelectorRequest, ClearCookiesRequest, CookieGenerationRequest, InspectRequest, NavigateRequest,
     ObserveRequest, OpenRequest, TokenRequest,
 )
 from worker.assistant_step import ExecuteRequest
-from worker.browser_backend import BrowserSession, create_backend
+from worker.browser_backend import (
+    BROWSER_SETTINGS_WRITE_UNKNOWN, BrowserCapacityError, BrowserSession, BrowserSettingsError,
+    ManagerBackend, active_profile_budget, create_backend,
+    await_browser_cleanup, observe_cleanup,
+)
 from worker.plugin_broker import (
     BrokerActionError,
     BrokerDenied,
@@ -75,6 +81,15 @@ class LaneDisabledError(RuntimeError):
 
 class LaneStartError(RuntimeError):
     pass
+
+
+class LaneCapacityError(LaneStartError):
+    pass
+
+
+SEAT_WAIT_SECONDS = 120
+SEAT_RETRY_SECONDS = 2
+SEAT_WAIT_MESSAGE = "Browser profile capacity unavailable; seat wait expired"
 
 
 class LaneNotRunningError(RuntimeError):
@@ -127,6 +142,7 @@ class LaneRuntime:
     idle_stop_seconds: int = 300
     max_concurrency: int = 1
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    cleanup_task: asyncio.Task | None = field(default=None, repr=False)
     execution_semaphore: LaneExecutionLimiter = field(
         default_factory=lambda: LaneExecutionLimiter(1), repr=False
     )
@@ -168,7 +184,7 @@ class LaneRuntime:
             "idle_stop_seconds": self.idle_stop_seconds,
             "idle_remaining": self.idle_remaining(),
             "can_start": self.enabled and self.status in ("stopped", "error") and self.in_use == 0,
-            "can_stop": self.status == "running" and self.in_use == 0,
+            "can_stop": self.status == "running" and not (self.in_use or self.viewers or self.task_pages),
             "error": self.error,
             "started_at": self.started_at,
         }
@@ -176,6 +192,7 @@ class LaneRuntime:
 
 class LaneManager:
     def __init__(self) -> None:
+        self._profile_budget = active_profile_budget()
         self.backend = create_backend(DATA_DIR)
         self.lanes: dict[str, LaneRuntime] = {}
         for definition in LANE_DEFINITIONS:
@@ -199,10 +216,18 @@ class LaneManager:
         for lane in self.lanes.values():
             lane.idle_stop_seconds = self.idle_stop_seconds
         self._idle_task: asyncio.Task | None = None
+        self._admission_lock = asyncio.Lock()
+        self._seat_changed = asyncio.Event()
+        self._seat_waiters: dict[object, str] = {}
+        self._stopping = False
+        self._remote_retry_at = 0.0
+        self._capacity_pressure = False
+        self.dispatch = DispatchRegistry(self)
 
     async def start(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         await self.backend.prepare()
+        self.dispatch.start()
         # Lanes are deliberately not started here. They are started by the UI
         # or leased by a task runner.
         self._idle_task = asyncio.create_task(self._idle_monitor(), name="lane-idle-monitor")
@@ -212,8 +237,12 @@ class LaneManager:
             SHUTDOWN_CANCEL_TIMEOUT_SECONDS, SHUTDOWN_TIMEOUT_SECONDS, shutdown_job_cleanup,
         )
 
+        self._stopping = True
+        self._seat_changed.set()
+
         async def shutdown():
             try:
+                await self.dispatch.close()
                 if self._idle_task is not None:
                     self._idle_task.cancel()
                     try:
@@ -225,15 +254,19 @@ class LaneManager:
             finally:
                 try:
                     for lane in self.lanes.values():
-                        async with lane.lock:
+                        async with self._admission_lock, lane.lock:
                             retained = {owner._cleanup_args[1] for owner in getattr(self, "_job_cleanup_owners", ())
                                         if owner.lane is lane and not owner._released}
-                            await self._stop_lane_locked(lane, force=True)
+                            try:
+                                await self._stop_lane_locked(lane, force=True)
+                            except LaneStartError:
+                                logger.warning("shutdown stop unconfirmed for %s", lane.key)
                             lane.leases.update(retained)
                 finally:
                     try:
                         await shutdown_job_cleanup(self, finalize=True)
                     finally:
+                        await self.dispatch.close()
                         async with asyncio.timeout(20):
                             await self.backend.close()
 
@@ -296,13 +329,13 @@ class LaneManager:
             await asyncio.sleep(1)
             for lane in list(self.lanes.values()):
                 if lane.session is not None and lane.session.disconnected:
-                    async with lane.lock:
+                    async with self._admission_lock, lane.lock:
                         if lane.session is None or not lane.session.disconnected:
                             continue
                         lane.status = "error"
                         lane.browser = "error"
                         lane.error = "Browser backend disconnected"
-                        if not lane.in_use:
+                        if not (lane.in_use or lane.viewers or lane.task_pages):
                             try:
                                 await self._stop_lane_locked(lane)
                             except Exception:
@@ -310,15 +343,16 @@ class LaneManager:
                     continue
                 if self.idle_stop_seconds <= 0:
                     continue
-                if lane.status != "running" or lane.in_use or lane.viewers:
+                if lane.status != "running" or lane.in_use or lane.viewers or lane.task_pages:
                     continue
                 if time.monotonic() - lane.last_activity_at < lane.idle_stop_seconds:
                     continue
-                async with lane.lock:
+                async with self._admission_lock, lane.lock:
                     if (
                         lane.status != "running"
                         or lane.in_use
                         or lane.viewers
+                        or lane.task_pages
                         or time.monotonic() - lane.last_activity_at < lane.idle_stop_seconds
                     ):
                         continue
@@ -335,57 +369,186 @@ class LaneManager:
         return lane
 
     async def start_lane(self, key: str) -> dict[str, Any]:
+        _, view = await self._admit_lane(key, lease=False, wait=False)
+        return view
+
+    async def _admit_lane(
+        self, key: str, *, lease: bool, wait: bool, verify: bool = False,
+    ) -> tuple[str | None, dict[str, Any]]:
         lane = self.get(key)
         if not lane.enabled:
-            raise LaneDisabledError(lane.error or "车道未启用")
-        async with lane.lock:
-            if lane.session is not None and lane.session.disconnected:
-                if lane.in_use:
-                    raise LaneStartError("Browser backend disconnected; active tasks are terminating")
-                lane.status = "error"
-            if lane.status == "running":
-                return lane.view()
-            await self._start_lane_locked(lane)
-            lane.last_activity_at = time.monotonic()
-            return lane.view()
+            raise LaneDisabledError(lane.error or "Lane disabled")
+        ticket = object()
+        self._seat_waiters[ticket] = key
+        order = {definition["key"]: index for index, definition in enumerate(LANE_DEFINITIONS)}
+        try:
+            async with asyncio.timeout(SEAT_WAIT_SECONDS):
+                capacity = None
+                while True:
+                    if self._stopping:
+                        raise LaneCapacityError("Browser worker is stopping")
+                    if capacity is None and (lane.status != "running" or (
+                            lane.session is not None and lane.session.disconnected)):
+                        capacity_method = getattr(self.backend, "capacity", None)
+                        # A cold status read must not block other running-lane reuse.
+                        capacity = self._profile_budget
+                        if capacity_method is not None:
+                            capacity = min(capacity, await capacity_method())
+                    async with self._admission_lock:
+                        if self._stopping:
+                            raise LaneCapacityError("Browser worker is stopping")
+                        async with lane.lock:
+                            if lane.session is not None and lane.session.disconnected:
+                                if lane.in_use or lane.viewers or lane.task_pages:
+                                    raise LaneStartError("Browser backend disconnected; lane still in use")
+                                lane.status = "error"
+                            reusable = lane.status == "running"
+                            if not reusable and (lane.in_use or lane.viewers or lane.task_pages):
+                                raise LaneStartError("Browser lane still in use; cannot restart")
+                        if not reusable and capacity is None:
+                            continue  # Lane stopped while this request was acquiring admission.
+                        first = min(self._seat_waiters.values(), key=order.__getitem__)
+                        if reusable or (key == first and time.monotonic() >= self._remote_retry_at):
+                            if not reusable:
+                                # Count quarantined launches as well as live/transitioning sessions.
+                                uncertain = getattr(self.backend, "uncertain_profiles", {})
+                                for owned_key, session in uncertain.items():
+                                    if owned_key in self.lanes and self.lanes[owned_key].session is None:
+                                        self.lanes[owned_key].session = session
+                                def occupied():
+                                    return sum(
+                                        value.session is not None or value.status in ("starting", "running", "stopping")
+                                        for value in self.lanes.values()
+                                    )
+                                for other in self.lanes.values():
+                                    if (other is lane or (not self._capacity_pressure
+                                            and occupied() - int(lane.session is not None) < capacity)):
+                                        continue
+                                    async with other.lock:
+                                        if (other.session is None or other.in_use or other.viewers
+                                                or other.task_pages):
+                                            continue
+                                        try:
+                                            await self._stop_lane_locked(other)
+                                            self._capacity_pressure = False
+                                        except LaneStartError:
+                                            pass  # Unconfirmed closure continues to consume a seat.
+                                # Replacing our own failed session does not require another seat.
+                                available = occupied() - int(lane.session is not None) < capacity
+                            else:
+                                available = True
+                            if available:
+                                async with lane.lock:
+                                    try:
+                                        if not reusable:
+                                            await self._start_lane_locked(lane)
+                                            self._capacity_pressure = False
+                                        if self._stopping:
+                                            raise LaneCapacityError("Browser worker is stopping")
+                                        if verify:
+                                            if lane.session is None:
+                                                raise LaneStartError("Browser session unavailable")
+                                            browser = getattr(lane.session, "browser", None)
+                                            connected = getattr(browser, "is_connected", None)
+                                            if connected is not None and not connected():
+                                                raise LaneStartError("Browser backend disconnected")
+                                            if lane.context is None or not lane.context.pages:
+                                                raise LaneStartError("Browser context unavailable")
+                                            await lane.context.pages[0].evaluate("() => 1")
+                                        if self._stopping:
+                                            raise LaneCapacityError("Browser worker is stopping")
+                                        lease_id = uuid.uuid4().hex if lease else None
+                                        if lease_id is not None:
+                                            lane.leases.add(lease_id)
+                                        lane.last_activity_at = time.monotonic()
+                                        return lease_id, lane.view()
+                                    except LaneCapacityError:
+                                        capacity = None
+                                        self._capacity_pressure = True
+                                        if not wait or self._stopping:
+                                            raise
+                                        self._remote_retry_at = time.monotonic() + SEAT_RETRY_SECONDS
+                        if not wait:
+                            raise LaneCapacityError("Browser profile capacity unavailable")
+                        self._seat_changed.clear()
+                    # Never hold admission or a lane lock while waiting for users to drain.
+                    delay = max(SEAT_RETRY_SECONDS, self._remote_retry_at - time.monotonic())
+                    try:
+                        await asyncio.wait_for(self._seat_changed.wait(), delay)
+                    except TimeoutError:
+                        pass
+        except TimeoutError:
+            raise LaneCapacityError(SEAT_WAIT_MESSAGE) from None
+        finally:
+            self._seat_waiters.pop(ticket, None)
+            self._seat_changed.set()
+
+    async def preflight(self, lanes: list[str]) -> dict[str, Any]:
+        required = [definition["key"] for definition in LANE_DEFINITIONS if definition["key"] in lanes]
+        supported = isinstance(self.backend, ManagerBackend)
+        flags = []
+        for definition in LANE_DEFINITIONS:
+            lane = self.lanes.get(definition["key"])
+            eligible = bool(lane is not None and lane.enabled and (
+                (lane.status == "running" and lane.session is not None and not lane.session.disconnected)
+                or (lane.status in ("stopped", "error")
+                    and not lane.in_use and not lane.viewers and not lane.task_pages)
+            ))
+            flags.append({"key": definition["key"], "ready": eligible and supported})
+        ready = False
+        reason = "unsupported_backend" if not supported else "browser_unavailable"
+        if (supported and required and not self._stopping
+                and all(item["ready"] for item in flags if item["key"] in required)):
+            try:
+                generation = self.backend.settings_generation
+                if await self.backend.execution_ready():
+                    await self._admit_lane(required[0], lease=False, wait=False, verify=True)
+                    ready = (
+                        self.backend.settings_generation == generation
+                        and not self.backend.settings_lock.locked()
+                        and not self.backend.settings_write_unknown
+                    )
+            except LaneCapacityError:
+                reason = "browser_capacity_unavailable"
+            except (LaneStartError, LaneDisabledError, TimeoutError):
+                pass
+            except Exception:
+                logger.warning("browser preflight failed")
+        if not ready:
+            for item in flags:
+                if item["key"] in required:
+                    item["ready"] = False
+        return {"backend": "cloak-manager" if supported else "unsupported", "ready": ready,
+                "lanes": flags, "first_lane": required[0] if ready else None,
+                "reason": None if ready else reason}
 
     async def stop_lane(self, key: str) -> dict[str, Any]:
         lane = self.get(key)
-        async with lane.lock:
-            if lane.in_use:
+        async with self._admission_lock, lane.lock:
+            if lane.in_use or lane.viewers or lane.task_pages:
                 raise LaneBusyError(f"车道 {key} 正在执行任务，禁止关闭")
-            if lane.status in ("stopped", "disabled"):
+            if lane.status in ("stopped", "disabled") and lane.session is None:
                 return lane.view()
             await self._stop_lane_locked(lane)
             return lane.view()
 
     async def lease_lane(self, key: str) -> tuple[str, dict[str, Any]]:
         """Task runners call this before using a lane. It auto-starts the lane."""
-        lane = self.get(key)
-        if not lane.enabled:
-            raise LaneDisabledError(lane.error or "车道未启用")
-        async with lane.lock:
-            if lane.session is not None and lane.session.disconnected:
-                if lane.in_use:
-                    raise LaneStartError("Browser backend disconnected; active tasks are terminating")
-                lane.status = "error"
-            if lane.status != "running":
-                await self._start_lane_locked(lane)
-            lease_id = uuid.uuid4().hex
-            lane.leases.add(lease_id)
-            lane.last_activity_at = time.monotonic()
-            return lease_id, lane.view()
+        return await self._admit_lane(key, lease=True, wait=True)
 
     async def release_lane(self, key: str, lease_id: str) -> dict[str, Any]:
         lane = self.get(key)
-        async with lane.lock:
+        async with self._admission_lock, lane.lock:
             lane.leases.discard(lease_id)
             lane.last_activity_at = time.monotonic()
+            self._seat_changed.set()
             return lane.view()
 
     async def viewer_acquire(self, key: str, viewer_id: str) -> dict[str, Any]:
         lane = self.get(key)
-        async with lane.lock:
+        async with self._admission_lock, lane.lock:
+            if self._stopping:
+                raise LaneNotRunningError("Browser worker is stopping")
             if lane.status != "running":
                 raise LaneNotRunningError(f"车道 {key} 未运行")
             lane.viewers.add(viewer_id)
@@ -394,9 +557,10 @@ class LaneManager:
 
     async def viewer_release(self, key: str, viewer_id: str) -> dict[str, Any]:
         lane = self.get(key)
-        async with lane.lock:
+        async with self._admission_lock, lane.lock:
             lane.viewers.discard(viewer_id)
             lane.last_activity_at = time.monotonic()
+            self._seat_changed.set()
             return lane.view()
 
     async def focus_task_page(self, key: str, job_id: str) -> dict[str, Any]:
@@ -427,9 +591,16 @@ class LaneManager:
         }
 
     async def _start_lane_locked(self, lane: LaneRuntime) -> None:
+        if self._stopping:
+            raise LaneCapacityError("Browser worker is stopping")
         if lane.status == "running":
             return
-        await self._cleanup_locked(lane, strict=True)
+        try:
+            await self._cleanup_locked(lane, strict=True)
+        except Exception:
+            raise LaneStartError("Browser backend stop failed") from None
+        if self._stopping:
+            raise LaneCapacityError("Browser worker is stopping")
         lane.status = "starting"
         lane.browser = "starting"
         lane.error = None
@@ -440,28 +611,44 @@ class LaneManager:
             lane.browser = "running"
             logger.info("lane %s connected display=%s", lane.key, lane.display)
         except BaseException as exc:
-            lane.error = f"{type(exc).__name__}: {exc}"
-            await self._cleanup_locked(lane)
+            uncertain = getattr(self.backend, "uncertain_profiles", {})
+            if lane.session is None:
+                lane.session = uncertain.get(lane.key)
+            lane.error = ("Browser profile capacity unavailable" if isinstance(exc, BrowserCapacityError)
+                          else f"{type(exc).__name__}: {exc}")
+            cleanup = asyncio.create_task(self._cleanup_locked(lane))
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
             lane.status = "error"
             lane.browser = "error"
-            if isinstance(exc, asyncio.CancelledError):
-                raise
+            self._seat_changed.set()
+            if cancelled:
+                raise asyncio.CancelledError
+            if isinstance(exc, BrowserCapacityError):
+                raise LaneCapacityError(lane.error) from exc
             logger.exception("lane %s failed to start", lane.key)
             raise LaneStartError(lane.error) from exc
 
     async def _stop_lane_locked(self, lane: LaneRuntime, *, force: bool = False) -> None:
-        if lane.status in ("stopped", "disabled"):
+        if lane.status in ("stopped", "disabled") and lane.session is None:
             return
-        if lane.in_use and not force:
+        if (lane.in_use or lane.viewers or lane.task_pages) and not force:
             raise LaneBusyError(f"车道 {lane.key} 正在执行任务，禁止关闭")
         lane.status = "stopping"
         lane.browser = "stopping"
         try:
-            await self._cleanup_locked(lane, strict=not force)
-        except Exception:
+            await self._cleanup_locked(lane, strict=True)
+        except BaseException as exc:
             lane.status = "error"
             lane.browser = "error"
             lane.error = "Browser backend stop failed"
+            self._seat_changed.set()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise LaneStartError(lane.error) from None
         lane.status = "stopped"
         lane.browser = "stopped"
@@ -469,16 +656,24 @@ class LaneManager:
         lane.error = None
         lane.leases.clear()
         lane.viewers.clear()
+        self._seat_changed.set()
         logger.info("lane %s stopped", lane.key)
 
     async def _cleanup_locked(self, lane: LaneRuntime, *, strict: bool = False) -> None:
         if lane.session is not None:
+            if lane.cleanup_task is None or lane.cleanup_task.done():
+                lane.cleanup_task = asyncio.create_task(self.backend.stop(lane.session))
+                lane.cleanup_task.add_done_callback(observe_cleanup)
             try:
-                await asyncio.wait_for(self.backend.stop(lane.session), timeout=20)
+                await await_browser_cleanup(lane.cleanup_task)
             except Exception:
                 logger.warning("failed to stop browser backend for %s", lane.key)
                 if strict:
                     raise
+                return  # Never discard ownership after an unconfirmed stop.
+            finally:
+                if lane.cleanup_task.done():
+                    lane.cleanup_task = None
             lane.session = None
         lane.context = None
         lane.page = None
@@ -829,6 +1024,8 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="SiteFlow Worker", version="0.2.0", lifespan=lifespan)
     app.add_middleware(AssistantRecoveryBodyLimit)
+    app.add_middleware(DispatchBoundary)
+    app.include_router(dispatch_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
@@ -909,12 +1106,147 @@ def create_app() -> FastAPI:
     def status() -> dict[str, Any]:
         return app.state.manager.status()
 
+    @app.get("/browser/readiness")
+    async def browser_readiness(request: Request) -> dict[str, Any]:
+        token = os.environ.get("SITEFLOW_BROWSER_TOKEN", "")
+        authorization = request.headers.get("authorization", "")
+        if ("origin" in request.headers or not token
+                or not secrets.compare_digest(authorization.encode(), f"Bearer {token}".encode())):
+            raise HTTPException(403, "Forbidden")
+        manager = app.state.manager
+        backend = manager.backend
+        supported = isinstance(backend, ManagerBackend)
+        ready = False
+        if supported:
+            try:
+                async with asyncio.timeout(10):
+                    ready = await backend.execution_ready()
+            except TimeoutError:
+                pass
+        lanes = []
+        for definition in LANE_DEFINITIONS:
+            usable = False
+            try:
+                lane = manager.get(definition["key"])
+            except HTTPException:
+                lane = None
+            if lane is not None:
+                usable = (lane.enabled and lane.status in ("stopped", "running")
+                          and (lane.session is None or not lane.session.disconnected))
+            lanes.append({"key": definition["key"], "ready": bool(ready and usable)})
+        return {
+            "backend": "cloak-manager" if supported else "unsupported", "ready": ready,
+            "lanes": lanes,
+            "reason": None if ready else "browser_unavailable" if supported else "unsupported_backend",
+        }
+
+    @app.post("/browser/preflight")
+    async def browser_preflight(request: Request) -> dict[str, Any]:
+        token = os.environ.get("SITEFLOW_BROWSER_TOKEN", "")
+        authorization = request.headers.get("authorization", "")
+        if ("origin" in request.headers or not token
+                or not secrets.compare_digest(authorization.encode(), f"Bearer {token}".encode())):
+            raise HTTPException(403, "Forbidden")
+        try:
+            body = bytearray()
+            async with asyncio.timeout(10):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > 4096:
+                        raise ValueError
+                    body.extend(chunk)
+
+            def unique_object(pairs):
+                value = dict(pairs)
+                if len(value) != len(pairs):
+                    raise ValueError
+                return value
+
+            payload = json.loads(body.decode("utf-8"), object_pairs_hook=unique_object)
+            if not isinstance(payload, dict) or set(payload) != {"lanes"}:
+                raise ValueError
+            lanes = payload["lanes"]
+            keys = {definition["key"] for definition in LANE_DEFINITIONS}
+            if (not isinstance(lanes, list) or not 1 <= len(lanes) <= len(keys)
+                    or any(not isinstance(key, str) or key not in keys for key in lanes)
+                    or len(set(lanes)) != len(lanes)):
+                raise ValueError
+        except TimeoutError:
+            raise HTTPException(408, "Browser request timed out") from None
+        except Exception:
+            raise HTTPException(422, "Invalid browser request") from None
+        try:
+            async with asyncio.timeout(120):
+                return await app.state.manager.preflight(lanes)
+        except TimeoutError:
+            return {"backend": "cloak-manager", "ready": False,
+                    "lanes": [{"key": definition["key"], "ready": False} for definition in LANE_DEFINITIONS],
+                    "first_lane": None, "reason": "browser_unavailable"}
+
+    @app.api_route("/browser/settings", methods=["GET", "PUT"])
+    async def browser_settings(request: Request) -> dict[str, Any]:
+        token = os.environ.get("SITEFLOW_BROWSER_TOKEN", "")
+        authorization = request.headers.get("authorization", "")
+        if ("origin" in request.headers or not token
+                or not secrets.compare_digest(authorization.encode(), f"Bearer {token}".encode())):
+            raise HTTPException(403, "禁止访问浏览器授权设置。")
+        backend = app.state.manager.backend
+        if not isinstance(backend, ManagerBackend):
+            return {
+                "backend": "unsupported", "connected": False,
+                "license": {"configured": False, "source": "unknown", "editable": False},
+                "license_tier": "unknown", "binary_version": None,
+                "error": "当前浏览器后端不支持授权设置。",
+            }
+        try:
+            async with asyncio.timeout(25 if request.method == "GET" else 350):
+                if request.method == "GET":
+                    return await backend.browser_settings()
+                if os.environ.get("CLOAKBROWSER_LICENSE_KEY", ""):
+                    raise HTTPException(409, "授权密钥由部署环境配置，只能在部署环境中修改。")
+                if backend.settings_write_unknown:
+                    raise HTTPException(409, BROWSER_SETTINGS_WRITE_UNKNOWN)
+                try:
+                    body = bytearray()
+                    async with asyncio.timeout(10):
+                        async for chunk in request.stream():
+                            if len(body) + len(chunk) > 8192:
+                                raise ValueError
+                            body.extend(chunk)
+
+                    def unique_object(pairs):
+                        value = dict(pairs)
+                        if len(value) != len(pairs):
+                            raise ValueError
+                        return value
+
+                    payload = json.loads(body.decode("utf-8"), object_pairs_hook=unique_object)
+                    if not isinstance(payload, dict) or set(payload) != {"license_key"}:
+                        raise ValueError
+                    key = payload["license_key"]
+                    if (not isinstance(key, str) or any(unicodedata.category(char).startswith("C") for char in key)
+                            or (key != "" and not key.strip()) or len(key.strip()) > 4096):
+                        raise ValueError
+                    key = key.strip()
+                except TimeoutError:
+                    raise HTTPException(408, "读取授权设置请求超时。") from None
+                except Exception:
+                    raise HTTPException(422, "授权设置请求无效。") from None
+                return await backend.update_browser_settings(key)
+        except (TimeoutError, asyncio.CancelledError):
+            detail = (BROWSER_SETTINGS_WRITE_UNKNOWN if backend.settings_write_unknown
+                      else "浏览器授权设置请求超时，请稍后刷新。")
+            raise HTTPException(504, detail) from None
+        except BrowserSettingsError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from None
+
     @app.post("/lanes/{key}/start")
     async def start_lane(key: str) -> dict[str, Any]:
         try:
             return await app.state.manager.start_lane(key)
         except LaneDisabledError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LaneCapacityError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except LaneStartError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -934,6 +1266,8 @@ def create_app() -> FastAPI:
             return {"lease_id": lease_id, "lane": lane}
         except LaneDisabledError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LaneCapacityError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except LaneStartError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1063,16 +1397,21 @@ def create_app() -> FastAPI:
     @app.post("/execute")
     async def execute(payload: dict[str, Any]) -> dict[str, Any]:
         job_id = str(payload.get("job_id") or uuid.uuid4().hex)
+        if job_id in ACTIVE_EXECUTIONS:
+            raise HTTPException(409, "Job already executing")
         cancel = asyncio.Event()
         ACTIVE_EXECUTIONS[job_id] = cancel
         try:
             return await execute_job(app.state.manager, payload, cancel)
         finally:
-            ACTIVE_EXECUTIONS.pop(job_id, None)
+            if ACTIVE_EXECUTIONS.get(job_id) is cancel:
+                ACTIVE_EXECUTIONS.pop(job_id, None)
 
     @app.post("/execute/stream")
     async def execute_stream(payload: dict[str, Any]) -> StreamingResponse:
         job_id = str(payload.get("job_id") or uuid.uuid4().hex)
+        if job_id in ACTIVE_EXECUTIONS:
+            raise HTTPException(409, "Job already executing")
         cancel = asyncio.Event()
         ACTIVE_EXECUTIONS[job_id] = cancel
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
@@ -1110,11 +1449,14 @@ def create_app() -> FastAPI:
                         break
                     yield json.dumps(item, ensure_ascii=False) + "\n"
             finally:
-                ACTIVE_EXECUTIONS.pop(job_id, None)
-                if not task.done():
-                    cancel.set()
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                try:
+                    if not task.done():
+                        cancel.set()
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                finally:
+                    if ACTIVE_EXECUTIONS.get(job_id) is cancel:
+                        ACTIVE_EXECUTIONS.pop(job_id, None)
 
         return StreamingResponse(
             stream(),

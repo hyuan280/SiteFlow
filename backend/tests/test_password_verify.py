@@ -15,6 +15,8 @@ from app.services.plugin_runtime import PluginRuntimeService
 from app.services.secret_providers import SecretDenied, step_provider
 
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
 PURPOSE = "auth.password_verify"
 DEFAULTS = {
     "password_selector": ["input[name='password']"],

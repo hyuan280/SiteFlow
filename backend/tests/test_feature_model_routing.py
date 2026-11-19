@@ -20,6 +20,8 @@ from app.services.integrations import IntegrationService
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from worker import executor, grid_captcha, vision
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
 RESULT = "flow.result"
 GRID = "challenge.grid_captcha"
 TEXT = {"base_url": "https://text.example/v1", "api_key": "private-text-key",

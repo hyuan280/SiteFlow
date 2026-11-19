@@ -162,7 +162,8 @@ def _read_bytes(root, relative_path):
 def _known_keys(db, tools):
     keys = [tools.config.get("api_key", "")]
     settings = tools.manager.settings
-    for name in ("vision_api_key", "cfbox_api_key", "twofauth_token", "bitwarden_token"):
+    for name in ("vision_api_key", "cfbox_api_key", "twofauth_token", "bitwarden_token",
+                 "cloakbrowser_license_key", "browser_token"):
         value = getattr(settings, name, None)
         keys.append(value.get_secret_value() if hasattr(value, "get_secret_value") else value)
     # Decrypt only configured secret values for literal replacement, never emit them.

@@ -214,6 +214,155 @@ def test_run_is_atomic_guarded_idempotent_and_assistant_audited(context):
         assert not validate_guard(db, run.id, site, tools.manager.settings, tools.manager.crypto)
 
 
+@pytest.mark.parametrize("policy", ["auto", "general", "interaction", "proxy_general", "proxy_interaction"])
+@pytest.mark.parametrize("proxy", [False, True])
+def test_run_releases_only_own_discovery_before_create_and_submit(context, monkeypatch, policy, proxy):
+    from app.services.assistant import BrowserScope
+    from app.services.execution import ExecutionService
+
+    tools = configure(context, run_lane_policy=policy, proxy=proxy)
+    import_draft(tools)
+    manager = tools.manager
+    other_id = manager.create("another-owner", CreateSession())["id"]
+    lane = "proxy_interaction" if proxy else "interaction"
+    own = BrowserScope(OWNER, str(uuid4()), "own-token", lane, "", time.monotonic() + 900)
+    other = BrowserScope("another-owner", str(uuid4()), "other-token", lane, "", time.monotonic() + 900)
+    manager.browsers.update({tools.session_id: own, other_id: other})
+    events = []
+    original_create = ExecutionService.create_run
+
+    async def close(path, payload):
+        assert path == f"{own.session_id}/close" and payload == {"token": own.token}
+        with manager.session_factory() as db:
+            assert db.scalar(select(func.count()).select_from(Run)) == 0
+        manager.executor.submit.assert_not_called()
+        await asyncio.sleep(0)
+        events.append("closed")
+        return {"closed": True}
+
+    def create_run(service, *args, **kwargs):
+        assert events == ["closed"]
+        assert manager.browsers == {other_id: other}
+        events.append("create")
+        return original_create(service, *args, **kwargs)
+
+    def submit_run(run_id):
+        assert events == ["closed", "create"]
+        assert manager.browsers == {other_id: other}
+        events.append("submit")
+
+    manager._worker = AsyncMock(side_effect=close)
+    manager.executor.submit.side_effect = submit_run
+    monkeypatch.setattr(ExecutionService, "create_run", create_run)
+    first = call(tools, "run_site")
+    assert first["ok"], first
+    assert first["lane"] == ("general" if policy == "auto" else policy)
+    assert call(tools, "run_site") == {**first, "replayed": True}
+    assert events == ["closed", "create", "submit"]
+    manager._worker.assert_awaited_once_with(f"{own.session_id}/close", {"token": own.token})
+    manager.executor.submit.assert_called_once_with(first["run_id"])
+    assert manager.browsers == {other_id: other}
+    with manager.session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(Run)) == 1
+
+
+@pytest.mark.parametrize("policy", ["auto", "general", "interaction", "proxy_general", "proxy_interaction"])
+@pytest.mark.parametrize("failure", ["exception", "unconfirmed"])
+def test_discovery_close_failure_creates_no_run_and_can_retry(context, policy, failure):
+    from app.services.assistant import BrowserScope
+
+    tools = configure(context, run_lane_policy=policy)
+    import_draft(tools)
+    manager = tools.manager
+    scope = BrowserScope(OWNER, str(uuid4()), "own-token", "proxy_interaction", "", time.monotonic() + 900)
+    manager.browsers[tools.session_id] = scope
+    manager._worker = AsyncMock(side_effect=RuntimeError("close failed")) if failure == "exception" else AsyncMock(
+        return_value={"closed": False})
+    assert not call(tools, "run_site")["ok"]
+    assert manager.browsers[tools.session_id] is scope
+    manager.executor.submit.assert_not_called()
+    with manager.session_factory() as db:
+        for model in (Run, SiteJob, AssistantRunGuard):
+            assert db.scalar(select(func.count()).select_from(model)) == 0
+        assert db.scalar(select(func.count()).select_from(AssistantWorkflowAction).where(
+            AssistantWorkflowAction.kind == "run")) == 0
+    manager._worker = AsyncMock(return_value={"closed": True})
+    first = call(tools, "run_site")
+    assert first["ok"], first
+    assert call(tools, "run_site") == {**first, "replayed": True}
+    manager._worker.assert_awaited_once_with(f"{scope.session_id}/close", {"token": scope.token})
+    manager.executor.submit.assert_called_once_with(first["run_id"])
+    with manager.session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(Run)) == 1
+
+
+@pytest.mark.parametrize("change", ["target", "status", "binding", "takeover", "browser"])
+def test_run_revalidates_authority_after_discovery_close(context, change):
+    from app.services.assistant import BrowserScope
+
+    tools = configure(context, run_lane_policy="general")
+    imported, _ = import_draft(tools)
+    manager = tools.manager
+    scope = BrowserScope(OWNER, str(uuid4()), "own-token", "proxy_interaction", "", time.monotonic() + 900)
+    manager.browsers[tools.session_id] = scope
+
+    async def close(path, payload):
+        await asyncio.sleep(0)
+        if change == "browser":
+            manager.browsers[tools.session_id] = BrowserScope(
+                OWNER, str(uuid4()), "replacement-token", "interaction", "", time.monotonic() + 900)
+            return {"closed": True}
+        with manager.session_factory() as db:
+            row = db.get(AssistantSession, tools.session_id)
+            if change == "status":
+                row.status = "idle"
+            elif change == "binding":
+                db.get(Site, imported["site_id"]).config_revision += 1
+            else:
+                data = manager._decrypt(row)
+                if change == "target":
+                    data["target"]["workflow_consent"] = False
+                else:
+                    data["_takeover"] = {}
+                manager._encrypt(row, data)
+            db.commit()
+        return {"closed": True}
+
+    manager._worker = AsyncMock(side_effect=close)
+    assert not call(tools, "run_site")["ok"]
+    manager._worker.assert_awaited_once()
+    if change == "browser":
+        assert manager.browsers[tools.session_id].token == "replacement-token"
+    manager.executor.submit.assert_not_called()
+    with manager.session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(Run)) == 0
+
+
+def test_run_checks_takeover_authority_before_closing_discovery(context):
+    from app.services.assistant import BrowserScope
+    from app.services.assistant_workflows import AssistantWorkflows
+
+    tools = configure(context)
+    import_draft(tools)
+    manager = tools.manager
+    scope = BrowserScope(OWNER, str(uuid4()), "own-token", "proxy_interaction", "", time.monotonic() + 900)
+    manager.browsers[tools.session_id] = scope
+    manager._worker = AsyncMock()
+    with manager.session_factory() as db:
+        row = db.get(AssistantSession, tools.session_id)
+        data = manager._decrypt(row)
+        data["_takeover"] = {}
+        manager._encrypt(row, data)
+        db.commit()
+    workflows = AssistantWorkflows(manager, OWNER, tools.session_id, tools.target)
+    assert asyncio.run(workflows.dispatch("run_site", {})) == {"ok": False, "code": "takeover_write_denied"}
+    manager._worker.assert_not_awaited()
+    assert manager.browsers[tools.session_id] is scope
+    manager.executor.submit.assert_not_called()
+    with manager.session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(Run)) == 0
+
+
 def test_notification_actor_is_assistant_without_rewriting_manual_history(context):
     tools = configure(context)
     import_draft(tools)
@@ -812,7 +961,9 @@ def test_repair_diagnostics_use_only_code_owned_values(context, diagnostics, exp
 
 
 @pytest.mark.parametrize("uncertain", [False, True])
-def test_real_executor_fake_worker_feedback_correction_and_uncertainty(context, monkeypatch, uncertain):
+def test_real_executor_fake_worker_feedback_correction_and_uncertainty(
+    context, monkeypatch, uncertain, fake_dispatch,
+):
     from app.services import executor as executor_module
     from app.services.assistant import BrowserScope
     from app.services.assistant_execution import AssistantExecution
@@ -835,6 +986,7 @@ def test_real_executor_fake_worker_feedback_correction_and_uncertainty(context, 
     async def worker(request):
         assert request.method == "POST" and request.url.path == "/execute/stream"
         payload = json.loads(request.content)
+        fake_dispatch.validate(payload)
         payloads.append(payload)
         assert payload["assistant_run"] is True and payload["lane_key"] == "general"
         assert payload["steps"][0]["config"]["url"] == public_url
@@ -898,7 +1050,9 @@ def test_real_executor_fake_worker_feedback_correction_and_uncertainty(context, 
             manager.browsers[tools.session_id] = scope
             from tests.test_assistant_execution import response
 
-            manager._worker = AsyncMock(side_effect=lambda path, payload: response(scope, payload["operation_id"]))
+            manager._worker = AsyncMock(side_effect=lambda path, payload: (
+                {"closed": True} if path == f"{scope.session_id}/close"
+                else response(scope, payload["operation_id"])))
             step_result = await AssistantExecution(manager, OWNER, tools.session_id, tools.target).execute({
                 "operation_id": str(uuid4()), "step": {"step_key": "click", "feature_type": "action.click",
                                                         "config": {"selector": ["#sign"]}}})

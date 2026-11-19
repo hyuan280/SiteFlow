@@ -36,7 +36,7 @@ def seal(context, row, data):
 
 
 @pytest.fixture
-def context(settings, monkeypatch):
+def context(settings, monkeypatch, fake_dispatch):
     engine = create_db_engine(settings.database_url)
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)

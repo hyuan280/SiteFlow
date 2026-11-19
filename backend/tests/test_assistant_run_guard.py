@@ -29,6 +29,9 @@ from app.services.scheduler import Scheduler
 from app.services.workflows import WorkflowService, WorkflowValidationError
 
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
+
 @pytest.fixture
 def context(settings):
     engine = create_db_engine(settings.database_url)

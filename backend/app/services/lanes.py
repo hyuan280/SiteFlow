@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from urllib.parse import urlparse
 
 import httpx
 
 from app.core.config import Settings
-from app.schemas.lane import LaneStatus, LanesResponse
+from app.schemas.lane import (
+    BROWSER_BACKEND_UNAVAILABLE, BrowserLicenseView, BrowserSettingsView, LaneStatus, LanesResponse,
+)
 
 LANE_DEFINITIONS = [
     {"key": "general", "label": "普通通用"},
@@ -25,6 +29,180 @@ class WorkerRequestError(RuntimeError):
 class LaneService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+    async def scheduler_preflight(self, lanes: set[str]) -> bool:
+        """Start/initialize the first required lane; others need only be queue-eligible."""
+        token = self.settings.browser_token
+        if not lanes or not lanes <= LANE_LABELS.keys() or token is None or not token.get_secret_value():
+            return False
+        required = [key for key in LANE_LABELS if key in lanes]
+        try:
+            async with asyncio.timeout(130):
+                async with httpx.AsyncClient(
+                    timeout=130.0, follow_redirects=False, trust_env=False,
+                ) as client:
+                    async with client.stream(
+                        "POST", f"{self.settings.worker_url.rstrip('/')}/browser/preflight",
+                        headers={
+                            "Authorization": f"Bearer {token.get_secret_value()}",
+                            "Accept-Encoding": "identity",
+                        },
+                        json={"lanes": required},
+                    ) as response:
+                        if response.status_code != 200:
+                            return False
+                        if response.headers.get("content-encoding", "identity").lower() != "identity":
+                            return False
+                        body = bytearray()
+                        async for chunk in response.aiter_raw(chunk_size=8192):
+                            if len(body) + len(chunk) > 65536:
+                                return False
+                            body.extend(chunk)
+            data = json.loads(body)
+            if not isinstance(data, dict) or data.get("backend") != "cloak-manager":
+                return False
+            if data.get("ready") is not True or data.get("first_lane") != required[0]:
+                return False
+            if not isinstance(data.get("lanes"), list):
+                return False
+            # Ignore provider extras/reasons and license seat counts, never log them.
+            available: dict[str, bool] = {}
+            for lane in data["lanes"]:
+                if not isinstance(lane, dict):
+                    return False
+                key = lane.get("key")
+                if not isinstance(key, str) or key not in LANE_LABELS or key in available:
+                    return False
+                if type(lane.get("ready")) is not bool:
+                    return False
+                available[key] = lane["ready"]
+            return all(available.get(key) is True for key in required)
+        except Exception:
+            # Startup may have completed even on timeout. Do not retry this request.
+            return False
+
+    async def scheduler_readiness(self, lanes: set[str]) -> bool:
+        """Read-only admission check; never start browsers or consult license settings."""
+        token = self.settings.browser_token
+        if not lanes or not lanes <= LANE_LABELS.keys() or token is None or not token.get_secret_value():
+            return False
+        try:
+            async with asyncio.timeout(10):
+                async with httpx.AsyncClient(
+                    timeout=10.0, follow_redirects=False, trust_env=False,
+                ) as client:
+                    async with client.stream(
+                        "GET", f"{self.settings.worker_url.rstrip('/')}/browser/readiness",
+                        headers={
+                            "Authorization": f"Bearer {token.get_secret_value()}",
+                            "Accept-Encoding": "identity",
+                        },
+                    ) as response:
+                        if response.status_code != 200:
+                            return False
+                        if response.headers.get("content-encoding", "identity").lower() != "identity":
+                            return False
+                        body = bytearray()
+                        async for chunk in response.aiter_raw(chunk_size=8192):
+                            if len(body) + len(chunk) > 65536:
+                                return False
+                            body.extend(chunk)
+            data = json.loads(body)
+            if not isinstance(data, dict) or data.get("backend") != "cloak-manager":
+                return False
+            if data.get("ready") is not True or not isinstance(data.get("lanes"), list):
+                return False
+            # Only these flags are admission evidence; ignore untrusted reason text.
+            available: dict[str, bool] = {}
+            for lane in data["lanes"]:
+                if not isinstance(lane, dict):
+                    return False
+                key = lane.get("key")
+                if not isinstance(key, str) or key not in LANE_LABELS or key in available:
+                    return False
+                if type(lane.get("ready")) is not bool:
+                    return False
+                available[key] = lane["ready"]
+            return all(available.get(key) is True for key in lanes)
+        except Exception:
+            return False
+
+    def browser_license_env_locked(self) -> bool:
+        key = self.settings.cloakbrowser_license_key
+        return bool(key.get_secret_value()) if key is not None else False
+
+    async def browser_settings(self, license_key: str | None = None) -> BrowserSettingsView:
+        if license_key is not None and self.browser_license_env_locked():
+            raise WorkerRequestError(409, "Browser license is managed by environment")
+        token = self.settings.browser_token
+        if token is None or not token.get_secret_value():
+            raise WorkerRequestError(503, BROWSER_BACKEND_UNAVAILABLE)
+        deadline = 360.0 if license_key is not None else 30.0
+        try:
+            async with asyncio.timeout(deadline):
+                async with httpx.AsyncClient(
+                    timeout=deadline, follow_redirects=False, trust_env=False,
+                ) as client:
+                    async with client.stream(
+                        "PUT" if license_key is not None else "GET",
+                        f"{self.settings.worker_url.rstrip('/')}/browser/settings",
+                        headers={
+                            "Authorization": f"Bearer {token.get_secret_value()}",
+                            "Accept-Encoding": "identity",
+                        },
+                        **({"json": {"license_key": license_key}} if license_key is not None else {}),
+                    ) as response:
+                        if response.status_code != 200:
+                            status = response.status_code
+                            errors = {
+                                409: "Browser license settings are locked",
+                                422: "Browser license key was rejected",
+                                502: BROWSER_BACKEND_UNAVAILABLE,
+                                503: BROWSER_BACKEND_UNAVAILABLE,
+                                504: "Browser settings request timed out",
+                            }
+                            raise WorkerRequestError(
+                                status if status in errors else 502,
+                                errors.get(status, BROWSER_BACKEND_UNAVAILABLE),
+                            )
+                        # Never decode compressed provider data, even if identity was ignored.
+                        if response.headers.get("content-encoding", "identity").lower() != "identity":
+                            raise WorkerRequestError(502, BROWSER_BACKEND_UNAVAILABLE)
+                        body = bytearray()
+                        async for chunk in response.aiter_raw(chunk_size=8192):
+                            if len(body) + len(chunk) > 65536:
+                                raise WorkerRequestError(502, BROWSER_BACKEND_UNAVAILABLE)
+                            body.extend(chunk)
+            data = json.loads(body)
+            if not isinstance(data, dict) or not isinstance(data.get("license"), dict):
+                raise ValueError("invalid browser settings")
+            # Project only public fields; provider errors and masks are never public data.
+            license = BrowserLicenseView.model_validate({
+                key: data["license"][key] for key in ("configured", "source", "editable")
+            })
+            if data["error"] is not None:
+                license.editable = False
+            if data["backend"] == "cloak-manager" and self.browser_license_env_locked():
+                license.configured = True
+                license.source = "env"
+                license.editable = False
+            view = BrowserSettingsView.model_validate({
+                "backend": data["backend"],
+                "connected": data["connected"],
+                "license": license,
+                "license_tier": data["license_tier"],
+                "binary_version": data["binary_version"],
+                "error": BROWSER_BACKEND_UNAVAILABLE if data["error"] is not None else None,
+            })
+        except WorkerRequestError:
+            raise
+        except (TimeoutError, httpx.TimeoutException):
+            raise WorkerRequestError(504, "Browser settings request timed out") from None
+        except (ValueError, KeyError, TypeError, RecursionError):
+            raise WorkerRequestError(502, BROWSER_BACKEND_UNAVAILABLE) from None
+        except Exception:
+            raise WorkerRequestError(503, BROWSER_BACKEND_UNAVAILABLE) from None
+        return view
 
     async def _post(self, path: str, payload: dict | None = None, *, timeout: float | None = None) -> dict:
         try:

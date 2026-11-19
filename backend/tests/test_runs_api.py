@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.models.execution import JobArtifact, JobStep, Run, SiteJob
@@ -14,6 +15,15 @@ from app.schemas.execution import RunCreate
 from app.services.credentials import CredentialService
 from app.services.execution import ExecutionService
 from app.services.executor import ExecutionManager
+from tests.test_execution_lane_waves import FakeDispatchClient
+
+
+@pytest.fixture(autouse=True)
+def dispatch_reservations(monkeypatch):
+    # Only this module's executor tests replace worker RPCs.
+    simulator = FakeDispatchClient()
+    monkeypatch.setattr(ExecutionManager, "_dispatch_client", lambda self: simulator)
+    return simulator
 
 
 class FakeExecutor:
@@ -713,7 +723,8 @@ def test_executor_passes_vision_for_image_quiz(client: TestClient) -> None:
 
         manager._post_execute = fake_execute  # type: ignore[method-assign]
         asyncio.run(manager._execute_run(run.id))
-        assert seen["vision"] == {
+        assert seen["vision"] is None
+        assert seen["feature_model_runtimes"]["sign.image_quiz"] == {
             "base_url": "https://vision.example/v1",
             "model": "vision-model",
             "api_key": "vision-secret",
@@ -727,7 +738,11 @@ def test_executor_passes_vision_for_image_quiz(client: TestClient) -> None:
         session.close()
 
 
-def test_executor_runs_different_lanes_concurrently(client: TestClient) -> None:
+@pytest.mark.parametrize("seats", [1, 2])
+def test_executor_dispatches_lanes_by_available_seats(
+    client: TestClient, dispatch_reservations, seats,
+) -> None:
+    dispatch_reservations.capacity = seats
     general = client.post(
         "/api/v1/sites",
         json={
@@ -765,8 +780,10 @@ def test_executor_runs_different_lanes_concurrently(client: TestClient) -> None:
             crypto=app.state.crypto,
         )
         state = {"active": 0, "max": 0}
+        lanes: list[str] = []
 
         async def fake_execute(payload):
+            lanes.append(payload["lane_key"])
             state["active"] += 1
             state["max"] = max(state["max"], state["active"])
             try:
@@ -780,7 +797,8 @@ def test_executor_runs_different_lanes_concurrently(client: TestClient) -> None:
         session.expire_all()
         row = session.get(Run, run.id)
         assert row is not None and row.status == "success"
-        assert state["max"] == 2
+        assert state["max"] == seats
+        assert lanes == ["general", "interaction"]
     finally:
         session.close()
 

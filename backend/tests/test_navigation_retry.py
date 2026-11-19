@@ -13,6 +13,8 @@ from app.services.execution import ExecutionService
 from app.services.executor import ExecutionManager
 
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
 KEY = "action.navigate"
 SETTINGS_PATH = f"/api/v1/features/{KEY}/settings"
 

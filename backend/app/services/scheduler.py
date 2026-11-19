@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime, time, timedelta, timezone
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -16,6 +18,7 @@ from app.models.workflow import Site
 from app.schemas.execution import RunCreate
 from app.services.execution import ExecutionService
 from app.services.executor import ExecutionManager
+from app.services.lanes import LANE_LABELS, LaneService
 from app.services.scheduler_settings import (
     SchedulerSettingsService,
     next_random_run,
@@ -24,6 +27,15 @@ from app.services.scheduler_settings import (
 from app.services.workflows import WorkflowError, WorkflowService
 
 logger = logging.getLogger("siteflow.scheduler")
+
+
+class _ScheduledBrowserPreflight(Exception):
+    def __init__(self, lanes: set[str]) -> None:
+        self.lanes = frozenset(lanes)
+
+
+class _ScheduledBrowserDeferred(Exception):
+    pass
 
 
 class Scheduler:
@@ -39,6 +51,7 @@ class Scheduler:
         self.crypto = crypto
         self.executor = executor
         self._task: asyncio.Task[None] | None = None
+        self._browser_admission_deferred = False
         try:
             self.timezone = ZoneInfo(settings.scheduler_timezone)
         except Exception:
@@ -63,7 +76,7 @@ class Scheduler:
         await asyncio.sleep(5)
         while True:
             try:
-                run_ids = self.scan_once()
+                run_ids = await self.scan_once_async()
                 if run_ids:
                     logger.info("scheduled %s run(s): %s", len(run_ids), run_ids)
             except asyncio.CancelledError:
@@ -121,12 +134,63 @@ class Scheduler:
                 due.append(site.id)
         return due
 
-    def _trigger(self, session, current: datetime) -> list[int]:
+    def _browser_ready(self, required_lanes: set[str]) -> bool:
+        # Synchronous callers have no readiness proof; never perform blocking I/O.
+        return False
+
+    async def scan_once_async(self, now: datetime | None = None) -> list[int]:
+        def preflight(lanes: set[str]) -> bool:
+            raise _ScheduledBrowserPreflight(lanes)
+
+        try:
+            return self.scan_once(now, _readiness=preflight)
+        except _ScheduledBrowserPreflight as pending:
+            required = pending.lanes
+        first_lane = next((key for key in LANE_LABELS if key in required), None)
+        try:
+            async with asyncio.timeout(135):
+                ready = await LaneService(self.settings).scheduler_preflight(set(required))
+        except Exception:
+            # Readiness failures are expected deferrals, not provider text for logs.
+            ready = False
+        checked_at = monotonic()
+        # No session or proof survives this scan. Re-resolve sites/config after the await;
+        # A subset is safe only if its first lane is the one actually initialized.
+        return self.scan_once(now, _readiness=lambda lanes: (
+            ready is True and lanes <= required
+            and next((key for key in LANE_LABELS if key in lanes), None) == first_lane
+            and monotonic() - checked_at <= 10
+        ))
+
+    def _trigger(
+        self, session, current: datetime, *,
+        _readiness: Callable[[set[str]], bool] | None = None,
+    ) -> list[int]:
         if self._active_scheduled_run(session):
             return []
         due = self._eligible_sites(session, current)
         if not due:
             return []
+        workflow = WorkflowService(session, self.settings, self.crypto)
+        site_lanes = {site_id: workflow.resolve_site(site_id).lane or "general" for site_id in due}
+        required_lanes = set(site_lanes.values())
+        if not (_readiness or self._browser_ready)(required_lanes):
+            if not self._browser_admission_deferred:
+                logger.warning(
+                    "scheduled browser admission deferred reason=browser_or_required_lane_unavailable "
+                    "required_lanes=%s",
+                    ",".join(key for key in LANE_LABELS if key in required_lanes),
+                )
+            self._browser_admission_deferred = True
+            raise _ScheduledBrowserDeferred
+        if self._browser_admission_deferred:
+            logger.info(
+                "scheduled browser admission readiness check recovered required_lanes=%s",
+                ",".join(key for key in LANE_LABELS if key in required_lanes),
+            )
+            self._browser_admission_deferred = False
+        lane_order = {key: index for index, key in enumerate(LANE_LABELS)}
+        due.sort(key=lambda site_id: lane_order[site_lanes[site_id]])
         run = ExecutionService(session, self.settings, self.crypto).create_run(
             RunCreate(site_ids=due),
             "scheduler",
@@ -136,7 +200,10 @@ class Scheduler:
         self.executor.submit(run.id)
         return [run.id]
 
-    def scan_once(self, now: datetime | None = None) -> list[int]:
+    def scan_once(
+        self, now: datetime | None = None, *,
+        _readiness: Callable[[set[str]], bool] | None = None,
+    ) -> list[int]:
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
             current = current.replace(tzinfo=timezone.utc)
@@ -185,7 +252,10 @@ class Scheduler:
                     if existing is not None:
                         continue
                     due = True
-                run_ids = self._trigger(session, current) if due else []
+                try:
+                    run_ids = self._trigger(session, current, _readiness=_readiness) if due else []
+                except _ScheduledBrowserDeferred:
+                    run_ids = []
                 # A run just created can also consume an overlapping future window.
                 for target, start_dt, end_dt in candidates:
                     existing = session.scalar(
@@ -212,7 +282,10 @@ class Scheduler:
             if current < next_run:
                 return []
             next_run = self._next_run(settings.mode, settings.cron, settings.interval_seconds, current)
-            run_ids = self._trigger(session, current)
+            try:
+                run_ids = self._trigger(session, current, _readiness=_readiness)
+            except _ScheduledBrowserDeferred:
+                return []
             settings_service.set_next_run(next_run)
             return run_ids
 

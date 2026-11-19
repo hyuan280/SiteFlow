@@ -12,6 +12,7 @@ from app.models.setting import AppSetting
 from app.models.execution import Run, SiteJob
 from app.models.workflow import Site, WorkflowStep
 from app.services.execution import ExecutionService
+from app.services.lanes import LaneService
 from app.services.scheduler import Scheduler
 from app.schemas.scheduler import SchedulerSettingsUpdate
 from app.services.scheduler_settings import (
@@ -29,6 +30,11 @@ class FakeExecutor:
 
     def submit(self, run_id: int) -> None:
         self.submitted.append(run_id)
+
+
+@pytest.fixture(autouse=True)
+def browser_ready(monkeypatch):
+    monkeypatch.setattr(Scheduler, "_browser_ready", lambda self, lanes: True)
 
 
 def _create_site(client, name: str = "scheduled-site") -> dict:
@@ -218,12 +224,17 @@ def test_scheduler_recovers_overdue_schedule_after_restart(
     executor = FakeExecutor()
 
     async def scan_on_start(self):
-        self.scan_once(current)
+        await self.scan_once_async(current)
+
+    async def preflight(self, lanes):
+        assert lanes == {"general"}
+        return True
 
     async def no_background_work(*args):
         pass
 
     monkeypatch.setattr(Scheduler, "start", scan_on_start)
+    monkeypatch.setattr(LaneService, "scheduler_preflight", preflight)
     monkeypatch.setattr(Scheduler, "stop", no_background_work)
     monkeypatch.setattr("app.services.artifacts.ArtifactCleanupRunner.start", no_background_work)
     monkeypatch.setattr("app.services.artifacts.ArtifactCleanupRunner.stop", no_background_work)
@@ -279,7 +290,7 @@ def test_scheduler_retries_overdue_schedule_after_trigger_error(client, monkeypa
     current = datetime.fromisoformat(response.json()["next_run_at"]) + timedelta(days=3)
     trigger = scheduler._trigger
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("temporary trigger failure")
 
     monkeypatch.setattr(scheduler, "_trigger", fail)
@@ -375,8 +386,8 @@ def test_random_scheduler_excludes_consumed_future_target(client, monkeypatch, c
         current, _ = scheduler._range_target(day.date(), 1, ranges[1], scheduler.timezone)
         trigger = scheduler._trigger
 
-        def trigger_at_scan_time(session, now):
-            run_ids = trigger(session, now)
+        def trigger_at_scan_time(session, now, **kwargs):
+            run_ids = trigger(session, now, **kwargs)
             for run_id in run_ids:
                 session.get(Run, run_id).created_at = now.astimezone(timezone.utc)
             session.commit()

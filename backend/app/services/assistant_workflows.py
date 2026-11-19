@@ -342,9 +342,17 @@ class AssistantWorkflows:
             from app.services.assistant_takeover import takeover_workflow_authority
 
             takeover_workflow_authority(self, db, data, operation="run")
-        # Release the discovery tab before taking the same interaction lane slot.
-        if saved_lane(self.target or {}) in {"interaction", "proxy_interaction"}:
-            await self.manager._close_browser(self.session_id)
+        # Discovery holds a browser seat even when the saved run uses another lane.
+        # Unlike best-effort cleanup, require confirmation before creating a run.
+        scope = self.manager.browsers.get(self.session_id)
+        if scope:
+            async with asyncio.timeout(5):
+                closed = await self.manager._worker(f"{scope.session_id}/close", {"token": scope.token})
+            if closed.get("closed") is not True:
+                raise WorkflowDenied("browser_close_failed")
+            if self.manager.browsers.get(self.session_id) is not scope:
+                raise WorkflowDenied("workflow_authorization_changed")
+            self.manager.browsers.pop(self.session_id)
         with self.manager.session_factory() as db:
             row, data, target = self._context(db, write=True)
             site = bound_workflow(db, target)

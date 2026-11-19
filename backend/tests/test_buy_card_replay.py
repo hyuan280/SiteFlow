@@ -19,6 +19,8 @@ from tests.test_worker_navigation import _JumpLane, _JumpManager, _JumpPage
 from worker import executor as worker_executor
 
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
 PURCHASES = [
     pytest.param({"bought": 1}, True, id="bought-without-attempt-flag"),
     pytest.param({"payment_attempted": False, "bought": 1}, True, id="bought"),

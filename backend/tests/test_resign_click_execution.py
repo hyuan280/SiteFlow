@@ -24,7 +24,7 @@ def checkpoint_feature(request):
 
 
 @pytest.fixture
-def execution(client, monkeypatch):
+def execution(client, monkeypatch, fake_dispatch):
     response = client.post("/api/v1/sites", json={
         "name": "resign-click-execution",
         "base_url": "https://pt.example.com",

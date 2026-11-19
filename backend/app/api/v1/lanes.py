@@ -1,23 +1,102 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import unicodedata
 import uuid
 from urllib.parse import urlparse
 
 import websockets
-from fastapi import APIRouter, Depends, HTTPException, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_session, get_db, get_settings, require_csrf
 from app.core.auth import SESSION_COOKIE
 from app.core.config import Settings
 from app.models.auth import AuthSession
-from app.schemas.lane import LaneFocusRequest, LaneStatus, LanesResponse
+from app.schemas.lane import BrowserSettingsView, LaneFocusRequest, LaneStatus, LanesResponse
 from app.services.auth import AuthService
 from app.services.lane_settings import LaneSettingsService
 from app.services.lanes import LaneService, WorkerRequestError
 
 router = APIRouter(prefix="/api/v1/lanes", tags=["lanes"])
+
+
+class _BrowserSettingsRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def no_store_handler(request: Request):
+            try:
+                response = await handler(request)
+            except HTTPException as exc:
+                exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+                raise
+            except RequestValidationError:
+                response = JSONResponse(status_code=422, content={"detail": "Invalid browser settings request"})
+            except Exception:
+                response = JSONResponse(status_code=500, content={"detail": "Browser settings unavailable"})
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+        return no_store_handler
+
+
+browser_settings_router = APIRouter(route_class=_BrowserSettingsRoute)
+
+
+@browser_settings_router.get("/browser-settings", response_model=BrowserSettingsView)
+async def get_browser_settings(
+    settings: Settings = Depends(get_settings),
+    _current: AuthSession = Depends(get_current_session),
+) -> BrowserSettingsView:
+    try:
+        return await LaneService(settings).browser_settings()
+    except WorkerRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+
+
+@browser_settings_router.put("/browser-settings", response_model=BrowserSettingsView)
+async def put_browser_settings(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    _current: AuthSession = Depends(require_csrf),
+) -> BrowserSettingsView:
+    service = LaneService(settings)
+    if service.browser_license_env_locked():
+        raise HTTPException(status_code=409, detail="Browser license is managed by environment")
+    try:
+        body = bytearray()
+        async with asyncio.timeout(10):
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > 8192:
+                    raise HTTPException(status_code=413, detail="Browser settings request too large")
+                body.extend(chunk)
+        # Retain pairs so duplicate keys cannot silently override a submitted value.
+        pairs = json.loads(body, object_pairs_hook=list)
+        if (not isinstance(pairs, list) or len(pairs) != 1
+                or not isinstance(pairs[0], tuple) or pairs[0][0] != "license_key"
+                or not isinstance(pairs[0][1], str)):
+            raise ValueError("invalid request")
+        raw_key = pairs[0][1]
+        key = raw_key.strip()
+        if ((raw_key != "" and not key) or len(key) > 4096
+                or any(unicodedata.category(char).startswith("C") for char in raw_key)):
+            raise ValueError("invalid key")
+    except TimeoutError:
+        raise HTTPException(status_code=408, detail="Browser settings request timed out") from None
+    except (ValueError, TypeError, RecursionError):
+        raise HTTPException(status_code=422, detail="Invalid browser license key") from None
+    try:
+        return await service.browser_settings(key)
+    except WorkerRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+
+
+router.include_router(browser_settings_router)
 
 
 @router.get("", response_model=LanesResponse)

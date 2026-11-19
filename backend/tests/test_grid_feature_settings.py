@@ -20,6 +20,8 @@ from app.services.executor import ExecutionManager
 from app.services.feature_settings import FeatureSettingsService
 
 
+pytestmark = pytest.mark.usefixtures("fake_dispatch")
+
 KEY = "challenge.grid_captcha"
 SETTINGS_PATH = f"/api/v1/features/{KEY}/settings"
 DEFAULTS = {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -17,6 +18,9 @@ from app.core.crypto import CryptoService
 from app.models.execution import JobArtifact, JobStep, Run, SiteJob
 from app.models.workflow import Site, SiteResignRecord
 from app.services.assistant_run_guard import validate_guard
+from app.services.browser_dispatch import (
+    DISPATCH_ERROR, DispatchClient, DispatchError, DispatchTicket, RunDispatch,
+)
 from app.services.credentials import CredentialError, CredentialService
 from app.services.execution import ExecutionService, FINAL_JOB_STATUSES, FINAL_RUN_STATUSES
 from app.services.integrations import IntegrationService
@@ -27,6 +31,10 @@ from app.services.secret_providers import SECRET_PURPOSES, SecretProviders, step
 from app.services.workflows import WorkflowError, WorkflowService
 
 logger = logging.getLogger("siteflow.executor")
+DISPATCH_JOIN_TIMEOUT_SECONDS = 10.0
+_dispatch_context: ContextVar[tuple[RunDispatch, DispatchTicket] | None] = ContextVar(
+    "dispatch_reservation", default=None,
+)
 
 
 class ExecutionManager:
@@ -44,6 +52,8 @@ class ExecutionManager:
         self._job_semaphore = asyncio.Semaphore(max(1, settings.execution_max_jobs))
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._active_jobs: dict[int, set[int]] = {}
+        self._run_cancel_events: dict[int, asyncio.Event] = {}
+        self._dispatch_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._notification_tasks: set[asyncio.Task[None]] = set()
 
     def submit(self, run_id: int) -> None:
@@ -55,6 +65,9 @@ class ExecutionManager:
         task.add_done_callback(lambda _task: self._tasks.pop(run_id, None))
 
     async def cancel(self, run_id: int) -> None:
+        event = self._run_cancel_events.get(run_id)
+        if event is not None:
+            event.set()
         job_ids = sorted(self._active_jobs.get(run_id, set()))
         for job_id in job_ids:
             self.secret_providers.revoke(job_id)
@@ -121,25 +134,12 @@ class ExecutionManager:
             prepared = await asyncio.to_thread(self._prepare_run, run_id)
             if prepared is None:
                 return
-            job_ids, canceled = prepared
+            _, canceled = prepared
             if canceled:
                 self._wake_run_notification(run_id)
                 return
 
-            tasks = [
-                asyncio.create_task(
-                    self._execute_job_guarded(run_id, job_id),
-                    name=f"run-{run_id}-job-{job_id}",
-                )
-                for job_id in job_ids
-            ]
-            try:
-                await asyncio.gather(*tasks)
-            except asyncio.CancelledError:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+            await self._dispatch_run(run_id)
 
             finalized = await asyncio.to_thread(self._finalize_run, run_id, _notify=False)
             if finalized is not None:
@@ -148,6 +148,160 @@ class ExecutionManager:
                 takeover = getattr(self, "takeover", None)
                 if takeover is not None:
                     takeover.wake()
+
+    def _dispatch_client(self) -> DispatchClient:
+        return DispatchClient(self.settings)
+
+    def _dispatch_jobs(self, run_id: int) -> tuple[bool, dict[str, list[int]]]:
+        with self.session_factory() as session:
+            run = session.get(Run, run_id)
+            if run is None or run.cancel_requested or run.status in FINAL_RUN_STATUSES:
+                return True, {}
+            lanes: dict[str, list[int]] = {}
+            for job in session.scalars(select(SiteJob).where(
+                SiteJob.run_id == run_id, SiteJob.status == "queued",
+            ).order_by(SiteJob.id)):
+                lanes.setdefault(job.lane, []).append(job.id)
+            return False, lanes
+
+    def _fail_dispatch_jobs(self, run_id: int, message: str, lane: str | None = None,
+                            exclude: set[int] | None = None) -> None:
+        with self.session_factory() as session:
+            jobs = select(SiteJob).where(SiteJob.run_id == run_id, SiteJob.status == "queued")
+            if lane is not None:
+                jobs = jobs.where(SiteJob.lane == lane)
+            for job in session.scalars(jobs):
+                if job.id not in (exclude or set()):
+                    self._finish_job(job, "error", message, {})
+            session.commit()
+
+    async def _dispatch_run(self, run_id: int) -> None:
+        from app.services.lanes import LANE_LABELS
+
+        dispatch = RunDispatch(self._dispatch_client(), run_id)
+        canceled = asyncio.Event()
+        self._run_cancel_events[run_id] = canceled
+        # Assigned IDs remain excluded until the entire batch joins, even if a
+        # job has already queued a cross-lane fallback in the database.
+        batches: dict[str, dict[int, asyncio.Task[None]]] = {}
+        failed_lanes: set[str] = set()
+        renewer: asyncio.Task | None = None
+        cancel_waiter = asyncio.create_task(canceled.wait())
+        changed_waiter: asyncio.Task | None = None
+        try:
+            while True:
+                dispatch.changed.clear()
+                for lane, tasks in list(batches.items()):
+                    if all(task.done() for task in tasks.values()):
+                        await asyncio.gather(*tasks.values())
+                        del batches[lane]
+                        try:
+                            await dispatch.release(lane)
+                        except DispatchError:
+                            dispatch.abort()
+
+                db_canceled, queued = await asyncio.to_thread(self._dispatch_jobs, run_id)
+                if db_canceled or canceled.is_set():
+                    dispatch.stopping = True
+                    for lane in list(dispatch.tickets):
+                        if lane not in batches:
+                            try:
+                                await dispatch.release(lane)
+                            except DispatchError:
+                                dispatch.abort()
+                    if not batches:
+                        break
+                    queued = {}
+                assigned = {job_id for tasks in batches.values() for job_id in tasks}
+                if dispatch.error or dispatch.stopping:
+                    if not db_canceled and not canceled.is_set():
+                        await asyncio.to_thread(self._fail_dispatch_jobs, run_id, dispatch.error,
+                                                exclude=assigned)
+                    if not batches:
+                        break
+                else:
+                    for lane in queued.keys() - LANE_LABELS.keys():
+                        await asyncio.to_thread(self._fail_dispatch_jobs, run_id, DISPATCH_ERROR, lane)
+                    for lane, ticket in list(dispatch.tickets.items()):
+                        if ticket.state == "failed":
+                            failed_lanes.add(lane)
+                            await asyncio.to_thread(self._fail_dispatch_jobs, run_id, DISPATCH_ERROR,
+                                                    lane, assigned)
+                            if lane not in batches:
+                                try:
+                                    await dispatch.release(lane)
+                                except DispatchError:
+                                    dispatch.abort()
+                    for lane in failed_lanes:
+                        await asyncio.to_thread(self._fail_dispatch_jobs, run_id, DISPATCH_ERROR,
+                                                lane, assigned)
+                    # Include every initially required lane in the first renewal.
+                    # Later rescans create a fresh identity only after confirmed release.
+                    if not dispatch.error and (renewer is None or dispatch.healthy.is_set()):
+                        for lane in LANE_LABELS:
+                            if (lane not in failed_lanes and lane not in dispatch.tickets
+                                    and any(job_id not in assigned for job_id in queued.get(lane, []))):
+                                dispatch.add(lane)
+                    if renewer is None:
+                        renewer = asyncio.create_task(dispatch.maintain(), name=f"run-{run_id}-dispatch")
+                    for lane in LANE_LABELS:
+                        ticket = dispatch.tickets.get(lane)
+                        if (dispatch.error or not dispatch.healthy.is_set() or ticket is None
+                                or ticket.state != "granted" or lane in batches):
+                            continue
+                        job_ids = [job_id for job_id in queued.get(lane, []) if job_id not in assigned]
+                        token = _dispatch_context.set((dispatch, ticket))
+                        try:
+                            batches[lane] = {job_id: asyncio.create_task(
+                                self._execute_job_guarded(run_id, job_id),
+                                name=f"run-{run_id}-job-{job_id}",
+                            ) for job_id in job_ids}
+                        finally:
+                            _dispatch_context.reset(token)
+                if not queued and not batches and not dispatch.tickets:
+                    break
+                changed_waiter = asyncio.create_task(dispatch.changed.wait())
+                await asyncio.wait(
+                    [changed_waiter, *([] if cancel_waiter.done() else [cancel_waiter]),
+                     *(task for tasks in batches.values() for task in tasks.values() if not task.done())],
+                    timeout=1.0, return_when=asyncio.FIRST_COMPLETED,
+                )
+                changed_waiter.cancel()
+                await asyncio.gather(changed_waiter, return_exceptions=True)
+                changed_waiter = None
+        finally:
+            dispatch.abort()
+            tasks = [task for batch in batches.values() for task in batch.values()]
+            helpers = [task for task in (renewer, cancel_waiter, changed_waiter) if task is not None]
+
+            async def teardown() -> None:
+                for task in tasks + helpers:
+                    task.cancel()
+
+                async def join() -> None:
+                    await asyncio.gather(*(tasks + helpers), return_exceptions=True)
+
+                joiner = asyncio.create_task(join(), name=f"run-{run_id}-dispatch-join")
+                self._dispatch_cleanup_tasks.add(joiner)
+                joiner.add_done_callback(self._dispatch_cleanup_tasks.discard)
+                try:
+                    # Do not cancel resistant business tasks again when the join
+                    # budget expires. Retain their joiner to collect late outcomes.
+                    await asyncio.wait({joiner}, timeout=DISPATCH_JOIN_TIMEOUT_SECONDS)
+                finally:
+                    self._run_cancel_events.pop(run_id, None)
+                    # Known even on an unknown PUT grant; DELETE also tombstones
+                    # an owner whose creation has not reached the worker yet.
+                    try:
+                        async with asyncio.timeout(10):
+                            await dispatch.client.close(dispatch.owner)
+                    except Exception:
+                        pass  # Unconfirmed releases expire under the worker's ticket TTL.
+
+            cleanup = asyncio.create_task(teardown(), name=f"run-{run_id}-dispatch-cleanup")
+            self._dispatch_cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._dispatch_cleanup_tasks.discard)
+            await asyncio.shield(cleanup)
 
     def _prepare_run(self, run_id: int) -> tuple[list[int], bool] | None:
         with self.session_factory() as session:
@@ -172,11 +326,6 @@ class ExecutionManager:
             self.schedule_run_notification(run_id)
 
     async def _execute_job_guarded(self, run_id: int, job_id: int) -> None:
-        with self.session_factory() as session:
-            job = session.get(SiteJob, job_id)
-            if job is None or job.status != "queued":
-                return
-            lane = job.lane
         async with self._job_semaphore:
             with self.session_factory() as session:
                 job = session.get(SiteJob, job_id)
@@ -190,10 +339,16 @@ class ExecutionManager:
                     job.finished_at = now
                     session.commit()
                     return
+                lane = job.lane
             try:
                 for _ in range(3):
                     if await self._execute_job(run_id, job_id) != "retry":
                         break
+                    with self.session_factory() as session:
+                        job = session.get(SiteJob, job_id)
+                        if job is None or job.status != "queued" or job.lane != lane:
+                            # Cross-lane retries need a new batch reservation.
+                            return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -449,6 +604,20 @@ class ExecutionManager:
             self.schedule_run_notification(run.id)
 
     async def _execute_job(self, run_id: int, job_id: int) -> str | None:
+        context = _dispatch_context.get()
+        reservation = None
+        if context is not None:
+            try:
+                reservation = await context[0].reservation(context[1])
+            except DispatchError as exc:
+                with self.session_factory() as session:
+                    job = session.get(SiteJob, job_id)
+                    run = session.get(Run, run_id)
+                    if (job is not None and job.status == "queued" and run is not None
+                            and not run.cancel_requested and not context[0].stopping):
+                        self._finish_job(job, "error", str(exc), {})
+                        session.commit()
+                return
         payload: dict[str, Any] | None = None
         reserve_auth = None
         with self.session_factory() as session:
@@ -638,6 +807,8 @@ class ExecutionManager:
                 "resign_max_days": resign_days,
                 "plugin_runtimes": plugin_runtimes,
             }
+            if reservation is not None:
+                payload["dispatch_reservation"] = reservation
             if run.trigger == "assistant":
                 payload["assistant_run"] = True
                 from app.services.assistant_run_guard import consumption_plan
@@ -756,12 +927,11 @@ class ExecutionManager:
                 job = session.get(SiteJob, job_id)
                 if job is None:
                     return None
-                if job.attempt < 2:
-                    job.lane = (
-                        "proxy_interaction"
-                        if job.lane.startswith("proxy")
-                        else "interaction"
-                    )
+                fallback = {"general": "interaction", "proxy_general": "proxy_interaction"}.get(
+                    job.lane
+                )
+                if job.attempt < 2 and fallback is not None:
+                    job.lane = fallback
                     job.status = "queued"
                     job.message = "Playwright 点击未生效，转交互车道重试"
                     job.attempt += 1
@@ -874,6 +1044,11 @@ class ExecutionManager:
                         pass
 
     async def _post_execute(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = _dispatch_context.get()
+        if context is None:
+            raise DispatchError()
+        if payload.get("dispatch_reservation") != await context[0].reservation(context[1]):
+            raise DispatchError()
         job_id = int(payload["job_id"])
         result: dict[str, Any] | None = None
         async with httpx.AsyncClient(timeout=self.settings.execution_timeout) as client:
