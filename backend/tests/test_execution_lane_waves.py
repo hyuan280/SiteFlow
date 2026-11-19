@@ -333,7 +333,7 @@ def test_wave_does_not_replay_consumed_or_unknown_outcome(manager, monkeypatch, 
         if evidence in {"paid", "resign"}:
             feature, data = (("post.buy_card", {"buy_card": {"payment_attempted": True}})
                              if evidence == "paid" else
-                             ("post.resign_click", {"resign": {"submit_attempted": True}}))
+                             ("post.resign_loop", {"resign": {"submit_attempted": True}}))
             steps.append({"step_key": "consumed", "feature_type": feature,
                           "status": "success", "data": data})
         return {"status": "unknown" if evidence == "unknown" else "fallback_interaction",

@@ -18,7 +18,7 @@ from app.services.config_ai_protocol import generation_guide
 from app.services.config_ai_tools import ConfigAITools
 from app.services.workflows import WorkflowService
 from tests.test_buy_card_config import DEFAULTS as BUY_CARD_CONFIG
-from tests.test_resign_click_config import DEFAULTS as RESIGN_CLICK_CONFIG, OLD_DEFAULTS
+from tests.test_resign_loop_config import DEFAULTS as RESIGN_LOOP_CONFIG, OLD_DEFAULTS
 from tests.test_resign_dialog_config import DEFAULTS as RESIGN_DIALOG_CONFIG
 from tests.test_workflow_drafts import _read_only
 
@@ -29,7 +29,7 @@ POST_CONFIGS = {
     "post.buy_card": {key: value for key, value in BUY_CARD_CONFIG.items()
                       if key not in {"option_selector", "exchange_action", "submit_value"}},
     "post.resign": OLD_DEFAULTS,
-    "post.resign_click": RESIGN_CLICK_CONFIG,
+    "post.resign_loop": RESIGN_LOOP_CONFIG,
     "post.resign_dialog": RESIGN_DIALOG_CONFIG,
 }
 

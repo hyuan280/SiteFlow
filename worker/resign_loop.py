@@ -1,4 +1,4 @@
-"""Calendar-only resign clicks. Ambiguous observations never authorize a submit."""
+"""One calendar resign click per visit, with confirmation on the next loop."""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +20,6 @@ DEFAULTS = {
     "calendar_selected_selector": ['.cal-grid > button.cal-cell.on:not(.mute):has(.cal-num:text-is("{day}"))'],
     "done_selector": ['.cal-grid > button.cal-cell:not(.mute):has(.cal-num:text-is("{day}")) .cal-badge.att'],
     "button_selector": [".cal-att button.cal-att-pill.act"],
-    "card_count_selector": [".cal-help"],
 }
 
 
@@ -47,27 +46,30 @@ def _iso(value):
     return parsed
 
 
-def resign_click_timeout(config, pending):
-    """Bound each target's month navigation, selection and confirmation budget."""
-    wait = max(1, min(float(config.get("success_wait_seconds", 10)), 60))
+def resign_loop_timeout(config, pending):
+    """Budget date checks and month navigation, bounded to two hours per visit."""
+    wait = max(1, min(float(config.get("wait_seconds", 10)), 60))
     jumps = max(0, min(int(config.get("max_month_jumps", 12)), 120))
     return min(7200, 30 + max(1, len(pending)) * (
-        (jumps + 4) * wait + 15 + 2 * CHECKPOINT_TIMEOUT_SECONDS))
+        (jumps + 5) * wait + 15 + 2 * CHECKPOINT_TIMEOUT_SECONDS))
 
 
-async def run_resign_click(
-    page, config, pending, log, *, today=None, unresolved=None, base_url=None, progress=None,
-    durable_progress=None,
+async def run_resign_loop(
+    page, config, pending, log, *, today=None, base_url=None, progress=None,
+    durable_progress=None, runtime=None,
 ):
     # Import lazily: executor dispatches here, and its readiness predicate is shared.
     from worker.executor import _buy_page_ready, _month_label
 
-    state = {"pending": list(pending), "success": [], "already_signed": [], "failed": [],
-             "remaining": list(pending), "cards_before": None, "cards_after": None,
-             "submit_attempted": False, "unconfirmed": []}
+    if runtime is None:
+        raise ValueError("循环补签需要任务运行上下文")
+    if not runtime:
+        runtime.update(pending=sorted(pending), success=[], already_signed=[], failed=[],
+                       remaining=sorted(pending), submit_attempted=False, unconfirmed=[],
+                       current_date=None, attempts={})
+    state = runtime
     current_date = None
     origin = None
-    installed = False
     dialog_installed = False
     popup_seen = False
 
@@ -99,8 +101,6 @@ async def run_resign_click(
 
     def selectors(key, stamp=None):
         values = config.get(key, DEFAULTS[key])
-        if key == "card_count_selector" and not values:
-            values = ["body"]
         if not isinstance(values, list) or not all(isinstance(item, str) and item for item in values):
             raise UnsafeCalendar(f"{key} 必须是选择器数组")
         if any(re.search(r"[{}]", re.sub(r"\{(?:date|day|month|year)\}", "", item)) for item in values):
@@ -255,24 +255,6 @@ async def run_resign_click(
         finally:
             await handle.dispose()
 
-    async def count(stamp):
-        if not await same_page():
-            return None
-        handle = await unique(page, "card_count_selector", stamp)
-        if handle is None:
-            return None
-        try:
-            text = await handle.inner_text()
-            matches = list(re.finditer(config.get("card_count_regex", r"补签卡（当前\s*(\d+)\s*张"), text))
-            if len(matches) != 1:
-                return None
-            raw = matches[0].group(1)
-            if not re.fullmatch(r"\d+", raw) or re.search(r"-\s*$", text[:matches[0].start(1)]):
-                raise UnsafeCalendar("补签卡库存不是非负整数")
-            return int(raw) if await same_page() and await handle.evaluate("el => el.isConnected") else None
-        finally:
-            await handle.dispose()
-
     async def safe_action(handle, submit=False):
         if not await same_page():
             raise UnsafeCalendar("点击前页面未就绪")
@@ -303,16 +285,6 @@ async def run_resign_click(
             }
         }""")
 
-    async def guard_route(route):
-        try:
-            allowed = _origin(route.request.url) == origin
-        except (ValueError, UnsafeCalendar):
-            allowed = False
-        if allowed:
-            await route.fallback()
-        else:
-            await route.abort()
-
     async def dismiss(dialog):
         await dialog.dismiss()
 
@@ -323,12 +295,15 @@ async def run_resign_click(
 
     try:
         reference = _iso(today)  # Missing scheduler-local today is deliberately fail closed.
-        targets = [_iso(value) for value in pending]
+        targets = [_iso(value) for value in sorted(pending)]
         if len(set(pending)) != len(pending) or any(value >= reference for value in targets):
             raise UnsafeCalendar("补签日期必须唯一且严格早于 resign_today")
-        unresolved = {_iso(value).isoformat() for value in (unresolved or [])}
-        wait = max(1, min(float(config.get("success_wait_seconds", 10)), 60))
+        if (state["pending"] != sorted(pending)
+                or any(value not in pending for value in state["remaining"])):
+            raise UnsafeCalendar("补签循环日期范围已改变")
+        wait = max(1, min(float(config.get("wait_seconds", 10)), 60))
         jumps = max(0, min(int(config.get("max_month_jumps", 12)), 120))
+        max_retries = max(0, min(int(config.get("max_retries", 3)), 10))
         if not targets:
             return result("success", "没有待补签日期")
         if durable_progress is None:
@@ -342,8 +317,6 @@ async def run_resign_click(
         page.on("dialog", dismiss)
         page.on("popup", close_popup)
         dialog_installed = True
-        await page.route("**/*", guard_route)
-        installed = True
         await page.goto(attendance, wait_until="domcontentloaded", timeout=30000)
         await poll(same_page, "日历页面未就绪")
         await page.evaluate("""() => {
@@ -351,41 +324,32 @@ async def run_resign_click(
             window.open = () => null;
         }""")
         await checkpoint()
-        # Resolve *all* past unknown targets read-only before consuming any card.
-        resolved = set()
-        for stamp in targets:
-            if stamp.isoformat() in unresolved:
-                await ensure_month(stamp)
-                if not await done(stamp):
-                    raise UnsafeCalendar("历史未决日期未发现目标 done，禁止再次提交")
-                resolved.add(stamp.isoformat())
-                state["already_signed"].append(stamp.isoformat())
-                state["remaining"].remove(stamp.isoformat())
-                await checkpoint()
-
         for stamp in targets:
             current_date = stamp.isoformat()
-            if current_date in resolved:
+            if current_date not in state["remaining"]:
                 continue
             await ensure_month(stamp)
+            handle = await poll(lambda: cell(stamp), "等待目标日期就绪超时")
+            await handle.dispose()
             if await done(stamp):
-                state["already_signed"].append(current_date)
+                attempted = any(item["date"] == current_date for item in state["unconfirmed"])
+                if attempted:
+                    state["success"].append({"date": current_date, "message": "循环核验目标日期已签到"})
+                    state["unconfirmed"] = [item for item in state["unconfirmed"] if item["date"] != current_date]
+                else:
+                    state["already_signed"].append(current_date)
                 state["remaining"].remove(current_date)
+                state["current_date"] = None
+                if attempted:
+                    try:
+                        await durable_checkpoint("confirm")
+                    finally:
+                        await checkpoint()
                 await checkpoint()
                 continue
-            async def readable_count():
-                value = await count(stamp)
-                return (value,) if value is not None else None
-
-            before = (await poll(readable_count, "补签卡库存无法核验"))[0]
-            if state["cards_before"] is None:
-                state["cards_before"] = before
-            if state["cards_after"] is not None and state["cards_after"] != before:
-                raise UnsafeCalendar("补签卡库存发生异常变化")
-            state["cards_after"] = before
-            if before == 0:
-                await checkpoint()
-                return result("success", "补签卡为 0，保留剩余日期")
+            attempts = state["attempts"].get(current_date, 0)
+            if attempts >= max_retries + 1:
+                raise UnsafeCalendar(f"{current_date} 补签仍未完成，已用尽 {max_retries} 次重试，请人工处理")
             async with hold_page_input(page):
                 handle = await cell(stamp)
                 if handle is None:
@@ -404,16 +368,38 @@ async def run_resign_click(
                 return True
 
             await poll(selected, "选择日期后无法确认目标 selected")
-            button = await unique(page, "button_selector", stamp)
-            if button is None:
-                raise UnsafeCalendar("未找到唯一补签按钮")
+            button_selectors = selectors("button_selector", stamp)
+            log("INFO", f"等待补签按钮: date={stamp.isoformat()} selectors={button_selectors!r}")
+
+            async def ready_button():
+                if not await selected():
+                    return None
+                handle = await unique(page, "button_selector", stamp)
+                if handle is not None and not await handle.is_enabled():
+                    await handle.dispose()
+                    return None
+                return handle
+
+            try:
+                button = await poll(ready_button, "等待补签按钮超时：未找到唯一可见且可用的补签按钮")
+            except UnsafeCalendar:
+                for selector in button_selectors:
+                    locator = page.locator(selector)
+                    matches = await locator.count()
+                    visible = enabled = 0
+                    for index in range(matches):
+                        candidate = locator.nth(index)
+                        if await candidate.is_visible():
+                            visible += 1
+                            enabled += int(await candidate.is_enabled())
+                    log("WARN", f"补签按钮诊断: selector={selector!r} matches={matches} "
+                        f"visible={visible} enabled_visible={enabled}")
+                raise
             try:
                 async with hold_page_input(page):
                     async def authorize():
                         if not await selected() or await done(stamp):
                             raise UnsafeCalendar("提交前目标日期选择或 done 状态已改变")
-                        if await count(stamp) != before:
-                            raise UnsafeCalendar("提交前库存已改变或不可读")
                         fresh = await unique(page, "button_selector", stamp)
                         try:
                             if fresh is None or not await button.evaluate("(el, other) => el === other", fresh):
@@ -428,51 +414,32 @@ async def run_resign_click(
                     await authorize()
                     previously_attempted = state["submit_attempted"]
                     state["submit_attempted"] = True
+                    previous_unconfirmed = copy.deepcopy(state["unconfirmed"])
+                    state["unconfirmed"] = [item for item in state["unconfirmed"] if item["date"] != current_date]
                     state["unconfirmed"].append({"date": current_date, "message": "已授权点击，结果待核验"})
                     try:
                         await durable_checkpoint("prepare")
                     except BaseException:
                         # No ACK means no click, not proof that the server rolled back.
                         # Do not let the stream independently claim a failed reservation.
-                        state["unconfirmed"] = [item for item in state["unconfirmed"] if item["date"] != current_date]
+                        state["unconfirmed"] = previous_unconfirmed
                         state["submit_attempted"] = previously_attempted
                         raise
                     await checkpoint()
                     await authorize()  # The checkpoint itself can yield to a changing SPA.
+                    state["current_date"] = current_date
+                    state["attempts"][current_date] = attempts + 1
+                    log("INFO", f"补签循环点击: date={current_date} attempt={attempts + 1}/{max_retries + 1}")
                     try:
                         await button.click(timeout=int(wait * 1000), no_wait_after=True)
                     except Exception as exc:
-                        log("WARN", f"补签点击返回异常，仅读取核验，不重试: {type(exc).__name__}")
+                        log("WARN", f"补签点击返回异常，保留日期供后续核验: {type(exc).__name__}")
             finally:
                 await button.dispose()
 
-            async def confirmed():
-                if not await same_page():
-                    return False
-                if await month(stamp) != stamp.strftime("%Y-%m"):
-                    return False
-                signed = await done(stamp)
-                after = await count(stamp)
-                if after is not None:
-                    state["cards_after"] = after
-                    if after not in {before, before - 1}:
-                        raise UnsafeCalendar("补签后库存变化异常")
-                if (signed and after == before - 1 and await same_page()
-                        and await month(stamp) == stamp.strftime("%Y-%m") and await done(stamp)
-                        and await count(stamp) == before - 1):
-                    state["success"].append({"date": current_date, "message": "目标 done 且补签卡恰好减少 1"})
-                    state["remaining"].remove(current_date)
-                    state["unconfirmed"] = [item for item in state["unconfirmed"] if item["date"] != current_date]
-                    try:
-                        await durable_checkpoint("confirm")
-                    finally:
-                        # A failed confirm ACK must not erase a real, observed success.
-                        await checkpoint()
-                    return True
-                return False
-
-            await poll(confirmed, "补签提交结果未确认，停止并等待人工核验")
-        return result("success", "补签日期已核验")
+            await checkpoint()
+            return result("success", f"已发起 {current_date} 补签，交给后续步骤处理，下次循环核验")
+        return result("success", "全部补签日期已核验，断签信号=false")
     except asyncio.CancelledError:
         # wait_for and job cancellation must not erase already-confirmed dates.
         await checkpoint()
@@ -488,9 +455,7 @@ async def run_resign_click(
         if dialog_installed:
             page.remove_listener("dialog", dismiss)
             page.remove_listener("popup", close_popup)
-        if installed:
             try:
-                await page.unroute("**/*", guard_route)
                 await page.evaluate("""() => {
                     if (window.__siteflowResignOpen) window.open = window.__siteflowResignOpen;
                     delete window.__siteflowResignOpen;

@@ -12,7 +12,7 @@ from app.models.execution import SiteJob
 from app.models.workflow import Site, SiteResignRecord, utcnow
 
 TERMINAL_RESIGN_STATUSES = {"success", "already_signed"}
-CHECKPOINT_RESIGN_FEATURES = frozenset({"post.resign_click", "post.resign_dialog"})
+CHECKPOINT_RESIGN_FEATURES = frozenset({"post.resign_loop", "post.resign_dialog"})
 
 
 class ResignConflict(ValueError):
@@ -86,7 +86,10 @@ class ResignService:
         }
         return sorted(missing - successes - handled)
 
-    def checkpoint(self, job: SiteJob, phase: str, value: str, result: dict) -> None:
+    def checkpoint(
+        self, job: SiteJob, phase: str, value: str, result: dict,
+        feature_type: str = "post.resign_dialog",
+    ) -> None:
         today = datetime.now(self.timezone).date()
 
         def valid_date(item):
@@ -134,7 +137,10 @@ class ResignService:
         ))
         now = utcnow()
         if phase == "prepare":
-            if row is not None and row.status in TERMINAL_RESIGN_STATUSES | {"unknown"}:
+            if row is not None and (
+                row.status in TERMINAL_RESIGN_STATUSES
+                or (row.status == "unknown" and feature_type != "post.resign_loop")
+            ):
                 raise ResignConflict()
             site = self.session.get(Site, job.site_id)
             if (
@@ -150,10 +156,17 @@ class ResignService:
                 ))
                 self.session.flush()
             else:
-                changed = self.session.execute(update(SiteResignRecord).where(
+                statement = update(SiteResignRecord).where(
                     SiteResignRecord.id == row.id,
-                    SiteResignRecord.status.not_in(TERMINAL_RESIGN_STATUSES | {"unknown"}),
-                ).values(
+                    SiteResignRecord.status == row.status,
+                    SiteResignRecord.job_id == row.job_id, SiteResignRecord.run_id == row.run_id,
+                )
+                if row.status == "unknown" and (row.job_id != job.id or row.run_id != job.run_id):
+                    # Check activity atomically with takeover, not from a stale dispatch/result.
+                    statement = statement.where(~select(SiteJob.id).where(
+                        SiteJob.id == row.job_id, SiteJob.status.in_({"queued", "running"}),
+                    ).exists())
+                changed = self.session.execute(statement.values(
                     status="unknown", message="Resign submission reserved; confirmation pending",
                     run_id=job.run_id, job_id=job.id, updated_at=now,
                 ))

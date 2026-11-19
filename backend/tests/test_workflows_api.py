@@ -1008,6 +1008,39 @@ def test_flow_jump_requires_condition_and_target(client: TestClient) -> None:
     assert jump["config"]["max_jumps"] == 5
 
 
+@pytest.mark.parametrize("kind", ["sites", "templates"])
+def test_flow_jump_always_with_signal_condition_roundtrips(client: TestClient, kind: str) -> None:
+    response = client.post(
+        f"/api/v1/{kind}",
+        json={
+            "name": "signal-only-jump",
+            **({"base_url": "https://pt.example.com"} if kind == "sites" else {}),
+            "steps": [
+                {"step_key": "open", "feature_type": "flow.open"},
+                {
+                    "step_key": "jump",
+                    "feature_type": "flow.jump",
+                    "condition": "signal:sys_resign_pending:true",
+                    "config": {
+                        "match_mode": "always",
+                        "target_step_key": "open",
+                        "max_jumps": 100,
+                    },
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201, response.text
+    detail = client.get(f"/api/v1/{kind}/{response.json()['id']}").json()
+    for steps in (detail["steps"], detail["resolved"]["steps"]):
+        jump = next(step for step in steps if step["step_key"] == "jump")
+        assert jump["condition"] == "signal:sys_resign_pending:true"
+        assert jump["config"]["match_mode"] == "always"
+        assert jump["config"]["max_jumps"] == 100
+        assert not jump["config"].get("texts")
+        assert not jump["config"].get("selectors")
+
+
 def test_group_order_controls_resolved_step_order(client: TestClient) -> None:
     response = client.post(
         "/api/v1/templates",

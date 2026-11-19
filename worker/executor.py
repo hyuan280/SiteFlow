@@ -24,7 +24,7 @@ from worker.cfbox_response import resolve_cfbox_prediction
 
 WAIT_UNTIL = {"domcontentloaded", "load", "networkidle"}
 SYSTEM_RESIGN_SIGNAL_KEY = "sys_resign_pending"
-CHECKPOINT_RESIGN_FEATURES = frozenset({"post.resign_click", "post.resign_dialog"})
+CHECKPOINT_RESIGN_FEATURES = frozenset({"post.resign_loop", "post.resign_dialog"})
 PAGE_TIMEOUT_MS = 30000
 SELECTOR_WAIT_MS = 10000
 SIGNAL_WAIT_MS = 3000
@@ -2347,6 +2347,10 @@ async def _run_flow_jump(
         if str(item).strip()
     ]
     matched_by: list[str] = []
+    if config.get("match_mode") == "always":
+        matched_by.append("always")
+        texts = []
+        selectors = []
     if texts:
         page_text = await _page_text(page)
         for text in texts:
@@ -4644,7 +4648,7 @@ async def _run_step(
         if feature == "post.resign_dialog":
             from worker.resign_dialog import run_resign_dialog as run_resign
         else:
-            from worker.resign_click import run_resign_click as run_resign
+            from worker.resign_loop import run_resign_loop as run_resign
         from worker.resign_checkpoint import make_resign_checkpoint, ResignCheckpointError
         payload = secret_payload or {}
         try:
@@ -4655,9 +4659,11 @@ async def _run_step(
         return await run_resign(
             page, config, list(resign_pending_dates or []), note,
             today=payload.get("resign_today"),
-            unresolved=payload.get("resign_unresolved_dates"),
             base_url=payload.get("base_url"), progress=resign_progress,
             durable_progress=durable_progress,
+            **({"runtime": payload.setdefault("_resign_runtime", {}).setdefault(
+                str(step.get("step_key") or ""), {})}
+               if feature == "post.resign_loop" else {"unresolved": payload.get("resign_unresolved_dates")}),
         )
 
     if feature == "post.resign":
@@ -4772,10 +4778,10 @@ async def _execute_admitted_job(
                           "challenge.slider", "challenge.image_captcha", "challenge.grid_captcha"),
             "sign": ("sign.button", "sign.iframe.image_captcha", "sign.image_quiz", "sign.unit3d_claim"),
             "action": ("action.navigate", "action.click", "action.fill", "action.wait"),
-            "post": ("post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog"),
+            "post": ("post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog"),
         }.items() for feature in features
     }
-    consumption_handlers = {"post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog"}
+    consumption_handlers = {"post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog"}
     plan = payload.get("assistant_consumption_plan")
     consumption_steps: set[str] = set()
     if payload.get("assistant_run") is True:
@@ -4821,6 +4827,10 @@ async def _execute_admitted_job(
                 return {"status": "fail", "message": "Consumption approval plan missing or changed",
                         "steps": [], "reason": "assistant_configuration_changed"}
     consumed_steps: set[str] = set()
+    # Job-local continuation state must survive flow.jump pruning step results.
+    resign_runtime: dict[str, dict[str, Any]] = {}
+    payload["_resign_runtime"] = resign_runtime
+    completed_resign_dates: set[str] = set()
     # Presence is authoritative: only old payloads may use the shared runtime.
     model_runtimes = payload.get("feature_model_runtimes")
     if "feature_model_runtimes" in payload and (
@@ -4853,6 +4863,28 @@ async def _execute_admitted_job(
         step_results: list[dict[str, Any]],
         output_rows: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        for key, state in resign_runtime.items():
+            if not state:
+                continue
+            existing = next((item for item in step_results if item.get("step_key") == key), None)
+            if existing is not None:
+                existing.setdefault("data", {})["resign"] = copy.deepcopy(state)
+            else:
+                source = next(item for item in steps if item.get("step_key") == key)
+                step_results.append(_step_result(source, "waiting_human" if state.get("remaining") else "success",
+                                                "补签循环累计状态", started=_now(),
+                                                data={"resign": copy.deepcopy(state)}))
+                existing = step_results[-1]
+            if state.get("remaining"):
+                incomplete = "补签循环仍有未确认日期，请返回补签步骤核验或人工处理"
+                if existing.get("status") in {"success", "skipped"}:
+                    existing.update(status="waiting_human", message=incomplete)
+                existing["data"].update(value=False, message=existing.get("message") or incomplete)
+                for output in output_rows:
+                    if output.get("step_key") == key:
+                        output.update(value=False, message=incomplete)
+                if status == "success":
+                    status, message = "waiting_human", incomplete
         level = "INFO" if status in {"success", "skipped"} else "ERROR"
         job_artifacts.log(level, f"job end status={status} message={message}")
         return {
@@ -4974,7 +5006,8 @@ async def _execute_admitted_job(
                     await emit_progress()
                     index += 1
                     continue
-                pending_dates = list(payload.get("resign_pending_dates") or [])
+                pending_dates = [value for value in (payload.get("resign_pending_dates") or [])
+                                 if value not in completed_resign_dates]
                 condition = await _condition_allows(
                     page,
                     step.get("condition"),
@@ -5051,9 +5084,9 @@ async def _execute_admitted_job(
                         timeout = _buy_timeout(step_config)
                     elif feature_type == "post.resign":
                         timeout = 300
-                    elif feature_type == "post.resign_click":
-                        from worker.resign_click import resign_click_timeout
-                        timeout = resign_click_timeout(step.get("config") or {}, pending_dates)
+                    elif feature_type == "post.resign_loop":
+                        from worker.resign_loop import resign_loop_timeout
+                        timeout = resign_loop_timeout(step.get("config") or {}, pending_dates)
                     elif feature_type == "post.resign_dialog":
                         from worker.resign_dialog import resign_dialog_timeout
                         timeout = resign_dialog_timeout(step.get("config") or {}, pending_dates)
@@ -5104,9 +5137,10 @@ async def _execute_admitted_job(
                     await emit_progress()
 
                 feature = str(step.get("feature_type") or "")
+                loop_resign = feature == "post.resign_loop"
                 if payload.get("assistant_run") is True and step.get("step_key") in consumption_steps:
                     key = str(step.get("step_key") or "")
-                    if (key in consumed_steps or
+                    if ((key in consumed_steps and not (loop_resign and resign_runtime.get(key))) or
                             plan["review"]["today"] != datetime.now(ZoneInfo(plan["review"]["timezone"])).date().isoformat()):
                         job_status, job_message = "waiting_human", "Consumption step cannot execute twice; request fresh approval"
                         results[-1] = _step_result(step, job_status, job_message, started=started)
@@ -5187,6 +5221,12 @@ async def _execute_admitted_job(
                     if "resign" not in data and "resign" in partial:
                         data = {**data, "resign": partial["resign"]}
                     resign = data.get("resign", {})
+                    if loop_resign and resign:
+                        resign_runtime[str(step.get("step_key") or "")] = copy.deepcopy(resign)
+                    if status == "success":
+                        completed_resign_dates.update(resign.get("already_signed") or [])
+                        completed_resign_dates.update(item["date"] for item in resign.get("success", [])
+                                                     if isinstance(item, dict) and "date" in item)
                     if resign.get("submit_attempted") or resign.get("success"):
                         payment_steps.add(str(step.get("step_key") or ""))
                         resign_dispatched_steps.add(str(step.get("step_key") or ""))
@@ -5262,7 +5302,10 @@ async def _execute_admitted_job(
                         job_artifacts.log("ERROR", job_message)
                         await emit_progress()
                         break
-                    if payment_steps.intersection(
+                    loop_keys = {str(item.get("step_key") or "") for item in steps
+                                 if item.get("feature_type") == "post.resign_loop"
+                                 and resign_runtime.get(str(item.get("step_key") or ""))}
+                    if (payment_steps - loop_keys).intersection(
                         str(item.get("step_key") or "") for item in steps[target_index:index + 1]
                     ):
                         job_status = "waiting_human"

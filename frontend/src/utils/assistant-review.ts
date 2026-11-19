@@ -335,7 +335,7 @@ export function operationResultLabel(message: AssistantMessage, parse = JSON.par
 }
 export const consumptionFeatureLabels = {
   "post.buy_card": "购买补签卡", "post.resign": "历史日历补签",
-  "post.resign_click": "点击补签", "post.resign_dialog": "弹窗补签",
+  "post.resign_loop": "页面循环补签", "post.resign_dialog": "弹窗补签",
 } as const;
 interface ConsumptionStep {
   feature_type: keyof typeof consumptionFeatureLabels; step_key: string; label: string;

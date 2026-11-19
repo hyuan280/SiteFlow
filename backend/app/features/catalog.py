@@ -325,6 +325,17 @@ class SignButtonConfig(FeatureConfig):
 
 
 class FlowJumpConfig(FeatureConfig):
+    match_mode: Literal["page", "always"] = Field(
+        default="page",
+        title="跳转匹配方式",
+        description="page 需要页面文字或选择器匹配；always 无需页面匹配，仅由步骤 condition 控制",
+        json_schema_extra={
+            "enum_titles": {
+                "page": "匹配页面文字或选择器",
+                "always": "仅由步骤条件控制",
+            }
+        },
+    )
     texts: TextCandidates = Field(
         default_factory=list,
         description="页面文字包含任意一项时命中；不区分大小写",
@@ -359,7 +370,7 @@ class FlowJumpConfig(FeatureConfig):
     @model_validator(mode="after")
     def _validate_jump(self) -> "FlowJumpConfig":
         self.target_step_key = self.target_step_key.strip()
-        if not self.texts and not self.selectors:
+        if self.match_mode == "page" and not self.texts and not self.selectors:
             raise PydanticCustomError(
                 "flow_jump_evidence_required", "Value error, 至少需要配置一项页面文字或选择器",
             )
@@ -775,12 +786,19 @@ class PostResignConfig(FeatureConfig):
     ajax_date_param: str = Field(default="params[date]", description="补签日期参数名")
 
 
-class PostResignClickConfig(FeatureConfig):
+class PostResignLoopConfig(FeatureConfig):
+    max_retries: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        title="最大重试次数",
+        description="页面循环补签未完成时的额外重试次数；默认首次提交后最多额外重试 3 次，需站点保证重复补签不重复扣卡",
+    )
     attendance_url: str = Field(
         default="{base_url}/calendar",
         min_length=1,
         title="签到页地址",
-        description="页面点击补签的日历地址，支持 {base_url} 占位符；仅处理 pending 中的过去日期",
+        description="页面循环补签的日历地址，支持 {base_url} 占位符；仅处理 pending 中的过去日期",
     )
     calendar_title_selector: SelectorCandidates = Field(
         default_factory=lambda: [".cal-board > .cal-water"],
@@ -853,26 +871,12 @@ class PostResignClickConfig(FeatureConfig):
             f"仅支持日期占位符的 Playwright 选择器模板；{SELECTOR_HINT}"
         ),
     )
-    card_count_selector: SelectorCandidates = Field(
-        default_factory=lambda: [".cal-help"],
-        max_length=20,
-        title="补签卡数量选择器",
-        description=(
-            "读取已有补签卡数量的元素必须唯一匹配；留空使用 body；"
-            f"仅支持日期占位符的 Playwright 选择器模板；{SELECTOR_HINT}"
-        ),
-    )
-    card_count_regex: str = Field(
-        default=r"补签卡（当前\s*(\d+)\s*张",
-        title="补签卡数量正则",
-        description="页面补签卡数量正则，第一个分组为数量；不是选择器模板",
-    )
-    success_wait_seconds: int = Field(
+    wait_seconds: int = Field(
         default=10,
         ge=1,
         le=60,
-        title="成功等待秒数",
-        description="点击补签后等待目标日期已签到标记的最长秒数",
+        title="等待秒数",
+        description="页面与按钮就绪等待上限；点击后立即交给后续步骤，循环回到本步骤时读取目标日期 done 标记确认完成",
     )
     max_month_jumps: int = Field(
         default=12,
@@ -885,7 +889,7 @@ class PostResignClickConfig(FeatureConfig):
     @field_validator(
         "calendar_title_selector", "calendar_prev_selector", "calendar_next_selector",
         "calendar_day_selector", "calendar_selected_selector", "done_selector",
-        "button_selector", "card_count_selector",
+        "button_selector",
     )
     @classmethod
     def _validate_selector_templates(
@@ -1250,15 +1254,16 @@ FEATURE_LIST: tuple[Feature, ...] = (
         description="读取漏签日期并执行 NexusPHP 日历补签。",
     ),
     _feature(
-        "post.resign_click",
-        "页面点击补签",
+        "post.resign_loop",
+        "页面循环补签",
         "post",
         "multiple",
-        PostResignClickConfig,
+        PostResignLoopConfig,
         description=(
-            "基于 pending 仅处理过去日期，通过页面点击补签，不发送旧补签 AJAX 请求；"
+            "基于 pending 仅处理过去日期，通过页面循环点击补签，不发送旧补签 AJAX 请求；"
             "日历按当月筛选并排除相邻月，选择器匹配必须唯一；"
             "选中状态及 done 标记绑定目标日期，按钮文字必须包含“补签”；"
+            "点击后交给后续步骤，循环返回后以目标日期 done 标记确认；未完成时按 max_retries 重试，站点须保证重复补签不重复扣卡；"
             "Playwright 选择器仅作模板，支持 {date}/{day}/{month}/{year}，不支持普通 CSS 花括号。"
         ),
     ),

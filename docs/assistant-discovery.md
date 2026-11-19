@@ -286,7 +286,7 @@ cd backend
 
 新的助手导入在新建/更新工作流时使用精确 actor `assistant`，生成的配置历史 `created_by` 为 `assistant`；新的完整任务同时保存 `Run.created_by: "assistant"` 与 `trigger: "assistant"`。真实人类身份保留在助手会话 owner 及关联 action owner 中，而非新运行的 `created_by`；会话/消息及 action 载荷加密保存，owner 索引元数据并非全是密文。UI 创建人显示英文 `assistant`，tooltip 为「来源：智能助手」，通知 `trigger_label` 也为英文 `assistant`，不展示人类发起人作为运行 actor。旧记录不迁移，任务 329 仍是 `manual` / `admin`，不能改称助手来源。
 
-四项 `post.buy_card`、`post.resign`、`post.resign_click`、`post.resign_dialog` 每次真正新派发都须 owner 审核冻结的完整消费计划，包括条件启用步骤、全部过去待补签日期（窗口最多 365 天）、时区/当天、数量和费用上限。`purchase_quantity` 为 0-365 整数，0 按缺口减库存自动补齐，仍给出最大数量；`max_price` 必须为正整数，展示最大总花费而非网站实时报价。全局自动执行/工作流授权不能跳过；日期、授权及 Worker 检查点计划均由宿主私下生成。相同配置/提案重放仅返回原 run ID，不再弹审核或 submit，不自动 fallback/restart/重试。通用点击/导航的业务效果不总能识别，提示禁止用点击、填充、导航或循环绕过审核，不能宣称所有网页消费必被拦截。
+四项 `post.buy_card`、`post.resign`、`post.resign_loop`、`post.resign_dialog` 每次真正新派发都须 owner 审核冻结的完整消费计划，包括条件启用步骤、全部过去待补签日期（窗口最多 365 天）、时区/当天、数量和费用上限。`purchase_quantity` 为 0-365 整数，0 按缺口减库存自动补齐，仍给出最大数量；`max_price` 必须为正整数，展示最大总花费而非网站实时报价。全局自动执行/工作流授权不能跳过；日期、授权及 Worker 检查点计划均由宿主私下生成。相同配置/提案重放仅返回原 run ID，不再弹审核或 submit，不自动 fallback/restart/重试。通用点击/导航的业务效果不总能识别，提示禁止用点击、填充、导航或循环绕过审核，不能宣称所有网页消费必被拦截。
 
 **导入已有启用站点保留调度状态，后续自动任务可能执行新导入的购买/补签步骤。** 新消费审核仅约束助手调用，不是普通手动/调度入口的新门禁，后者维持既有策略；导入前先核对影响，新站点仍默认禁用。详细边界见 [购买与补签审核](ai-assistant.md#购买与补签审核)。
 

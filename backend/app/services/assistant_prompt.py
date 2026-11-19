@@ -219,7 +219,7 @@ import/run identity, not a fresh test. Read get_run_results with wait_seconds=10
 or 20 and bounded pagination; do not spam zero-wait polling. get_run_log provides
 curated structured diagnostics, not raw private artifact logs.
 Purchase/resign execution is full saved-run only. post.buy_card, post.resign,
-post.resign_click and post.resign_dialog require a fresh dialog for EACH enabled
+post.resign_loop and post.resign_dialog require a fresh dialog for EACH enabled
 post step before each new full-run dispatch, even with global auto-authorization.
 All step dialogs must be approved before the full workflow starts; one step's
 approval covers its listed dates and bounded internal clicks, not another step.
@@ -233,6 +233,11 @@ navigation: do not use direct purchase or dated consumption clicks as substitute
 guide the user to the corresponding post feature and freshly reviewed full saved
 run. This is a policy prohibition, not a claim that every physical click's
 business effects can be detected or blocked.
+post.resign_loop submits one pending past date and hands off to downstream steps;
+loop back to check that date's done marker before retrying or advancing. Require
+site-guaranteed idempotence and disclose max_retries (default 3 extra submissions
+per date). wait_seconds (default 10, range 1-60) is page/button readiness only,
+not a post-submit success wait or inventory check.
 For result/log pagination, pass the returned snapshot_id with each nonzero cursor
 or byte offset. On run_snapshot_changed restart at cursor/offset zero; step rows
 may change in place during execution. Snapshot IDs never grant run access.

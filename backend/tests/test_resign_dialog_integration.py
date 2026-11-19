@@ -15,8 +15,8 @@ from app.schemas.execution import RunCreate
 from app.services.execution import ExecutionService
 from app.services.resign import ResignService
 from tests.helpers import make_settings
-from tests.test_resign_click_integration import CHECKPOINT_PATH, _pending, _records
-from tests.test_worker_resign_click import install_checkpoint_transport
+from tests.test_resign_loop_integration import CHECKPOINT_PATH, _pending, _records
+from tests.test_worker_resign_loop import install_checkpoint_transport
 from tests.test_worker_resign_dialog import BASE, dialog_page
 from worker import executor
 from worker.resign_checkpoint import CHECKPOINT_ERROR

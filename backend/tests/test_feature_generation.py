@@ -53,9 +53,12 @@ def test_sensitive_hints_cover_security_and_result_semantics():
     purchase = FEATURES["post.buy_card"].generation_hints
     assert "授权" in purchase.when_to_use
     assert "自动" in " ".join(purchase.avoid)
-    resign = FEATURES["post.resign_click"].generation_hints
+    resign = FEATURES["post.resign_loop"].generation_hints
     assert "pending" in " ".join(resign.prerequisites)
     assert "过去日期" in " ".join(resign.prerequisites)
+    assert "幂等" in " ".join(resign.prerequisites)
+    for text in ("wait_seconds", "max_retries", "循环返回", "done", "unknown"):
+        assert text in " ".join(resign.evidence_required)
     dialog = FEATURES["post.resign_dialog"].generation_hints
     assert "直接消费" in dialog.when_to_use
     assert "pending" in " ".join(dialog.prerequisites)

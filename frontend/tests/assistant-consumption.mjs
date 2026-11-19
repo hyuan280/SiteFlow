@@ -11,7 +11,7 @@ const purchase = { feature_type: "post.buy_card", step_key: "buy", label: "购�
 const resign = feature => ({ feature_type: feature, step_key: feature.replaceAll(".", "-"), label: "补签" });
 const xss = '<img src=x onerror="alert(1)">';
 const review = { name: `Example ${xss}`, base_url: "https://example.com/?a=1&b=2", site_id: 12,
-  steps: [purchase, ...["post.resign", "post.resign_click", "post.resign_dialog"].map(resign)],
+  steps: [purchase, ...["post.resign", "post.resign_loop", "post.resign_dialog"].map(resign)],
   dates, date_count: dates.length, timezone: "Asia/Shanghai", today: "2026-11-07",
   warnings: ["仅授权本次完整运行；不会开启自动重试。", "所列为配置上限，不是网站实时报价。", `条件步骤也列入审阅 ${xss}`] };
 const prompt = (data = review, fields = {}) => ({ id: randomUUID(), kind: "authorization", purpose: "consumption",
@@ -27,7 +27,7 @@ try {
   await choose(state(first));
   assert.equal(ui.interactionValid.value, true);
   let html = section(await h.html()); assert.ok(html);
-  for (const label of ["网站名称", "网站地址", "运行站点", "Asia/Shanghai", "2026-11-07", "购买补签卡", "历史日历补签", "点击补签", "弹窗补签",
+  for (const label of ["网站名称", "网站地址", "运行站点", "Asia/Shanghai", "2026-11-07", "购买补签卡", "历史日历补签", "页面循环补签", "弹窗补签",
     "购买数量策略", "配置数量 0", "最多购买", "365 张", "单张价格上限", "7（网站积分或计价单位）", "本步骤总消费上限", "2555",
     "全部批准补签日期（365 天）", "改变网站状态", "消耗积分、费用或补签卡", "一次性许可", "不可复用", "全局默认授权也不能跳过", "不是网站实时报价"]) assert.ok(html.includes(label), label);
   assert.equal((html.match(/<time /g) ?? []).length, 365);
@@ -50,7 +50,7 @@ try {
   const denying = ui.respondInteraction("deny");
   assert.deepEqual(JSON.parse(h.last().body), { decision: "deny" });
   await respond(state(null)); await respond(state(null)); await denying;
-  for (const feature of ["post.resign", "post.resign_click", "post.resign_dialog"]) {
+  for (const feature of ["post.resign", "post.resign_loop", "post.resign_dialog"]) {
     assert.equal(types.isAssistantPendingInteraction(prompt({ ...fixed, steps: [resign(feature)] })), true, "no purchase limits required on resign-only steps");
   }
   assert.equal(types.isAssistantPendingInteraction(prompt({ ...fixed, steps: [{ ...purchase, maximum_quantity: 0, maximum_spend: 0 }] })), true, "automatic purchase can have a zero bound");

@@ -265,6 +265,6 @@ def test_automatic_grant_cannot_be_stolen_or_rebound(execution, monkeypatch):
 
 def test_post_and_plugin_never_auto_execute(execution):
     host_turn(execution)
-    for feature in ("post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog", "plugin.foo"):
+    for feature in ("post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog", "plugin.foo"):
         assert run(execution, arguments(feature))["code"] == "execution_feature_denied"
     execution.manager._worker.assert_not_awaited()

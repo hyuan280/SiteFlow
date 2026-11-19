@@ -86,10 +86,10 @@ class SecretProviders:
     def register(self, job, site, steps, *, reserve_auth=None):
         token = secrets.token_urlsafe(32)
         allowed = {}
-        resign_steps = set()
+        resign_steps = {}
         for step in steps:
             if step.enabled and step.feature_type in CHECKPOINT_RESIGN_FEATURES:
-                resign_steps.add(step.step_key)
+                resign_steps[step.step_key] = step.feature_type
             if step.enabled and step.feature_type in SECRET_PURPOSES:
                 provider = step_provider(site, step)
                 options = dict(step.config)
@@ -101,7 +101,7 @@ class SecretProviders:
                 allowed[step.step_key] = (step.feature_type, provider, options)
         with self.lock:
             self.leases = {key: value for key, value in self.leases.items() if value[0] != job.id}
-            self.jobs[job.id] = (self.digest(token), site.id, job.attempt, time.monotonic() + self.settings.execution_timeout, allowed, frozenset(resign_steps), reserve_auth)
+            self.jobs[job.id] = (self.digest(token), site.id, job.attempt, time.monotonic() + self.settings.execution_timeout, allowed, resign_steps, reserve_auth)
         return token
 
     def authorize_resign(self, token, job_id, site_id, step_key, session):
@@ -121,7 +121,7 @@ class SecretProviders:
             or job.status not in {"queued", "running"}
         ):
             raise SecretDenied()
-        return job
+        return job, grant[5][step_key]
 
     def revoke(self, job_id):
         with self.lock:

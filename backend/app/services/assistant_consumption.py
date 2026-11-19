@@ -18,7 +18,7 @@ from app.services.resign import ResignService
 
 # Reviewed plan builders only. Whether approval is required comes from FEATURES.category.
 CONSUMING_FEATURES = frozenset({
-    "post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog",
+    "post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog",
 })
 
 
@@ -46,10 +46,11 @@ def build_plan(db, service, site):
     if unresolved:
         raise WorkflowDenied("workflow_outcome_uncertain")
     review_steps = []
+    loop_warnings = []
     for step in steps:
         item = {"feature_type": step.feature_type, "step_key": step.step_key,
                 "label": {"post.buy_card": "\u8d2d\u4e70\u8865\u7b7e\u5361", "post.resign": "\u5386\u53f2\u65e5\u5386\u8865\u7b7e",
-                          "post.resign_click": "\u70b9\u51fb\u8865\u7b7e", "post.resign_dialog": "\u5f39\u7a97\u8865\u7b7e"}[step.feature_type]}
+                          "post.resign_loop": "\u9875\u9762\u5faa\u73af\u8865\u7b7e", "post.resign_dialog": "\u5f39\u7a97\u8865\u7b7e"}[step.feature_type]}
         if step.feature_type == "post.buy_card":
             quantity, price = step.config.get("purchase_quantity", 0), step.config.get("max_price")
             if type(quantity) is not int or not 0 <= quantity <= 365:
@@ -60,6 +61,13 @@ def build_plan(db, service, site):
             item.update(purchase_quantity=quantity, maximum_quantity=maximum,
                         max_price=price, maximum_spend=maximum * price)
         review_steps.append(item)
+        if step.feature_type == "post.resign_loop":
+            max_retries = step.config.get("max_retries", 3)
+            loop_warnings.append(
+                f"{item['label']}\uff08{step.step_key}\uff09\u4f7f\u7528\u6b65\u9aa4\u5faa\u73af\uff1a"
+                f"\u6bcf\u4e2a\u65e5\u671f\u9996\u6b21\u63d0\u4ea4\u540e\u6700\u591a\u989d\u5916\u91cd\u8bd5 {max_retries} \u6b21"
+                f"\uff08max_retries={max_retries}\uff0c\u5408\u8ba1\u6700\u591a {1 + max_retries} \u6b21\u63d0\u4ea4\uff09\u3002"
+                "\u7ad9\u70b9\u9700\u4fdd\u8bc1\u91cd\u590d\u8865\u7b7e\u5e42\u7b49\uff0c\u4e0d\u91cd\u590d\u6263\u5361\u3002")
     fingerprint, _ = _fingerprint(service, site)
     return {"binding": workflow_binding(site), "fingerprint": fingerprint,
             "unresolved_dates": unresolved,
@@ -68,11 +76,13 @@ def build_plan(db, service, site):
                        "timezone": str(resign.timezone),
                        "today": today,
                        "warnings": [
-                            "\u6bcf\u4e2a post \u6b65\u9aa4\u5747\u9700\u5355\u72ec\u786e\u8ba4\uff0c\u5168\u90e8\u540c\u610f\u540e\u624d\u4f1a\u5b8c\u6574\u8fd0\u884c\u4e00\u6b21\uff1b\u4e0d\u4f1a\u81ea\u52a8\u91cd\u8bd5\u3002"
-                            "\u672c\u6b65\u9aa4\u7684\u6388\u6743\u8986\u76d6\u6240\u5217\u5168\u90e8\u65e5\u671f\u548c\u6570\u91cf\u4e0a\u9650\uff0c\u4e0d\u4f1a\u4e3a\u6bcf\u4e2a\u65e5\u671f\u6216\u5185\u90e8\u70b9\u51fb\u518d\u6b21\u5f39\u7a97\u3002",
+                            "\u6bcf\u4e2a post \u6b65\u9aa4\u5747\u9700\u5355\u72ec\u786e\u8ba4\uff0c\u5168\u90e8\u540c\u610f\u540e\u624d\u4f1a\u5b8c\u6574\u8fd0\u884c\u4e00\u6b21\uff1b"
+                            + ("\u4e0d\u4f1a\u81ea\u52a8\u6574\u4efb\u52a1\u91cd\u542f\uff0c\u4f46\u6b65\u9aa4\u5faa\u73af\u4f1a\u6309\u914d\u7f6e\u91cd\u590d\u63d0\u4ea4\u3002"
+                               if loop_warnings else "\u4e0d\u4f1a\u81ea\u52a8\u91cd\u8bd5\u3002")
+                            + "\u672c\u6b65\u9aa4\u7684\u6388\u6743\u8986\u76d6\u6240\u5217\u5168\u90e8\u65e5\u671f\u548c\u6570\u91cf\u4e0a\u9650\uff0c\u4e0d\u4f1a\u4e3a\u6bcf\u4e2a\u65e5\u671f\u6216\u5185\u90e8\u70b9\u51fb\u518d\u6b21\u5f39\u7a97\u3002",
                            "\u6240\u5217\u4e3a\u914d\u7f6e\u4e0a\u9650\uff0c\u4e0d\u662f\u7f51\u7ad9\u5b9e\u65f6\u62a5\u4ef7\uff1b\u81ea\u52a8\u8d2d\u5361\u6570\u91cf\u6309\u5f85\u8865\u7b7e\u5929\u6570\u51cf\u5e93\u5b58\u8ba1\u7b97\u3002",
                            "\u6761\u4ef6\u6b65\u9aa4\u4e5f\u5217\u5165\u5ba1\u9605\uff1b\u666e\u901a\u70b9\u51fb\u7684\u7f51\u7ad9\u4e1a\u52a1\u6548\u679c\u65e0\u6cd5\u4ec5\u51ed\u9009\u62e9\u5668\u8bc6\u522b\u3002",
-                       ]}}
+                         ] + loop_warnings}}
 
 
 def _pending_plan(db, tools, plan_id, step_key):

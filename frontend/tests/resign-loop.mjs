@@ -11,7 +11,7 @@ import ElementPlus, { ID_INJECTION_KEY, ZINDEX_INJECTION_KEY } from "element-plu
 const venvPython = fileURLToPath(new URL("../../.venv/bin/python", import.meta.url));
 const [feature, legacy] = JSON.parse(execFileSync(process.env.PYTHON ?? (existsSync(venvPython) ? venvPython : "python3"), [
   "-c",
-  "import json; from sqlalchemy import create_engine; from sqlalchemy.orm import Session; from app.features.catalog import FEATURES; from app.models.setting import AppSetting; from app.services.feature_settings import FeatureSettingsService; engine = create_engine('sqlite://'); AppSetting.__table__.create(engine); service = FeatureSettingsService(Session(engine)); print(json.dumps([service.view(FEATURES[key]).model_dump(mode='json') for key in ('post.resign_click', 'post.resign')]))",
+  "import json; from sqlalchemy import create_engine; from sqlalchemy.orm import Session; from app.features.catalog import FEATURES; from app.models.setting import AppSetting; from app.services.feature_settings import FeatureSettingsService; engine = create_engine('sqlite://'); AppSetting.__table__.create(engine); service = FeatureSettingsService(Session(engine)); print(json.dumps([service.view(FEATURES[key]).model_dump(mode='json') for key in ('post.resign_loop', 'post.resign')]))",
 ], { cwd: fileURLToPath(new URL("../../backend", import.meta.url)), encoding: "utf8" }));
 const schema = feature.config_schema;
 const defaults = {
@@ -23,10 +23,9 @@ const defaults = {
   calendar_selected_selector: ['.cal-grid > button.cal-cell.on:not(.mute):has(.cal-num:text-is("{day}"))'],
   done_selector: ['.cal-grid > button.cal-cell:not(.mute):has(.cal-num:text-is("{day}")) .cal-badge.att'],
   button_selector: [".cal-att button.cal-att-pill.act"],
-  card_count_selector: [".cal-help"],
-  card_count_regex: String.raw`补签卡（当前\s*(\d+)\s*张`,
-  success_wait_seconds: 10,
+  wait_seconds: 10,
   max_month_jumps: 12,
+  max_retries: 3,
 };
 const legacyDefaults = {
   attendance_url: "{base_url}/attendance.php",
@@ -45,9 +44,11 @@ const legacyDefaults = {
 };
 const selectors = Object.keys(defaults).filter(key => key.endsWith("_selector"));
 const dateSelectors = ["calendar_day_selector", "calendar_selected_selector", "done_selector"];
-assert.equal(feature.name, "页面点击补签");
-assert.equal(schema.title, "PostResignClickConfig");
+assert.equal(feature.key, "post.resign_loop");
+assert.equal(feature.name, "页面循环补签");
+assert.equal(schema.title, "PostResignLoopConfig");
 assert.equal(schema.additionalProperties, false);
+assert.equal(Object.keys(defaults).length, 11);
 assert.deepEqual(feature.defaults, defaults);
 assert.deepEqual(Object.keys(schema.properties).sort(), Object.keys(defaults).sort());
 for (const [key, value] of Object.entries(defaults)) {
@@ -61,7 +62,7 @@ for (const key of selectors) {
   const property = schema.properties[key];
   assert.equal(property.type, "array", key);
   assert.deepEqual(property.items, { type: "string", minLength: 1 });
-  assert.equal(property.minItems ?? 0, key === "card_count_selector" ? 0 : 1);
+  assert.equal(property.minItems, 1);
   assert.equal(property.maxItems, 20);
 }
 for (const key of dateSelectors) {
@@ -69,7 +70,7 @@ for (const key of dateSelectors) {
     assert.ok(schema.properties[key].description.includes(token), `${key}: ${token}`);
   }
 }
-for (const [key, minimum, maximum] of [["success_wait_seconds", 1, 60], ["max_month_jumps", 0, 120]]) {
+for (const [key, minimum, maximum] of [["wait_seconds", 1, 60], ["max_month_jumps", 0, 120], ["max_retries", 0, 10]]) {
   assert.equal(schema.properties[key].type, "integer");
   assert.equal(schema.properties[key].minimum, minimum);
   assert.equal(schema.properties[key].maximum, maximum);
@@ -86,7 +87,7 @@ const server = await createServer({
   optimizeDeps: { noDiscovery: true, include: [] },
   server: { middlewareMode: true, hmr: false },
   plugins: [{
-    name: "resign-clicks-test-expose", enforce: "pre",
+    name: "resign-loop-test-expose", enforce: "pre",
     transform(source, id) {
       if (id.endsWith("/SchemaConfigForm.vue")) {
         source = source.replace("</script>", "defineExpose({ valueOf, setField, clearField, openPicker, applyPicked, addArrayItem, updateArrayItem, removeArrayItem });\n</script>");
@@ -163,13 +164,14 @@ try {
       assert.match(html, /拾取并添加/);
       assert.match(html, /type="number" value="10" min="1" max="60"/);
       assert.match(html, /type="number" value="12" min="0" max="120"/);
+      assert.match(html, /type="number" value="3" min="0" max="10"/);
     }
     assert.deepEqual(step.config, {}, "rendering defaults must not create overrides");
   }
 
   const inherited = freeze({
     calendar_day_selector: ['button.day:not(.adjacent):has-text("{day}")', '[data-date="{date}"]'],
-    success_wait_seconds: 25,
+    wait_seconds: 25,
   });
   let emissions = 0;
   const props = reactive({ schema, modelValue: {}, inherited, pickerBaseUrl: "https://example.com" });
@@ -210,13 +212,14 @@ try {
     assert.deepEqual(props.modelValue, {});
     assert.deepEqual(form.valueOf(key, property), original);
   }
-  form.setField("card_count_selector", []);
-  assert.deepEqual(form.valueOf("card_count_selector", schema.properties.card_count_selector), []);
-  form.clearField("card_count_selector");
-  form.setField("success_wait_seconds", 40);
+  form.setField("wait_seconds", 40);
   assert.match(await render(Form, props), /恢复继承/);
-  form.clearField("success_wait_seconds");
-  assert.equal(form.valueOf("success_wait_seconds", schema.properties.success_wait_seconds), 25);
+  form.clearField("wait_seconds");
+  assert.equal(form.valueOf("wait_seconds", schema.properties.wait_seconds), 25);
+  form.setField("max_retries", 0);
+  assert.equal(form.valueOf("max_retries", schema.properties.max_retries), 0);
+  form.clearField("max_retries");
+  assert.equal(form.valueOf("max_retries", schema.properties.max_retries), 3);
   props.inherited = null;
   for (const key of selectors) assert.equal(form.valueOf(key, schema.properties[key]), schema.properties[key].default);
   assert.deepEqual(feature.defaults, defaults);
@@ -225,14 +228,24 @@ try {
   const editor = await setup(Editor, { feature });
   assert.equal(editor.validationError.value, "");
   for (const key of selectors) {
-    for (const invalid of ["#day-{day}", [""], [1], Array(21).fill("#day-{day}"), ...(key === "card_count_selector" ? [] : [[]])]) {
+    for (const invalid of ["#day-{day}", [""], [1], Array(21).fill("#day-{day}"), []]) {
       editor.text.value = JSON.stringify({ [key]: invalid });
       assert.match(editor.validationError.value, new RegExp(key));
     }
   }
-  for (const invalid of [0, 61, 1.5, "10"]) {
-    editor.text.value = JSON.stringify({ success_wait_seconds: invalid });
-    assert.match(editor.validationError.value, /success_wait_seconds/);
+  for (const [key, values] of [
+    ["wait_seconds", [0, 61, 1.5, "10", true, null]],
+    ["max_retries", [-1, 11, 1.5, "3", true, null]],
+    ["max_month_jumps", [-1, 121, 1.5, "12", true, null]],
+  ]) {
+    for (const invalid of values) {
+      editor.text.value = JSON.stringify({ [key]: invalid });
+      assert.match(editor.validationError.value, new RegExp(key));
+    }
+  }
+  for (const max_retries of [0, 3, 10]) {
+    editor.text.value = JSON.stringify({ max_retries });
+    assert.equal(editor.validationError.value, "");
   }
   const dayTemplate = 'button.day:not(.adjacent):has(.num:text-is("{day}"))';
   form.openPicker("calendar_day_selector", schema.properties.calendar_day_selector, 0);
@@ -255,7 +268,7 @@ try {
   try {
     await savingEditor.save();
     assert.deepEqual(requests, [{
-      url: "/api/v1/features/post.resign_click/settings", method: "PUT",
+      url: "/api/v1/features/post.resign_loop/settings", method: "PUT",
       defaults: saved, required_fields: feature.required_fields, execution_settings: feature.execution_settings,
     }]);
     assert.deepEqual(updates, [{ event: "updated", value: { ...feature, defaults: saved } }]);
@@ -274,7 +287,7 @@ try {
     assert.deepEqual(legacyStep.config, {});
   }
   assert.deepEqual(legacy.defaults, legacyDefaults);
-  console.log("Resign clicks regression passed (real API schemas, editable/readonly, generic selector picking, inheritance, template save, legacy FullCalendar unchanged)");
+  console.log("Resign loop regression passed (11-field API schema, editable/readonly, generic selector picking, inheritance, retry bounds, template save, legacy FullCalendar unchanged)");
 } finally {
   await server.close();
 }

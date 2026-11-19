@@ -10,15 +10,15 @@ from types import SimpleNamespace
 import pytest
 
 from app.models.execution import JobStep, Run, SiteJob
-from app.models.workflow import Site, SiteResignRecord
+from app.models.workflow import Site, SiteResignRecord, WorkflowStep
 from app.schemas.execution import RunCreate
 from app.services.execution import ExecutionService
 from app.services.executor import ExecutionManager
-from app.services.resign import ResignService
+from app.services.resign import ResignConflict, ResignService
 from app.services.secret_providers import SecretDenied
 
 
-@pytest.fixture(params=["post.resign_click", "post.resign_dialog"])
+@pytest.fixture(params=["post.resign_loop", "post.resign_dialog"])
 def checkpoint_feature(request):
     return request.param
 
@@ -26,7 +26,7 @@ def checkpoint_feature(request):
 @pytest.fixture
 def execution(client, monkeypatch, fake_dispatch):
     response = client.post("/api/v1/sites", json={
-        "name": "resign-click-execution",
+        "name": "resign-loop-execution",
         "base_url": "https://pt.example.com",
         "lane_policy": "general",
         "steps": [{"step_key": "open", "feature_type": "flow.open"}],
@@ -58,7 +58,7 @@ def _result(day, **overrides):
     }
 
 
-def _step(result, *, feature="post.resign_click", status="running"):
+def _step(result, *, feature="post.resign_loop", status="running"):
     return {
         "step_key": "resign", "feature_type": feature, "status": status,
         "message": "checkpoint", "data": {"resign": result},
@@ -142,7 +142,7 @@ def test_new_results_reject_invalid_and_out_of_scope_dates(execution, bucket, ch
     assert _records(manager, site_id) == {day: "unknown" if bucket == "unconfirmed" else bucket}
 
 
-@pytest.mark.parametrize("feature", ["post.resign", "post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("feature", ["post.resign", "post.resign_loop", "post.resign_dialog"])
 @pytest.mark.parametrize("overall", ["waiting_human", "canceled", "cancel_requested"])
 def test_final_confirmations_survive_overall_status(execution, monkeypatch, feature, overall):
     manager, site_id, run_id, job_id = execution
@@ -427,7 +427,7 @@ def test_checkpoint_merge_requires_both_step_key_and_feature(
     previous = _result("2026-10-01", submit_attempted=True, unconfirmed=[{"date": "2026-10-01"}])
     incoming = _step(_result("2026-10-02"), feature=(
         checkpoint_feature if same_feature else
-        "post.resign_dialog" if checkpoint_feature == "post.resign_click" else "post.resign_click"
+        "post.resign_dialog" if checkpoint_feature == "post.resign_loop" else "post.resign_loop"
     ))
     incoming["step_key"] = "resign" if same_key else "other"
     with manager.session_factory() as session:
@@ -503,9 +503,13 @@ def checkpoint(client, execution, checkpoint_feature):
         session.commit()
         job = session.get(SiteJob, job_id)
         token = manager.secret_providers.register(job, session.get(Site, site_id), [
-            SimpleNamespace(enabled=True, feature_type=checkpoint_feature, step_key="resign"),
+            SimpleNamespace(
+                enabled=True, feature_type=checkpoint_feature, step_key="resign",
+                config={},
+            ),
             SimpleNamespace(enabled=False, feature_type=checkpoint_feature, step_key="disabled"),
             SimpleNamespace(enabled=True, feature_type="post.resign", step_key="legacy"),
+            SimpleNamespace(enabled=True, feature_type="post.resign_click", step_key="removed"),
         ])
     body = {
         "job_id": job_id, "site_id": site_id, "step_key": "resign", "phase": "prepare",
@@ -520,7 +524,7 @@ def _post_checkpoint(client, token, body):
     return client.post(CHECKPOINT_PATH, json=body, headers={"Authorization": f"Bearer {token}"})
 
 
-def _second_grant(manager, site_id):
+def _second_grant(manager, site_id, *, feature="post.resign_loop"):
     with manager.session_factory() as session:
         run = Run(mode="manual", trigger="manual", status="running", created_by="admin")
         session.add(run)
@@ -529,12 +533,12 @@ def _second_grant(manager, site_id):
         session.add(job)
         session.commit()
         token = manager.secret_providers.register(job, session.get(Site, site_id), [
-            SimpleNamespace(enabled=True, feature_type="post.resign_click", step_key="resign"),
+            SimpleNamespace(enabled=True, feature_type=feature, step_key="resign", config={}),
         ])
         return job.id, token
 
 
-def test_prepare_ack_is_committed_and_replay_is_rejected(client, checkpoint):
+def test_prepare_ack_is_committed_and_replay_follows_feature_identity(client, checkpoint, checkpoint_feature):
     manager, token, body = checkpoint
     response = _post_checkpoint(client, token, body)
     assert response.status_code == 200 and response.json() == {"ok": True}
@@ -544,12 +548,14 @@ def test_prepare_ack_is_committed_and_replay_is_rejected(client, checkpoint):
         assert row.status == "unknown" and row.job_id == body["job_id"]
         assert row.run_id == session.get(SiteJob, body["job_id"]).run_id
         assert "private-input" not in row.message
-    assert _post_checkpoint(client, token, body).status_code == 409
+    assert _post_checkpoint(client, token, body).status_code == (
+        200 if checkpoint_feature == "post.resign_loop" else 409
+    )
 
 
 @pytest.mark.parametrize("change", [
     "missing", "wrongtoken", "revoked", "expired", "wrongstep", "disabled", "wrongsite",
-    "wrongjob", "attempt", "finished", "cancel", "runfinished", "clear", "reregister", "legacy",
+    "wrongjob", "attempt", "finished", "cancel", "runfinished", "clear", "reregister", "legacy", "removed",
 ])
 def test_checkpoint_authorization_fails_closed(client, checkpoint, monkeypatch, change):
     manager, token, body = checkpoint
@@ -566,7 +572,7 @@ def test_checkpoint_authorization_fails_closed(client, checkpoint, monkeypatch, 
         import app.services.secret_providers as module
         now = module.time.monotonic()
         monkeypatch.setattr(module.time, "monotonic", lambda: now + manager.settings.execution_timeout + 1)
-    elif change in {"wrongstep", "disabled", "legacy"}:
+    elif change in {"wrongstep", "disabled", "legacy", "removed"}:
         body["step_key"] = "open" if change == "wrongstep" else change
     elif change in {"wrongsite", "wrongjob"}:
         body["site_id" if change == "wrongsite" else "job_id"] += 1000
@@ -596,6 +602,19 @@ def test_resign_snapshot_does_not_grant_credentials(client, checkpoint):
         ))
     # The current workflow contains no resign step; authorization uses the dispatch snapshot.
     assert _post_checkpoint(client, token, body).status_code == 200
+
+
+@pytest.mark.parametrize("feature", [None, "post.resign_dialog", "post.resign", "post.resign_click", "unknown"])
+def test_service_default_and_non_loop_identity_cannot_reprepare(client, checkpoint, feature):
+    manager, token, body = checkpoint
+    assert _post_checkpoint(client, token, body).status_code == 200
+    with manager.session_factory() as session:
+        args = () if feature is None else (feature,)
+        with pytest.raises(ResignConflict):
+            ResignService(session, manager.settings).checkpoint(
+                session.get(SiteJob, body["job_id"]), "prepare", body["date"],
+                body["result"]["resign"], *args,
+            )
 
 
 @pytest.mark.parametrize("invalid", [
@@ -752,14 +771,18 @@ def test_stream_cannot_steal_another_jobs_reservation(client, checkpoint, status
 
 
 @pytest.mark.parametrize("status", ["unknown", "success", "already_signed"])
-def test_existing_reserved_or_terminal_date_never_prepares(client, checkpoint, status):
+def test_existing_reservation_follows_feature_and_terminal_dates_never_prepare(
+    client, checkpoint, checkpoint_feature, status,
+):
     manager, token, body = checkpoint
     with manager.session_factory() as session:
         session.add(SiteResignRecord(
             site_id=body["site_id"], resign_date=body["date"], status=status,
         ))
         session.commit()
-    assert _post_checkpoint(client, token, body).status_code == 409
+    assert _post_checkpoint(client, token, body).status_code == (
+        200 if status == "unknown" and checkpoint_feature == "post.resign_loop" else 409
+    )
 
 
 def test_confirm_only_updates_owned_target_in_cumulative_state(client, checkpoint):
@@ -872,7 +895,7 @@ def test_owned_unknown_cannot_be_downgraded_to_failed_by_stream(client, checkpoi
     assert _records(manager, body["site_id"]) == {body["date"]: "unknown"}
 
 
-@pytest.mark.parametrize("feature", ["post.resign", "post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("feature", ["post.resign", "post.resign_loop", "post.resign_dialog"])
 def test_legacy_failure_cannot_release_reservation_for_another_prepare(client, checkpoint, feature):
     manager, token, body = checkpoint
     assert _post_checkpoint(client, token, body).status_code == 200
@@ -948,7 +971,7 @@ def test_readonly_done_requires_valid_pending_scope_to_close_foreign_reservation
     assert _records(manager, body["site_id"]) == {day: "unknown"}
 
 
-@pytest.mark.parametrize("feature", ["post.resign", "post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("feature", ["post.resign", "post.resign_loop", "post.resign_dialog"])
 @pytest.mark.parametrize("terminal", ["success", "already_signed"])
 @pytest.mark.parametrize("incoming", ["failed", "unknown", "success", "already_signed"])
 def test_all_features_preserve_terminal_status_and_owner(execution, feature, terminal, incoming):
@@ -1073,9 +1096,11 @@ def test_dialog_missing_inference_still_records_unreserved_dates(execution, prev
         assert (row.run_id, row.job_id) == ((999, 999) if previous else (run_id, job_id))
 
 
-@pytest.mark.parametrize("feature", ["post.resign", "post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("feature", ["post.resign", "post.resign_loop", "post.resign_dialog"])
 @pytest.mark.parametrize("incoming", ["failed", "success", "already_signed", "inferred_signed"])
-def test_result_cas_does_not_overwrite_a_concurrent_prepare(client, checkpoint, feature, incoming):
+def test_result_cas_does_not_overwrite_a_concurrent_prepare(
+    client, checkpoint, checkpoint_feature, feature, incoming,
+):
     from sqlalchemy import event
 
     manager, token, body = checkpoint
@@ -1121,4 +1146,250 @@ def test_result_cas_does_not_overwrite_a_concurrent_prepare(client, checkpoint, 
     with manager.session_factory() as session:
         row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
         assert row.status == "unknown" and row.job_id == body["job_id"]
+    assert _post_checkpoint(client, token, body).status_code == (
+        200 if checkpoint_feature == "post.resign_loop" else 409
+    )
+
+
+@pytest.mark.parametrize("checkpoint_feature", ["post.resign_loop"])
+class TestLoopCheckpoint:
+    def test_same_job_reprepares_and_only_owner_confirms(self, client, checkpoint):
+        manager, token, body = checkpoint
+        # Only the dispatched feature identity grants repeated preparation.
+        for _ in range(4):
+            assert _post_checkpoint(client, token, body).status_code == 200
+        other_job, other_token = _second_grant(manager, body["site_id"])
+        assert _post_checkpoint(client, other_token, {**body, "job_id": other_job}).status_code == 409
+        confirm = {**body, "phase": "confirm", "result": {"resign": _result(
+            body["date"], success=[{"date": body["date"]}],
+        )}}
+        assert _post_checkpoint(client, other_token, {**confirm, "job_id": other_job}).status_code == 409
+        assert _post_checkpoint(client, token, confirm).status_code == 200
+        assert _post_checkpoint(client, token, confirm).status_code == 200
+        assert _post_checkpoint(client, token, body).status_code == 409
+
+    @pytest.mark.parametrize("status", ["success", "already_signed"])
+    def test_terminal_dates_never_reprepare(self, client, checkpoint, status):
+        manager, token, body = checkpoint
+        with manager.session_factory() as session:
+            job = session.get(SiteJob, body["job_id"])
+            session.add(SiteResignRecord(
+                site_id=body["site_id"], resign_date=body["date"], status=status,
+                job_id=job.id, run_id=job.run_id, message="original confirmation",
+            ))
+            session.commit()
+        assert _post_checkpoint(client, token, body).status_code == 409
+        assert _records(manager, body["site_id"]) == {body["date"]: status}
+
+    @pytest.mark.parametrize("status", ["queued", "running", "waiting_human", "fail", "error", "canceled", "unknown"])
+    def test_foreign_unknown_owner_activity_and_takeover(self, client, checkpoint, status):
+        manager, token, body = checkpoint
+        old_job_id, old_token = _second_grant(manager, body["site_id"])
+        old_body = {**body, "job_id": old_job_id}
+        assert _post_checkpoint(client, old_token, old_body).status_code == 200
+        with manager.session_factory() as session:
+            old_job = session.get(SiteJob, old_job_id)
+            old_run_id = old_job.run_id
+            old_job.status = status
+            if status not in {"queued", "running"}:
+                old_job.finished_at = datetime.now(timezone.utc)
+            session.commit()
+        response = _post_checkpoint(client, token, body)
+        if status in {"queued", "running"}:
+            assert response.status_code == 409
+            with manager.session_factory() as session:
+                row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
+                assert (row.job_id, row.run_id, row.status) == (old_job_id, old_run_id, "unknown")
+            return
+        assert response.status_code == 200
+        assert _post_checkpoint(client, token, body).status_code == 200
+        with manager.session_factory() as session:
+            row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
+            assert row.job_id == body["job_id"] and row.status == "unknown"
+            assert row.run_id == session.get(SiteJob, body["job_id"]).run_id
+            # Ownership is enforced by the service even independently of grant expiry.
+            with pytest.raises(ResignConflict):
+                ResignService(session, manager.settings).checkpoint(
+                    session.get(SiteJob, old_job_id), "confirm", body["date"],
+                    _result(body["date"], success=[{"date": body["date"]}]), "post.resign_loop",
+                )
+        confirm = {**body, "phase": "confirm", "result": {"resign": _result(
+            body["date"], success=[{"date": body["date"]}],
+        )}}
+        assert _post_checkpoint(client, old_token, {**confirm, "job_id": old_job_id}).status_code == 403
+        assert _post_checkpoint(client, token, confirm).status_code == 200
+
+    @pytest.mark.parametrize("owner", [None, "missing"])
+    def test_unknown_without_live_owner_can_be_claimed(self, client, checkpoint, owner):
+        manager, token, body = checkpoint
+        with manager.session_factory() as session:
+            session.add(SiteResignRecord(
+                site_id=body["site_id"], resign_date=body["date"], status="unknown",
+                job_id=999 if owner else None, run_id=999 if owner else None,
+            ))
+            session.commit()
+        assert _post_checkpoint(client, token, body).status_code == 200
+        with manager.session_factory() as session:
+            row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
+            assert row.job_id == body["job_id"] and row.status == "unknown"
+
+    def test_concurrent_takeovers_compare_and_swap_owner(self, client, checkpoint, monkeypatch):
+        manager, token, body = checkpoint
+        second_job, second_token = _second_grant(manager, body["site_id"])
+        with manager.session_factory() as session:
+            session.add(SiteResignRecord(
+                site_id=body["site_id"], resign_date=body["date"], status="unknown",
+            ))
+            session.commit()
+        barrier = Barrier(2)
+        original = ResignService.pending_dates
+
+        def pending(service, *args):
+            dates = original(service, *args)
+            barrier.wait(timeout=5)
+            return dates
+
+        monkeypatch.setattr(ResignService, "pending_dates", pending)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_post_checkpoint, client, key, item) for key, item in [
+                (token, body), (second_token, {**body, "job_id": second_job}),
+            ]]
+            statuses = [future.result().status_code for future in futures]
+        assert sorted(statuses) == [200, 409]
+        with manager.session_factory() as session:
+            row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
+            assert row.status == "unknown"
+            assert row.job_id == (body["job_id"] if statuses[0] == 200 else second_job)
+
+    def test_owner_activity_is_checked_at_update(self, client, checkpoint, monkeypatch):
+        manager, token, body = checkpoint
+        old_job_id, old_token = _second_grant(manager, body["site_id"])
+        assert _post_checkpoint(client, old_token, {**body, "job_id": old_job_id}).status_code == 200
+        with manager.session_factory() as session:
+            session.get(SiteJob, old_job_id).status = "fail"
+            session.commit()
+        original = ResignService.pending_dates
+
+        def pending(service, *args):
+            dates = original(service, *args)
+            with manager.session_factory() as session:
+                session.get(SiteJob, old_job_id).status = "running"
+                session.commit()
+            return dates
+
+        monkeypatch.setattr(ResignService, "pending_dates", pending)
+        assert _post_checkpoint(client, token, body).status_code == 409
+        with manager.session_factory() as session:
+            row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
+            assert row.job_id == old_job_id and row.status == "unknown"
+
+    @pytest.mark.parametrize("change", ["owner", "terminal"])
+    def test_takeover_cas_preserves_concurrent_owner_or_confirmation(
+        self, client, checkpoint, monkeypatch, change,
+    ):
+        manager, token, body = checkpoint
+        new_job_id, _ = _second_grant(manager, body["site_id"])
+        with manager.session_factory() as session:
+            session.add(SiteResignRecord(
+                site_id=body["site_id"], resign_date=body["date"], status="unknown",
+            ))
+            session.commit()
+        original = ResignService.pending_dates
+
+        def pending(service, *args):
+            dates = original(service, *args)
+            with manager.session_factory() as session:
+                row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
+                if change == "owner":
+                    new_job = session.get(SiteJob, new_job_id)
+                    row.job_id, row.run_id = new_job.id, new_job.run_id
+                    # No active-job guard can mask a missing owner CAS here.
+                    new_job.status = "fail"
+                else:
+                    row.status = "success"
+                session.commit()
+            return dates
+
+        monkeypatch.setattr(ResignService, "pending_dates", pending)
+        assert _post_checkpoint(client, token, body).status_code == 409
+        with manager.session_factory() as session:
+            row = session.query(SiteResignRecord).filter_by(site_id=body["site_id"]).one()
+            if change == "owner":
+                assert row.job_id == new_job_id and row.status == "unknown"
+            else:
+                assert row.job_id is None and row.status == "success"
+
+
+@pytest.mark.parametrize("checkpoint_feature", ["post.resign_dialog"])
+def test_result_feature_identity_cannot_upgrade_dialog_grant(client, checkpoint):
+    _, token, body = checkpoint
+    body["feature_type"] = "post.resign_loop"
+    body["result"]["feature_type"] = "post.resign_loop"
+    body["result"]["resign"]["feature_type"] = "post.resign_loop"
+    assert _post_checkpoint(client, token, body).status_code == 200
     assert _post_checkpoint(client, token, body).status_code == 409
+
+
+@pytest.mark.parametrize("feature", ["post.resign_loop", "post.resign_dialog"])
+def test_dispatch_feature_snapshot_is_not_a_live_step_reference(client, checkpoint, feature):
+    manager, _, body = checkpoint
+    step = SimpleNamespace(enabled=True, feature_type=feature, step_key="resign", config={})
+    with manager.session_factory() as session:
+        token = manager.secret_providers.register(
+            session.get(SiteJob, body["job_id"]), session.get(Site, body["site_id"]), [step],
+        )
+        step.feature_type = "post.resign_dialog" if feature == "post.resign_loop" else "post.resign_loop"
+        job, granted_feature = manager.secret_providers.authorize_resign(
+            token, body["job_id"], body["site_id"], "resign", session,
+        )
+        assert job.id == body["job_id"] and granted_feature == feature
+    assert _post_checkpoint(client, token, body).status_code == 200
+    assert _post_checkpoint(client, token, body).status_code == (200 if feature == "post.resign_loop" else 409)
+
+
+def test_same_grant_keeps_loop_and_dialog_step_authorities_separate(client, checkpoint):
+    manager, _, body = checkpoint
+    with manager.session_factory() as session:
+        token = manager.secret_providers.register(
+            session.get(SiteJob, body["job_id"]), session.get(Site, body["site_id"]), [
+                SimpleNamespace(enabled=True, feature_type=feature, step_key=key, config={})
+                for key, feature in (("loop", "post.resign_loop"), ("dialog", "post.resign_dialog"))
+            ],
+        )
+    loop_body = {**body, "step_key": "loop"}
+    assert _post_checkpoint(client, token, loop_body).status_code == 200
+    assert _post_checkpoint(client, token, {**body, "step_key": "dialog"}).status_code == 409
+    assert _post_checkpoint(client, token, loop_body).status_code == 200
+
+
+@pytest.mark.parametrize("feature", ["post.resign_loop", "post.resign_dialog"])
+def test_actual_dispatch_captures_resolved_feature_identity(client, checkpoint, monkeypatch, feature):
+    manager, _, body = checkpoint
+    with manager.session_factory() as session:
+        step = session.query(WorkflowStep).filter_by(owner_type="site", owner_id=body["site_id"]).one()
+        step.feature_type = feature
+        step.step_key = "resign"
+        step.config_json = "{}"
+        run_id = session.get(SiteJob, body["job_id"]).run_id
+        session.commit()
+
+    async def execute(payload):
+        step, = payload["steps"]
+        assert step["feature_type"] == feature
+        assert "execution_mode" not in step["config"]
+        # Worker payload edits must not change the server's dispatch authorization.
+        step["feature_type"] = "post.resign_dialog" if feature == "post.resign_loop" else "post.resign_loop"
+        token = payload["secret_access"]["token"]
+        assert _post_checkpoint(client, token, body).status_code == 200
+        assert _post_checkpoint(client, token, body).status_code == (200 if feature == "post.resign_loop" else 409)
+        confirm = {**body, "phase": "confirm", "result": {"resign": _result(
+            body["date"], success=[{"date": body["date"]}],
+        )}}
+        assert _post_checkpoint(client, token, confirm).status_code == 200
+        return {"status": "success", "steps": []}
+
+    monkeypatch.setattr(manager, "_post_execute", execute)
+    asyncio.run(manager._execute_run(run_id))
+    assert _records(manager, body["site_id"]) == {body["date"]: "success"}
+    with manager.session_factory() as session:
+        assert session.get(SiteJob, body["job_id"]).status == "success"

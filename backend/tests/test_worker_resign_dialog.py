@@ -15,7 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.features.catalog import PostResignDialogConfig
-from tests.test_worker_resign_click import EXECUTABLE
+from tests.test_worker_resign_loop import EXECUTABLE
 from worker.resign_checkpoint import CHECKPOINT_ERROR
 from worker.resign_dialog import DEFAULTS, run_resign_dialog
 

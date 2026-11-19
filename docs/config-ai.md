@@ -24,7 +24,7 @@ In this endpoint there is no persisted chat, existing-site or template editing,
 template inheritance, public standalone tool dispatcher, MCP server, saving,
 scheduling, browser interaction or workflow execution. All **23 reviewed builtins**
 can be selected for authoring, including `action.fill`, `post.buy_card`,
-`post.resign`, `post.resign_click` and `post.resign_dialog`. Plugin features,
+`post.resign`, `post.resign_loop` and `post.resign_dialog`. Plugin features,
 aliases and unknown keys remain blocked. Authoring purchase/resign steps grants
 no execution or consumption authority. The generic
 guide and schemas also describe inheritance and editing semantics for future
@@ -281,7 +281,7 @@ analysis is not proof of a business fix. See the [assistant guide](ai-assistant.
 for full contracts and the complete 38-tool ordinary list (39 registered).
 
 Assistant full saved runs support all 23 builtins. Each actual new dispatch with
-enabled `post.buy_card`, `post.resign`, `post.resign_click` or `post.resign_dialog`
+enabled `post.buy_card`, `post.resign`, `post.resign_loop` or `post.resign_dialog`
 requires a fresh owner review dialog for EACH enabled post step, including
 conditional steps. All step dialogs must be approved before the full workflow
 starts; each approval covers that step's listed dates and bounded internal

@@ -68,7 +68,7 @@ def job(monkeypatch, tmp_path, approved_consumption_payload):
 SIDE_EFFECTS = [
     "auth.form_login", "auth.password_verify", "sign.button", "sign.image_quiz",
     "sign.iframe_form", "sign.unit3d_claim", "action.click", "action.fill",
-    "post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog", "challenge.2fa",
+    "post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog", "challenge.2fa",
     "challenge.altcha", "challenge.slider", "challenge.image_captcha", "challenge.grid_captcha",
 ]
 
@@ -104,14 +104,14 @@ def test_assistant_side_effect_exception_is_terminal_unknown(monkeypatch, job, f
 
 
 @pytest.mark.parametrize("assistant", [False, None, 1, "true"])
-@pytest.mark.parametrize("feature", ["action.click", "post.buy_card", "post.resign_click"])
+@pytest.mark.parametrize("feature", ["action.click", "post.buy_card", "post.resign_loop"])
 @pytest.mark.parametrize("error", [RuntimeError(PRIVATE), TimeoutError(PRIVATE)])
 def test_normal_jobs_keep_existing_exception_status(monkeypatch, job, assistant, feature, error):
     run_step = AsyncMock(side_effect=error)
     monkeypatch.setattr(executor, "_run_step", run_step)
     result = job.run(feature, assistant=assistant)
     expected = "waiting_human" if isinstance(error, TimeoutError) and feature.startswith("post.") else "fail"
-    if feature == "post.resign_click":
+    if feature == "post.resign_loop":
         expected = "waiting_human"
     assert result["status"] == result["steps"][0]["status"] == expected
     run_step.assert_awaited_once()
@@ -164,13 +164,13 @@ def test_resign_checkpoint_survives_uncertain_exception(monkeypatch, job):
         raise RuntimeError(PRIVATE)
 
     monkeypatch.setattr(executor, "_run_step", run_step)
-    result = job.run("post.resign_click")
+    result = job.run("post.resign_loop")
     assert result["status"] == "unknown"
     assert result["steps"][0]["data"]["resign"] == {"submit_attempted": True}
     assert result["steps"][0]["data"]["reason"] == "outcome_uncertain"
 
 
-@pytest.mark.parametrize("feature", ["post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("feature", ["post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog"])
 def test_unapproved_consuming_full_run_rejects_before_page_creation(monkeypatch, job, feature):
     run_step = AsyncMock()
     monkeypatch.setattr(executor, "_run_step", run_step)

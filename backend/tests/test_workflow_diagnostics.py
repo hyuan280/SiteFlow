@@ -202,10 +202,10 @@ def test_builtin_model_rules_provide_actionable_field_diagnostics(tools, feature
      "product_selectors", "自定义布局必须提供商品选择器 product_selectors"),
     ("post.buy_card", {"layout": "grid"}, "buy_card_price_selectors_required",
      "price_selectors", "网格卡片和自定义布局必须提供价格选择器 price_selectors"),
-    ("post.resign_click", {"calendar_title_selector": ["{secret}"]},
+    ("post.resign_loop", {"calendar_title_selector": ["{secret}"]},
      "resign_selector_template_invalid", "calendar_title_selector",
      "Playwright 选择器模板仅支持 {date}/{day}/{month}/{year}，不支持其他花括号语法"),
-    ("post.resign_click", {"calendar_day_selector": ["#day"]},
+    ("post.resign_loop", {"calendar_day_selector": ["#day"]},
      "resign_selector_date_required", "calendar_day_selector",
      "每个目标日期选择器模板必须包含 {date} 或 {day}"),
 ])

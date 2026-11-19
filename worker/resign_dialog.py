@@ -10,7 +10,7 @@ from urllib.parse import urljoin
 
 from worker.browser_input import hold_page_input
 from worker.resign_checkpoint import CHECKPOINT_TIMEOUT_SECONDS, ResignCheckpointError
-from worker.resign_click import UnsafeCalendar, _iso, _origin
+from worker.resign_loop import UnsafeCalendar, _iso, _origin
 
 
 DEFAULTS = {

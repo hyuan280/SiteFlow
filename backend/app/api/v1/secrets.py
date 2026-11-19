@@ -62,13 +62,15 @@ def resign_checkpoint(
     executor = request.app.state.executor
     with executor.session_factory() as session:
         try:
-            job = executor.secret_providers.authorize_resign(
+            job, feature_type = executor.secret_providers.authorize_resign(
                 authorization[7:], payload.job_id, payload.site_id, payload.step_key, session,
             )
             result = payload.result.get("resign")
             if not isinstance(result, dict):
                 raise ValueError("Invalid resign result")
-            ResignService(session, executor.settings).checkpoint(job, payload.phase, payload.date, result)
+            ResignService(session, executor.settings).checkpoint(
+                job, payload.phase, payload.date, result, feature_type,
+            )
             executor.secret_providers.authorize_resign(
                 authorization[7:], payload.job_id, payload.site_id, payload.step_key, session,
             )

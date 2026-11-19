@@ -1,18 +1,16 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Isolated Resign Calendar</title>
+<title>Isolated Resign Loop Calendar</title>
 <main aria-busy="true"></main>
 <script>
 const opts = FIXTURE_OPTIONS;
 const main = document.querySelector('main');
 let month = opts.month || '2026-10', selected = null;
-let cards = opts.cards ?? 3;
 const signed = new Set(opts.signed || []);
 window.clicks = [];
 window.flips = [];
 function render() {
-  main.innerHTML = `<p class="cal-help">补签卡（当前 ${cards} 张）</p>
-    <div class="cal-board"><h2 class="cal-water">${month.replace('-', '年')}月</h2></div>
+  main.innerHTML = `<div class="cal-board"><h2 class="cal-water">${month.replace('-', '年')}月</h2></div>
     <button class="cal-arr" aria-label="上一月">prev</button>
     <button class="cal-arr" aria-label="下一月">next</button>
     <div class="cal-grid"></div>
@@ -40,6 +38,11 @@ function render() {
     '<span class="cal-num">1</span><span class="cal-badge att">done</span></button>');
   if (opts.noDates) grid.querySelector('.mute').removeAttribute('data-date');
   if (opts.ambiguous) grid.append(grid.children[1].cloneNode(true));
+  if (opts.dateDelay) {
+    const cells = [...grid.children];
+    grid.replaceChildren();
+    setTimeout(() => grid.replaceChildren(...cells), opts.dateDelay);
+  }
   if (opts.ambiguousTitle) main.querySelector('.cal-board').append(main.querySelector('h2').cloneNode(true));
   main.querySelectorAll('.cal-arr').forEach((el, index) => el.onclick = () => {
     window.flips.push(index);
@@ -56,19 +59,40 @@ function render() {
   if (opts.ambiguousButton) button.after(button.cloneNode(true));
   if (opts.target) button.setAttribute('formtarget', opts.target);
   if (opts.action) button.setAttribute('formaction', opts.action);
+  if (selected && opts.buttonState) {
+    if (opts.buttonState === 'missing') button.remove();
+    if (opts.buttonState === 'hidden') button.hidden = true;
+    if (opts.buttonState === 'inactive') button.classList.remove('act');
+    if (opts.buttonState === 'disabled') button.disabled = true;
+    if (opts.buttonDelay) setTimeout(() => {
+      if (opts.buttonState === 'missing') main.querySelector('.cal-att').append(button);
+      button.hidden = false;
+      button.classList.add('act');
+      button.disabled = false;
+    }, opts.buttonDelay);
+  }
   button.onclick = async () => {
     window.clicks.push(selected);
-    if (opts.dialog && !confirm('confirm')) return;
     await fetch('/submit', {method: 'POST', body: selected});
+    if (opts.challengeFrame) {
+      const frame = document.createElement('iframe');
+      frame.src = opts.challengeFrame;
+      document.body.append(frame);
+    }
     if (opts.noResult) return;
     signed.add(selected);
     render();
-    setTimeout(() => {
-      cards -= opts.delta ?? 1;
-      render();
-      if (opts.postBusy) main.setAttribute('aria-busy', 'true');
-    }, opts.stockDelay || 0);
   };
 }
-setTimeout(() => { render(); main.removeAttribute('aria-busy'); }, opts.readyDelay || 0);
+function startCalendar() {
+  setTimeout(() => { render(); main.removeAttribute('aria-busy'); }, opts.readyDelay || 0);
+}
+if (opts.persistent) {
+  fetch('/fixture-state').then(response => response.json()).then(dates => {
+    [...dates, ...JSON.parse(sessionStorage.getItem('fixture-signed') || '[]')].forEach(date => signed.add(date));
+    startCalendar();
+  });
+} else {
+  startCalendar();
+}
 </script>

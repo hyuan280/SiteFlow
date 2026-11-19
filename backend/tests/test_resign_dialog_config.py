@@ -195,7 +195,7 @@ def test_resign_dialog_api_rejects_invalid_effective_config(client, config):
 
 
 def test_resign_dialog_settings_and_inherited_workflow_roundtrip(client):
-    legacy = {key: get_feature(key).validate_full({}) for key in ("post.resign", "post.resign_click")}
+    legacy = {key: get_feature(key).validate_full({}) for key in ("post.resign", "post.resign_loop")}
     custom = {"success_selector": ['[role="dialog"][aria-label^="补签"] p'], "dialog_wait_seconds": 20}
     path = f"/api/v1/features/{KEY}/settings"
     response = client.put(path, json={"defaults": custom, "required_fields": []})

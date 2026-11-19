@@ -24,7 +24,7 @@ local config, where fields may be omitted for inheritance or null to clear a key
 An effective required field need not be repeated if supplied by inheritance or
 server policy. Always use full draft validation to check the resulting workflow.
 All 23 reviewed built-in features support authoring, including action.fill and
-post.buy_card, post.resign, post.resign_click and post.resign_dialog. The host may
+post.buy_card, post.resign, post.resign_loop and post.resign_dialog. The host may
 select a narrower allowlist. Plugins, aliases and unknown feature keys are denied.
 Do not invent selectors, page text, success signals, URLs or evidence. Use only
 sanitized evidence supplied by the host or explicit user requirements. If evidence
@@ -81,7 +81,7 @@ feature settings. Step/signal enabled flags are workflow fields, not permission
 to enable a site or template. Do not weaken protected server policy through config.
 
 Purchasing and resign (retroactive check-in), including post.buy_card,
-post.resign, post.resign_click and post.resign_dialog, require explicit user approval.
+post.resign, post.resign_loop and post.resign_dialog, require explicit user approval.
 Authoring is allowed, but do not add them merely because they exist or a page
 suggests them. Execution is full saved-run only, with fresh per-run approval even
 under global auto-authorization, bound to the exact host-reviewed workflow and
@@ -93,6 +93,13 @@ direct click on a purchase or dated consumption button; use the corresponding
 post feature and reviewed full-run path. Identify costs and side effects for
 review; never purchase, resign, save, execute, launch a browser or schedule work
 as part of generation or validation.
+
+post.resign_loop is page-loop resign: submit one pending past date, hand off to
+downstream steps, then return to inspect that exact date's done marker before
+retrying or advancing. The site must guarantee idempotent repeated submissions.
+wait_seconds (default 10, range 1-60) waits only for page/button readiness;
+max_retries defaults to 3 extra submissions per date. There is no execution mode
+or inventory-based success check for this feature.
 
 All model-visible tool responses must be diagnostics-safe projections. The
 existing administrator validation endpoint is NOT model-facing safe output:

@@ -20,7 +20,7 @@ from app.models.assistant_workflow import AssistantWorkflowAction
 from app.models.execution import Run, SiteJob
 from app.models.setting import AppSetting
 from app.models.workflow import Site, SiteResignRecord, Template, WorkflowStep
-from app.schemas.assistant import ConsumptionInteraction, InteractionResponse
+from app.schemas.assistant import ConsumptionInteraction, CreateSession, InteractionResponse
 from app.services.assistant_consumption import apply_consumption, build_plan, prepare_consumption
 from app.services.assistant_interactions import respond_interaction
 from app.services.assistant_run_guard import consumption_plan, validate_guard
@@ -112,13 +112,76 @@ def test_deny_timeout_never_calls_executor(context, monkeypatch, decision):
         assert db.scalar(select(Run)) is None
 
 
-@pytest.mark.parametrize("feature", ["post.resign", "post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("feature", ["post.resign", "post.resign_loop", "post.resign_dialog"])
 def test_all_resign_features_require_review_even_with_no_pending_dates(context, feature):
     tools, site_id = setup(context, feature=feature)
     result, item = asyncio.run(approve(tools))
     assert result["ok"], result
     assert item["review"]["date_count"] == 0
     assert item["review"]["steps"][0]["feature_type"] == feature
+
+
+@pytest.mark.parametrize("max_retries", [None, 0, 3, 5])
+def test_loop_review_discloses_extra_retries_without_changing_step_shape(context, max_retries):
+    config = {}
+    if max_retries is not None:
+        config["max_retries"] = max_retries
+    tools, site_id = setup(context, feature="post.resign_loop", config=config)
+    result, item = asyncio.run(approve(tools))
+    assert result["ok"], result
+    review = item["review"]
+    assert review["steps"] == [{
+        "feature_type": "post.resign_loop", "step_key": "consume", "label": "\u9875\u9762\u5faa\u73af\u8865\u7b7e",
+    }]
+    assert len(review["warnings"]) == 4
+    assert "\u4e0d\u4f1a\u81ea\u52a8\u6574\u4efb\u52a1\u91cd\u542f" in review["warnings"][0]
+    assert "\u6b65\u9aa4\u5faa\u73af\u4f1a\u6309\u914d\u7f6e\u91cd\u590d\u63d0\u4ea4" in review["warnings"][0]
+    retries = 3 if max_retries is None else max_retries
+    assert review["warnings"][-1] == (
+        "\u9875\u9762\u5faa\u73af\u8865\u7b7e\uff08consume\uff09\u4f7f\u7528\u6b65\u9aa4\u5faa\u73af\uff1a"
+        f"\u6bcf\u4e2a\u65e5\u671f\u9996\u6b21\u63d0\u4ea4\u540e\u6700\u591a\u989d\u5916\u91cd\u8bd5 {retries} \u6b21"
+        f"\uff08max_retries={retries}\uff0c\u5408\u8ba1\u6700\u591a {1 + retries} \u6b21\u63d0\u4ea4\uff09\u3002"
+        "\u7ad9\u70b9\u9700\u4fdd\u8bc1\u91cd\u590d\u8865\u7b7e\u5e42\u7b49\uff0c\u4e0d\u91cd\u590d\u6263\u5361\u3002")
+    with tools.manager.session_factory() as db:
+        assert validate_guard(db, result["run_id"], db.get(Site, site_id),
+                              tools.manager.settings, tools.manager.crypto)
+        job = db.scalar(select(SiteJob).where(SiteJob.run_id == result["run_id"]))
+        job.attempt = 2
+        db.flush()
+        assert not validate_guard(db, result["run_id"], db.get(Site, site_id),
+                                  tools.manager.settings, tools.manager.crypto)
+
+
+@pytest.mark.parametrize("feature", ["post.resign", "post.resign_dialog"])
+def test_non_loop_review_warnings_are_unchanged(context, feature):
+    tools, _ = setup(context, feature=feature)
+    result, item = asyncio.run(approve(tools))
+    assert result["ok"], result
+    assert item["review"]["warnings"] == [
+        "\u6bcf\u4e2a post \u6b65\u9aa4\u5747\u9700\u5355\u72ec\u786e\u8ba4\uff0c\u5168\u90e8\u540c\u610f\u540e\u624d\u4f1a\u5b8c\u6574\u8fd0\u884c\u4e00\u6b21\uff1b\u4e0d\u4f1a\u81ea\u52a8\u91cd\u8bd5\u3002"
+        "\u672c\u6b65\u9aa4\u7684\u6388\u6743\u8986\u76d6\u6240\u5217\u5168\u90e8\u65e5\u671f\u548c\u6570\u91cf\u4e0a\u9650\uff0c\u4e0d\u4f1a\u4e3a\u6bcf\u4e2a\u65e5\u671f\u6216\u5185\u90e8\u70b9\u51fb\u518d\u6b21\u5f39\u7a97\u3002",
+        "\u6240\u5217\u4e3a\u914d\u7f6e\u4e0a\u9650\uff0c\u4e0d\u662f\u7f51\u7ad9\u5b9e\u65f6\u62a5\u4ef7\uff1b\u81ea\u52a8\u8d2d\u5361\u6570\u91cf\u6309\u5f85\u8865\u7b7e\u5929\u6570\u51cf\u5e93\u5b58\u8ba1\u7b97\u3002",
+        "\u6761\u4ef6\u6b65\u9aa4\u4e5f\u5217\u5165\u5ba1\u9605\uff1b\u666e\u901a\u70b9\u51fb\u7684\u7f51\u7ad9\u4e1a\u52a1\u6548\u679c\u65e0\u6cd5\u4ec5\u51ed\u9009\u62e9\u5668\u8bc6\u522b\u3002",
+    ]
+
+
+def test_loop_review_does_not_admit_new_run_after_unknown_outcome(context):
+    tools, site_id = setup(context, feature="post.resign_loop")
+    first, _ = asyncio.run(approve(tools))
+    assert first["ok"], first
+    with tools.manager.session_factory() as db:
+        db.get(Run, first["run_id"]).status = "unknown"
+        db.scalar(select(SiteJob).where(SiteJob.run_id == first["run_id"])).status = "unknown"
+        db.commit()
+    tools.manager.executor.submit.reset_mock()
+    # A different session has a fresh run identity, not an idempotent replay.
+    identifier = tools.manager.create(OWNER, CreateSession())["id"]
+    fresh = configure((tools.manager, identifier), workflow_site_id=site_id)
+    result, _ = asyncio.run(approve(fresh))
+    assert result == {"ok": False, "code": "workflow_outcome_uncertain"}
+    tools.manager.executor.submit.assert_not_called()
+    with tools.manager.session_factory() as db:
+        assert list(db.scalars(select(Run.id))) == [first["run_id"]]
 
 
 def test_direct_run_and_model_requested_purpose_cannot_grant_authority(context):
@@ -236,7 +299,7 @@ def test_nonbuiltin_feature_cannot_enter_consumption_plan():
 @pytest.mark.parametrize("second_decision", ["approve", "deny", "timeout"])
 def test_each_post_step_needs_fresh_popup_before_any_execution(context, monkeypatch, second_decision):
     site = make_site(context, support_resign=True, steps=[{
-        "step_key": key, "feature_type": "post.resign_click", "config": {},
+        "step_key": key, "feature_type": "post.resign_loop", "config": {},
     } for key in ("first", "second")])
     tools = configure(context, workflow_site_id=site.id)
     tools.config["_assistant_settings"] = {"auto_authorize_" + capability: True
@@ -251,7 +314,9 @@ def test_each_post_step_needs_fresh_popup_before_any_execution(context, monkeypa
         first = await pending(tools, task)
         assert [step["step_key"] for step in first["review"]["steps"]] == ["first"]
         assert first["review"]["dates"] == dates
-        assert 1 <= len(first["review"]["warnings"]) <= 3
+        assert len(first["review"]["warnings"]) == 5
+        for key, warning in zip(("first", "second"), first["review"]["warnings"][-2:]):
+            assert key in warning and "max_retries=3" in warning
         await respond_interaction(tools.manager, tools.owner, tools.session_id,
                                   first["id"], InteractionResponse(decision="approve"))
         second = await pending(tools, task)
@@ -548,7 +613,7 @@ def test_guard_completed_proof_allows_expected_date_changes(context, monkeypatch
                               check_consumption=False)
 
 
-@pytest.mark.parametrize("feature", ["post.resign_click", "post.resign_dialog"])
+@pytest.mark.parametrize("feature", ["post.resign_loop", "post.resign_dialog"])
 def test_approved_worker_keeps_real_partial_checkpoint_on_exception(context, monkeypatch, tmp_path, feature):
     from worker import executor
     from tests.test_worker_navigation import _JumpLane, _JumpManager, _JumpPage

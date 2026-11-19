@@ -128,7 +128,7 @@ GENERATION_HINTS: dict[str, GenerationHints] = {
     "post.resign": GenerationHints(
         when_to_use="已确认是兼容 NexusPHP 日历和补签接口的站点，需要处理授权范围内的漏签日期时。",
         prerequisites=["已启用补签并确认 pending 日期范围及可用补签卡；补签会消耗卡。"],
-        avoid=["不要臆造 AJAX 接口、参数或漏签日期，不要补签今天、未来或已完成日期。", "不要为补签自动购买卡；页面点击型日历应使用 post.resign_click。"],
+        avoid=["不要臆造 AJAX 接口、参数或漏签日期，不要补签今天、未来或已完成日期。", "不要为补签自动购买卡；页面循环型日历应使用 post.resign_loop。"],
         evidence_required=["实际日历月份、已签到与漏签标记、卡数，以及已确认的补签请求结构。", "pending 与日历的日期对应关系和每次补签结果。"],
     ),
     "post.resign_dialog": GenerationHints(
@@ -137,10 +137,10 @@ GENERATION_HINTS: dict[str, GenerationHints] = {
         avoid=["不要将日期按钮当作仅选中日期，点击直接消费卡；不要重复提交、处理今天/未来或 pending 之外的日期。", "missing_button_as_signed 默认 False，仅在弹窗明确就绪后有效，不用于历史 unknown 自动消除；结果不明先只读核验。", "不要用旧提示、无关日期 done 或仅库存变化判成功；卡数核验必需。", "仅 done_selector 使用日期模板，每项含 {date} 或 {day}，可含 {year}/{month}；其他选择器不做模板，正则花括号不能当模板解析。"],
         evidence_required=["真实入口、唯一弹窗及日期按钮文本；date_regex 含 month/day 或 ISO date 命名组，含 year 必须同时含 month/day；runner 做 fullmatch 和真实日期校验。", "无 year 时由 pending 对应月日推导；多个 year 对应同一月日有歧义时停止，不猜年份。文本含明确 ISO 完整日期时不得忽略年份截取月日；命名 date 或完整 year/month/day 与 DOM 完整日期矛盾时拒绝。", "done_selector 或 success_selector 至少一项。成功需目标日期 done 或本次新出现且匹配 success_regex 的提示，同时卡数恰好减少 1。成功提示 baseline 在 prepare ACK + authorize 之后、实际点击之前采集。", "提示可能瞬时出现后网站刷新；runner 捕获提示后继续等待稳定库存。确认 card_count_selector 及 card_count_regex 第一捕获组。dialog_wait_seconds/success_wait_seconds 默认 10 秒，范围 1-60 秒。", "missing_button_as_signed 开启且无目标按钮时，至少观察过一个可解析日期按钮，或可选 dialog_ready_selector 相对唯一弹窗内唯一可见命中明确加载完成/合法空列表证据；两者皆无则 waiting_human，不视为已签到。弹窗有其他日期按钮时无需此字段，整个列表为空需配置明确就绪/空态证据。"],
     ),
-    "post.resign_click": GenerationHints(
-        when_to_use="补签通过页面选择日期并点击补签按钮完成，不使用旧 AJAX 接口时。",
-        prerequisites=["只处理 pending 中的过去日期，已确认补签授权和卡数。", "目标日期、选中状态和 done 标记必须绑定同一日期并唯一匹配。"],
-        avoid=["不要处理 pending 之外、今天、未来或已完成的日期；不要自动买卡。", "不要点击普通签到按钮，不要以其他日期的完成标记判定成功。", "选择器模板只支持 {date}/{day}/{month}/{year}，不要编造其他花括号语法。"],
-        evidence_required=["实际月份标题、翻月控件及排除相邻月的目标日期元素。", "按钮文字包含补签，目标日期的选中状态、完成标记和卡数；所有选择器来自真实 DOM。"],
+    "post.resign_loop": GenerationHints(
+        when_to_use="补签通过页面选择日期并点击补签按钮，交给后续步骤处理验证，再循环返回核验目标日期时。",
+        prerequisites=["只处理 pending 中的过去日期，已明确授权补签和额外重试；站点须保证重复补签幂等，不重复扣卡。", "目标日期、选中状态和 done 标记必须绑定同一日期并唯一匹配；安排后续步骤及返回本步骤的循环。"],
+        avoid=["不要处理 pending 之外、今天、未来或已完成的日期；不要自动买卡。", "不要点击普通签到按钮，不要以其他日期的完成标记判定成功；点击后不在本步骤等待提交结果。", "选择器模板只支持 {date}/{day}/{month}/{year}，不要编造其他花括号语法。"],
+        evidence_required=["实际月份标题、翻月控件及排除相邻月的目标日期元素。", "按钮文字包含补签，目标日期的选中状态和 done 完成标记；所有选择器来自真实 DOM。", "wait_seconds 默认 10 秒，范围 1-60 秒，仅等待页面与按钮就绪；max_retries 默认 3，首次提交后最多额外重试 3 次。循环返回时先只读核验 done，未完成才重试；历史 unknown 也须先核验页面。"],
     ),
 }

@@ -530,7 +530,7 @@ def test_invalid_host_selection_is_safe_422_without_network(harness, features):
 
 
 @pytest.mark.parametrize("feature", [
-    "action.fill", "post.buy_card", "post.resign", "post.resign_click", "post.resign_dialog",
+    "action.fill", "post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog",
 ])
 def test_all_builtins_selected_and_newly_available_features_are_proposal_only(harness, feature):
     features = [feature.key for feature in FEATURE_LIST]

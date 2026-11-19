@@ -674,7 +674,7 @@ manual 模式导入也要求有效的同源凭据站点绑定，不能仅靠聊�
 
 插件功能可声明同样六个 category 值，但插件元数据未验证，不是助手授权来源；危险实际实现仍需独立审核，不因声明非 post 类别就开放助手访问。
 
-`post.buy_card`、`post.resign`、`post.resign_click`、`post.resign_dialog` 均可用于助手完整运行，旧接口型 `post.resign` 也在支持范围内。每次**真正新派发**前，宿主都要展示并由 owner 审核本次精确消费计划；`auto_authorize_execution`、`auto_authorize_workflow`、工作流权限、导入批准或聊天同意均不能跳过，也没有全局自动消费授权。条件步骤中的启用 `post.*` 同样纳入审核，不能假定条件不会命中而省略。
+`post.buy_card`、`post.resign`、`post.resign_loop`（页面循环补签）、`post.resign_dialog` 均可用于助手完整运行，旧接口型 `post.resign` 也在支持范围内。每次**真正新派发**前，宿主都要展示并由 owner 审核本次精确消费计划；`auto_authorize_execution`、`auto_authorize_workflow`、工作流权限、导入批准或聊天同意均不能跳过，也没有全局自动消费授权。条件步骤中的启用 `post.*` 同样纳入审核，不能假定条件不会命中而省略。
 
 审核单位是**每个 post 步骤**：同一完整工作流内依次展示各步骤的全新面板，全部批准后才启动一次完整运行；任何拒绝或超时都不启动。一个步骤的批准覆盖所列全部日期、数量和内部点击上限，不为每个日期或内部点击再次弹窗，也不授权其他步骤。
 
