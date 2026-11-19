@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_session, get_db, get_settings, require_csrf
+from app.api.deps import get_current_session, get_db, get_readonly_current_session, get_settings, require_csrf
 from app.core.auth import SESSION_COOKIE
 from app.core.config import Settings
 from app.models.auth import AuthSession
@@ -97,6 +97,78 @@ async def put_browser_settings(
 
 
 router.include_router(browser_settings_router)
+
+
+class _ClipboardRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def no_store_handler(request: Request):
+            try:
+                response = await handler(request)
+            except HTTPException as exc:
+                response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            except RequestValidationError:
+                response = JSONResponse(status_code=422, content={"detail": "Invalid clipboard request"})
+            except Exception:
+                response = JSONResponse(status_code=502, content={"detail": "Clipboard unavailable"})
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+        return no_store_handler
+
+
+clipboard_router = APIRouter(route_class=_ClipboardRoute)
+
+
+@clipboard_router.get("/{lane_key}/clipboard")
+async def get_lane_clipboard(
+    lane_key: str,
+    settings: Settings = Depends(get_settings),
+    _current: AuthSession = Depends(get_readonly_current_session),
+) -> dict:
+    try:
+        return {"text": await LaneService(settings).get_clipboard(lane_key)}
+    except WorkerRequestError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@clipboard_router.post("/{lane_key}/clipboard")
+async def set_lane_clipboard(
+    lane_key: str,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    _current: AuthSession = Depends(require_csrf),
+) -> dict:
+    try:
+        body = bytearray()
+        async with asyncio.timeout(10):
+            async for chunk in request.stream():
+                # JSON may encode each astral character as two escaped surrogates.
+                if len(body) + len(chunk) > 12 * 1_048_576 + 1024:
+                    raise HTTPException(413, "Clipboard request too large")
+                body.extend(chunk)
+        pairs = json.loads(body.decode("utf-8"), object_pairs_hook=list)
+        if (not isinstance(pairs, list) or len(pairs) != 1
+                or not isinstance(pairs[0], tuple) or pairs[0][0] != "text"
+                or not isinstance(pairs[0][1], str)):
+            raise ValueError
+        text = pairs[0][1]
+        if len(text) > 1_048_576:
+            raise HTTPException(413, "Clipboard text too large")
+        text.encode("utf-8")
+    except TimeoutError:
+        raise HTTPException(408, "Clipboard request timed out") from None
+    except (ValueError, TypeError, RecursionError):
+        raise HTTPException(422, "Invalid clipboard request") from None
+    try:
+        await LaneService(settings).set_clipboard(lane_key, text)
+    except WorkerRequestError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+    return {"ok": True}
+
+
+router.include_router(clipboard_router)
 
 
 @router.get("", response_model=LanesResponse)

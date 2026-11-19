@@ -21,6 +21,9 @@ declare module "@novnc/novnc" {
     clipViewport: boolean;
     dragViewport: boolean;
     background: string;
+    showDotCursor: boolean;
+    sendKey(keysym: number, code: string, down?: boolean): void;
+    focus(options?: FocusOptions): void;
     addEventListener(type: string, listener: (event: Event) => void): void;
     removeEventListener(type: string, listener: (event: Event) => void): void;
     disconnect(): void;

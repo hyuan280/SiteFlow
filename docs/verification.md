@@ -9,6 +9,7 @@ Run automated checks from the repository root:
 (cd frontend && node tests/feature-settings.mjs)
 (cd frontend && node tests/plugin-management.mjs)
 (cd frontend && node tests/workflow-ordering.mjs)
+(cd frontend && node tests/vnc-viewer.mjs)
 git diff --check
 ```
 

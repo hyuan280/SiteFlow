@@ -8,6 +8,41 @@ class X11Desktop:
     def __init__(self, display: str):
         self.display = display
 
+    async def read_clipboard(self) -> str:
+        process = None
+        try:
+            async with asyncio.timeout(5):
+                process = await asyncio.create_subprocess_exec(
+                    "xclip", "-selection", "clipboard", "-o", "-target", "UTF8_STRING",
+                    env={**os.environ, "DISPLAY": self.display},
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                body = bytearray()
+                while chunk := await process.stdout.read(65536):
+                    if len(body) + len(chunk) > 4 * 1_048_576:
+                        raise ValueError
+                    body.extend(chunk)
+                if await process.wait():
+                    raise ValueError
+                text = body.decode("utf-8")
+                if len(text) > 1_048_576:
+                    raise ValueError
+                return text
+        except TimeoutError:
+            raise TimeoutError("Clipboard request timed out") from None
+        except Exception:
+            raise RuntimeError("Clipboard unavailable") from None
+        finally:
+            if process is not None and process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                # Drain without retaining output so a full pipe cannot block reaping.
+                while await process.stdout.read(65536):
+                    pass
+                await process.wait()
+
     async def screenshot(self) -> bytes:
         def capture():
             import mss

@@ -161,6 +161,16 @@ WS /api/v1/lanes/{lane_key}/vnc
 - 弹窗内显示连接状态：连接中/已连接/已断开/连接失败。
 - 「退出 VNC」关闭连接并关闭弹窗。
 - 连接失败提供「重新连接」。
+- 启用 noVNC `showDotCursor`，远端未提供可见光标时显示圆点；远端提供正常光标时保留其形状，不覆盖远端光标样式或隐藏辅助光标画布。
+- 先点击远端目标输入框，在 VNC 画面按 `Ctrl+V` / `Cmd+V` 可读取本机剪贴板并粘贴文本。仅在用户操作时读取，不轮询或自动同步剪贴板。
+- HTTP 访问、浏览器未授权或不支持 Clipboard API 时，使用工具栏「粘贴文本」，将内容粘贴到本地文本框后点击「发送并粘贴」。支持中文、Emoji 和多行文本，最多 1,048,576 个字符；不支持图片或文件。
+- 文本通过 `POST /api/v1/lanes/{lane_key}/clipboard`，经 Worker 转发至当前 profile 的 Manager HTTP 剪贴板接口；确认写入后才通过 VNC 发送远端 `Ctrl+V`。不使用会损失中文的普通 RFB `ClientCutText`。
+- 剪贴板写入要求管理员会话和 CSRF 校验，内部接口要求令牌；不自动启动已停止车道，响应禁止缓存，异常不回显剪贴板内容。关闭或切换连接后，旧请求不会继续发送粘贴按键。
+- 在远端选中文本后，在 VNC 画面按 `Ctrl+C` / `Cmd+C` 会发送远端 Linux `Ctrl+C`，等待剪贴板通知或短暂延迟后，通过 `GET /api/v1/lanes/{lane_key}/clipboard` 读取文本并尝试写入本机剪贴板。显示「已复制到本机剪贴板」后即可移出 VNC 粘贴；通知及延迟不构成远端复制完成的协议确认，远端很慢时可重试。
+- 使用远端右键菜单复制后，点击工具栏「复制到本机」。此操作只读取已复制的内容，不再发送远端按键。不会后台轮询或因任意远端事件覆盖本机剪贴板。
+- 本机剪贴板写入被拒绝或使用 HTTP 时，会显示只读文本框，可点击「复制此文本」重试，也可选中文本后用本机 `Ctrl+C` / `Cmd+C`。远端返回空字符串时不会清空本机剪贴板。
+- 默认 X11 部署由 Worker 用 `xclip -selection clipboard -o -target UTF8_STRING` 读取当前系统剪贴板，避免 Manager 多标签页捕获缓存返回旧文本。Worker 镜像需要重新构建以安装 `xclip`，继续使用共享 X11 socket；非 X11 模式回退 Manager GET 接口，其多标签页缓存可能滞后。两条读取路径均限制大小、验证 UTF-8、设置超时并禁止缓存。
+- 读取要求管理员会话和内部令牌，仅读取运行中的车道。关闭或切换连接会丢弃待处理读取，不再触发本机写入；已经调用的浏览器系统剪贴板写入无法撤销。
 
 ### 5.1 任务对照
 
@@ -177,7 +187,7 @@ Vite 构建目标为 `es2022`，因为 `@novnc/novnc` 1.7 使用 top-level await
 
 - `RFB` 的 target 必须是**容器 div**（`.vnc-screen`），不能直接传 `<canvas>`；noVNC 会在容器内创建自己的 canvas。直接传 canvas 会出现「已连接但黑屏、canvas 仍是 300×150」。
 - 在 `el-dialog` 的 `@opened` 后再创建 RFB，避免在弹窗过渡期间把 RFB 绑到会被替换的 DOM。
-- 同时避免 `modelValue` 与 `laneKey` 两个 watcher 重复连接；当前用连接代次（generation）防止竞态。
+- 使用单个 watcher 处理 `modelValue` 和 `laneKey`，弹窗首次连接仍等待 `opened`；连接代次（generation）防止重连及剪贴板异步请求竞态。
 
 ## 6. 运行
 

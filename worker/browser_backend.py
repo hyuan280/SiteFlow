@@ -38,6 +38,8 @@ class BrowserBackend(Protocol):
     async def prepare(self) -> None: ...
     async def start(self, key: str, proxy: str | None) -> BrowserSession: ...
     async def stop(self, session: BrowserSession) -> None: ...
+    async def set_clipboard(self, session: BrowserSession, text: str) -> None: ...
+    async def get_clipboard(self, session: BrowserSession) -> str: ...
     def vnc_connection(self, session: BrowserSession) -> tuple[str, dict[str, str]]: ...
     async def close(self) -> None: ...
 
@@ -401,6 +403,58 @@ class ManagerBackend:
         url = urlunsplit(("wss" if parsed.scheme == "https" else "ws", parsed.netloc,
                          parsed.path + f"/api/profiles/{quote(session.profile_id, safe='')}/vnc", "", ""))
         return url, self.headers
+
+    async def get_clipboard(self, session: BrowserSession) -> str:
+        if session.disconnected:
+            raise RuntimeError("Clipboard session unavailable")
+        path = f"/api/profiles/{quote(session.profile_id, safe='')}/clipboard"
+        try:
+            async with asyncio.timeout(10):
+                async with self.client.stream(
+                    "GET", path, timeout=10, follow_redirects=False,
+                    headers={"Accept-Encoding": "identity", "Cache-Control": "no-store"},
+                ) as response:
+                    if (response.status_code != 200
+                            or response.headers.get("content-encoding", "identity").lower() != "identity"):
+                        raise ValueError
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(body) + len(chunk) > 12 * 1_048_576 + 1024:
+                            raise ValueError
+                        body.extend(chunk)
+                    result = json.loads(body.decode("utf-8"))
+                    text = result.get("text") if isinstance(result, dict) else None
+                    if not isinstance(text, str) or len(text) > 1_048_576:
+                        raise ValueError
+                    text.encode("utf-8")
+                    return text
+        except (TimeoutError, httpx.TimeoutException):
+            raise TimeoutError("Clipboard request timed out") from None
+        except Exception:
+            raise RuntimeError("Clipboard unavailable") from None
+
+    async def set_clipboard(self, session: BrowserSession, text: str) -> None:
+        if not isinstance(text, str) or len(text) > 1_048_576:
+            raise ValueError("Invalid clipboard text")
+        try:
+            text.encode("utf-8")
+        except UnicodeError:
+            raise ValueError("Invalid clipboard text") from None
+        if session.disconnected:
+            raise RuntimeError("Clipboard session unavailable")
+        path = f"/api/profiles/{quote(session.profile_id, safe='')}/clipboard"
+        try:
+            async with asyncio.timeout(10):
+                async with self.client.stream(
+                    "POST", path, json={"text": text}, timeout=10, follow_redirects=False,
+                ) as response:
+                    # Never read provider bodies, including errors that may echo text.
+                    if not 200 <= response.status_code < 300:
+                        raise RuntimeError("Clipboard unavailable")
+        except (TimeoutError, httpx.TimeoutException):
+            raise TimeoutError("Clipboard request timed out") from None
+        except Exception:
+            raise RuntimeError("Clipboard unavailable") from None
 
     async def close(self) -> None:
         if self.playwright is not None:

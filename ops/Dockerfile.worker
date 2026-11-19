@@ -4,7 +4,7 @@ ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 COPY ops/debian.sources /etc/apt/sources.list.d/debian.sources
 # X11 client tools only. The browser and display server live in an external backend.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates xdotool libxrandr2 \
+    && apt-get install -y --no-install-recommends ca-certificates xdotool xclip libxrandr2 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV SITEFLOW_WORKER_DATA=/app/data \

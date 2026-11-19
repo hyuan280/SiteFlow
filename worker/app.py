@@ -563,6 +563,36 @@ class LaneManager:
             self._seat_changed.set()
             return lane.view()
 
+    async def get_clipboard(self, key: str) -> str:
+        lane = self.get(key)
+        viewer_id = uuid.uuid4().hex
+        await self.viewer_acquire(key, viewer_id)
+        try:
+            session = lane.session
+            if session is None or session.disconnected:
+                raise LaneNotRunningError("Lane is not running")
+            # Manager may return a stale page cache before consulting X11.
+            getter = getattr(session.desktop, "read_clipboard", None)
+            text = await getter() if callable(getter) else await self.backend.get_clipboard(session)
+            if not isinstance(text, str) or len(text) > 1_048_576:
+                raise RuntimeError("Clipboard unavailable")
+            text.encode("utf-8")
+            return text
+        finally:
+            await self.viewer_release(key, viewer_id)
+
+    async def set_clipboard(self, key: str, text: str) -> None:
+        lane = self.get(key)
+        viewer_id = uuid.uuid4().hex
+        await self.viewer_acquire(key, viewer_id)
+        try:
+            session = lane.session
+            if session is None or session.disconnected:
+                raise LaneNotRunningError("Lane is not running")
+            await self.backend.set_clipboard(session, text)
+        finally:
+            await self.viewer_release(key, viewer_id)
+
     async def focus_task_page(self, key: str, job_id: str) -> dict[str, Any]:
         lane = self.get(key)
         page = lane.task_pages.get(str(job_id))
@@ -1238,6 +1268,66 @@ def create_app() -> FastAPI:
             raise HTTPException(504, detail) from None
         except BrowserSettingsError as exc:
             raise HTTPException(exc.status_code, str(exc)) from None
+
+    @app.api_route("/lanes/{key}/clipboard", methods=["GET", "POST"])
+    async def lane_clipboard(key: str, request: Request) -> JSONResponse:
+        try:
+            token = os.environ.get("SITEFLOW_BROWSER_TOKEN", "")
+            authorization = request.headers.getlist("authorization")
+            if ("origin" in request.headers or not token or len(authorization) != 1
+                    or not secrets.compare_digest(authorization[0].encode(), f"Bearer {token}".encode())):
+                raise HTTPException(403, "Forbidden")
+            if request.method == "GET":
+                try:
+                    async with asyncio.timeout(12):
+                        text = await app.state.manager.get_clipboard(key)
+                except LaneNotRunningError:
+                    raise HTTPException(409, "Lane is not running") from None
+                except HTTPException as exc:
+                    raise HTTPException(404 if exc.status_code == 404 else 502,
+                                        "Unknown lane" if exc.status_code == 404 else "Clipboard unavailable") from None
+                except TimeoutError:
+                    raise HTTPException(504, "Clipboard request timed out") from None
+                return JSONResponse({"text": text}, headers={"Cache-Control": "no-store"})
+            try:
+                body = bytearray()
+                async with asyncio.timeout(10):
+                    async for chunk in request.stream():
+                        if len(body) + len(chunk) > 12 * 1_048_576 + 1024:
+                            raise HTTPException(413, "Clipboard request too large")
+                        body.extend(chunk)
+                pairs = json.loads(body.decode("utf-8"), object_pairs_hook=list)
+                if (not isinstance(pairs, list) or len(pairs) != 1
+                        or not isinstance(pairs[0], tuple) or pairs[0][0] != "text"
+                        or not isinstance(pairs[0][1], str)):
+                    raise ValueError
+                text = pairs[0][1]
+                if len(text) > 1_048_576:
+                    raise HTTPException(413, "Clipboard text too large")
+                text.encode("utf-8")
+            except TimeoutError:
+                raise HTTPException(408, "Clipboard request timed out") from None
+            except (ValueError, TypeError, RecursionError):
+                raise HTTPException(422, "Invalid clipboard request") from None
+            try:
+                async with asyncio.timeout(12):
+                    await app.state.manager.set_clipboard(key, text)
+            except LaneNotRunningError:
+                raise HTTPException(409, "Lane is not running") from None
+            except HTTPException as exc:
+                raise HTTPException(404 if exc.status_code == 404 else 502,
+                                    "Unknown lane" if exc.status_code == 404 else "Clipboard unavailable") from None
+            except TimeoutError:
+                raise HTTPException(504, "Clipboard request timed out") from None
+            return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+        except HTTPException as exc:
+            # Lane lookup errors are static; never expose provider exception text.
+            detail = "Unknown lane" if exc.status_code == 404 else exc.detail
+            return JSONResponse({"detail": detail}, status_code=exc.status_code,
+                                headers={"Cache-Control": "no-store"})
+        except Exception:
+            return JSONResponse({"detail": "Clipboard unavailable"}, status_code=502,
+                                headers={"Cache-Control": "no-store"})
 
     @app.post("/lanes/{key}/start")
     async def start_lane(key: str) -> dict[str, Any]:

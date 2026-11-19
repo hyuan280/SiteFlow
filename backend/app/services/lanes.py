@@ -247,6 +247,66 @@ class LaneService:
     async def start_lane(self, key: str) -> dict:
         return await self._post(f"/lanes/{key}/start", timeout=max(120, self.settings.worker_timeout))
 
+    async def set_clipboard(self, key: str, text: str) -> None:
+        await self._clipboard_request(key, "POST", text)
+
+    async def get_clipboard(self, key: str) -> str:
+        return await self._clipboard_request(key, "GET")
+
+    async def _clipboard_request(self, key: str, method: str, text: str | None = None):
+        if key not in LANE_LABELS:
+            raise WorkerRequestError(404, "Unknown lane")
+        token = self.settings.browser_token
+        if token is None or not token.get_secret_value():
+            raise WorkerRequestError(503, "Clipboard unavailable")
+        try:
+            async with asyncio.timeout(15):
+                async with httpx.AsyncClient(
+                    timeout=15, follow_redirects=False, trust_env=False,
+                ) as client:
+                    async with client.stream(
+                        method, f"{self.settings.worker_url.rstrip('/')}/lanes/{key}/clipboard",
+                        headers={"Authorization": f"Bearer {token.get_secret_value()}",
+                                 "Accept-Encoding": "identity", "Cache-Control": "no-store"},
+                        **({"json": {"text": text}} if method == "POST" else {}),
+                    ) as response:
+                        errors = {
+                            404: "Unknown lane", 409: "Lane is not running",
+                            413: "Clipboard text too large", 422: "Invalid clipboard request",
+                            502: "Clipboard unavailable", 503: "Clipboard unavailable",
+                            504: "Clipboard request timed out",
+                        }
+                        if response.status_code != 200:
+                            raise WorkerRequestError(
+                                response.status_code if response.status_code in errors else 502,
+                                errors.get(response.status_code, "Clipboard unavailable"),
+                            )
+                        if response.headers.get("content-encoding", "identity").lower() != "identity":
+                            raise ValueError
+                        body = bytearray()
+                        limit = 4096 if method == "POST" else 12 * 1_048_576 + 1024
+                        async for chunk in response.aiter_bytes():
+                            if len(body) + len(chunk) > limit:
+                                raise ValueError
+                            body.extend(chunk)
+                        result = json.loads(body.decode("utf-8"))
+                        if not isinstance(result, dict):
+                            raise ValueError
+                        if method == "GET":
+                            value = result.get("text")
+                            if not isinstance(value, str) or len(value) > 1_048_576:
+                                raise ValueError
+                            value.encode("utf-8")
+                            return value
+                        if result.get("ok") is not True:
+                            raise ValueError
+        except WorkerRequestError:
+            raise
+        except (TimeoutError, httpx.TimeoutException):
+            raise WorkerRequestError(504, "Clipboard request timed out") from None
+        except Exception:
+            raise WorkerRequestError(502, "Clipboard unavailable") from None
+
     async def stop_lane(self, key: str) -> dict:
         return await self._post(f"/lanes/{key}/stop", timeout=max(30, self.settings.worker_timeout))
 
