@@ -4126,7 +4126,7 @@ async def _run_step(
         "action.fill", "challenge.turnstile", "challenge.image_captcha",
         "sign.iframe.image_captcha", "challenge.grid_captcha", "sign.image_quiz",
     }:
-        return await run_private_step(private, step, vision, cfbox, lane_key)
+        return await run_private_step(private, step, vision, cfbox, lane_key, plugin_runtimes)
 
     if feature.startswith("plugin."):
         return await _run_plugin_step(
@@ -5150,7 +5150,7 @@ async def _execute_admitted_job(
                 # Opt in only for host-tagged assistant runs. A raised error after
                 # dispatch cannot prove that a business action was not applied.
                 assistant_side_effect = payload.get("assistant_run") is True and (
-                    feature.startswith(("auth.", "sign.", "post."))
+                    feature.startswith(("auth.", "sign.", "post.", "plugin."))
                     or feature in {"action.click", "action.fill", "challenge.2fa",
                                    "challenge.altcha", "challenge.slider",
                                    "challenge.image_captcha", "challenge.grid_captcha"}
@@ -5180,6 +5180,11 @@ async def _execute_admitted_job(
                         ),
                         timeout=max(1, int(timeout)),
                     )
+                    if assistant_side_effect and feature.startswith("plugin.") and status != "success":
+                        # RPC failure/revocation cannot prove the plugin performed no action.
+                        status, message, data = "unknown", "Plugin outcome uncertain", {
+                            "reason": "outcome_uncertain", "stage": "step_execution",
+                        }
                 except asyncio.TimeoutError:
                     status = ("unknown" if assistant_side_effect else
                               "waiting_human" if feature in {"post.buy_card", *CHECKPOINT_RESIGN_FEATURES} else "fail")

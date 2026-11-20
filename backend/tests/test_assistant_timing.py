@@ -23,7 +23,7 @@ from tests.test_assistant_retry import load, mutate, unknown
 def legacy_approval_timing(monkeypatch):
     # Exercise the retained dialog lifecycle explicitly, not ordinary non-post
     # routing. Actual post features remain unsupported by isolated execution.
-    monkeypatch.setattr("app.services.assistant_retry.builtin_category", lambda key: "post")
+    monkeypatch.setattr("app.services.assistant_retry.execution_category", lambda db, key: "post")
 
 
 @pytest.mark.parametrize("kind", ["interaction", "retry"])

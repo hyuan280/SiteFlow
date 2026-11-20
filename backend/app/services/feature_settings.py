@@ -17,6 +17,8 @@ from app.features.plugin_registry import (
     schema_required,
 )
 from app.models.setting import AppSetting
+from app.services.assistant_feature_policy import policy_binding
+from app.services.plugin_feature_policy import CATEGORY_RISKS
 from app.schemas.workflow import FeatureView, FeatureExecutionSettings, ResultExecutionSettings
 
 
@@ -121,6 +123,8 @@ class FeatureSettingsService:
         return FeatureExecutionSettings.model_validate({"llm_prompt": prompt})
 
     def view(self, feature):
+        binding = policy_binding(self.session, feature.key)
+        risk_index, risk_label = CATEGORY_RISKS[feature.category]
         defaults, required, customized = self.policy(feature)
         schema = feature.config_schema()
         schema["required"] = required
@@ -141,6 +145,10 @@ class FeatureSettingsService:
             customized=customized,
             execution_settings=self.execution_settings(feature),
             source=getattr(feature, "plugin_id", "builtin"),
+            assistant_allowed=binding["allowed"],
+            assistant_policy_revision=binding["revision"],
+            risk_index=risk_index,
+            risk_label=risk_label,
         )
 
     def update(self, feature, defaults, required, execution_settings=None):

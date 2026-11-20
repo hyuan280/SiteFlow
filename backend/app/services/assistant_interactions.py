@@ -134,32 +134,34 @@ def bind_sites(db, target):
             target[private] = workflow_binding(site)
 
 
-def grant(target, capability, *, features=None):
-    from app.services.assistant_categories import builtin_category
+def grant(target, capability, *, features=None, db=None):
+    from app.services.assistant_categories import builtin_category, execution_category, execution_features
     from app.services.assistant_execution import SUPPORTED_FEATURES
 
     if capability == "execution":
         credentials = target.get("credential_mode") == "bitwarden" or (
-            target.get("credential_mode") == "manual" and target.get("site_id") is not None)
-        features = set(SUPPORTED_FEATURES if features is None else features)
-        features &= SUPPORTED_FEATURES
+            target.get("credential_mode") in {"manual", "site"} and target.get("site_id") is not None)
+        available = set(execution_features(db)) if db is not None else SUPPORTED_FEATURES
+        category = (lambda key: execution_category(db, key)) if db is not None else builtin_category
+        features = set(available if features is None else features)
+        features &= available
         features = {key for key in features if credentials or not (
-            builtin_category(key) == "auth" or key == "challenge.2fa")}
+            category(key) == "auth" or key == "challenge.2fa")}
         target["execution_consent"] = True
         target["execution_features"] = sorted(features)
         target["credential_consent"] = credentials and any(
-            builtin_category(key) == "auth" or key == "challenge.2fa" for key in features)
-        target["allow_sign"] = any(builtin_category(key) in {"sign", "challenge"} or key in {
+            category(key) == "auth" or key == "challenge.2fa" for key in features)
+        target["allow_sign"] = any(category(key) in {"sign", "challenge", "post"} or key in {
             "action.click", "action.fill"} for key in features)
     else:
         target[capability + "_consent"] = True
 
 
-def apply_defaults(target, values):
+def apply_defaults(target, values, *, db=None):
     if target and target.get("confirmed") is True:
         for capability in ("execution", "screenshot", "workflow"):
             if values.get("auto_authorize_" + capability) is True:
-                grant(target, capability)
+                grant(target, capability, db=db)
 
 
 def invalidate_retry_authority(data):
@@ -180,7 +182,7 @@ def apply_turn_defaults(manager, owner, sid, values):
         if turn:
             data["_interaction_turn_id"] = turn["id"]
         previous = deepcopy(data.get("target"))
-        apply_defaults(data.get("target"), values)
+        apply_defaults(data.get("target"), values, db=db)
         if previous != data.get("target"):
             invalidate_retry_authority(data)
         manager._encrypt(row, data)
@@ -190,7 +192,9 @@ def apply_turn_defaults(manager, owner, sid, values):
 def prepare(db, request, data, values, *, tools=None):
     """Build canonical host review and a private, closed set of permitted effects."""
     from app.services.assistant import AssistantError
-    from app.services.assistant_execution import SUPPORTED_FEATURES
+    from app.services.assistant_categories import execution_features, execution_category
+
+    supported = execution_features(db)
 
     args = request.model_dump()
     purpose = request.purpose
@@ -230,7 +234,7 @@ def prepare(db, request, data, values, *, tools=None):
                         allow_sign=False, screenshot_consent=False, workflow_consent=False,
                         run_lane_policy="general", trusted_origins=[])
         bind_sites(db, proposed)
-        apply_defaults(proposed, values)
+        apply_defaults(proposed, values, db=db)
         public.update(title="\u786e\u8ba4\u76ee\u6807\u7f51\u7ad9", description=(
             "\u8bf7\u6838\u5bf9\u7f51\u7ad9\u540d\u79f0\u548c URL\u3002\u786e\u8ba4\u540e\u5141\u8bb8\u6d4f\u89c8\u5e76\u5411\u6a21\u578b\u53d1\u9001\u53ef\u89c1\u9875\u9762\u6587\u672c\uff0c\u4e0d\u53d1\u9001\u51ed\u636e\u3002"
             "\u6267\u884c\u3001\u622a\u56fe\u53ca\u4fdd\u5b58\u5e76\u8fd0\u884c\u9700\u5355\u72ec\u6388\u6743\uff0c\u5168\u5c40\u81ea\u52a8\u6388\u6743\u9664\u5916\u3002\u4fdd\u5b58\u540e\u9ed8\u8ba4\u4f7f\u7528 general \u8fd0\u884c\u8f66\u9053\u3002"),
@@ -280,16 +284,14 @@ def prepare(db, request, data, values, *, tools=None):
             subject = "proxy:" + request.scope
         else:
             if request.capability == "execution":
-                if request.feature_type is not None and request.feature_type not in SUPPORTED_FEATURES:
+                if request.feature_type is not None and request.feature_type not in supported:
                     raise AssistantError("execution_feature_denied", 422)
-                from app.services.assistant_categories import builtin_category
-
-                if request.feature_type and (builtin_category(request.feature_type) == "auth" or request.feature_type == "challenge.2fa") and not (
+                if request.feature_type and (execution_category(db, request.feature_type) == "auth" or request.feature_type == "challenge.2fa") and not (
                     target.get("credential_mode") == "bitwarden" or (
-                        target.get("credential_mode") == "manual" and target.get("site_id"))):
+                        target.get("credential_mode") in {"manual", "site"} and target.get("site_id"))):
                     raise AssistantError("credentials_unavailable", 422)
                 reviewed = deepcopy(target)
-                grant(reviewed, "execution")
+                grant(reviewed, "execution", db=db)
                 args["execution_features"] = reviewed["execution_features"]
             public.update(title={"execution": "\u6388\u6743\u771f\u5b9e\u6267\u884c", "screenshot": "\u6388\u6743\u622a\u56fe\u53d1\u9001",
                                  "workflow": "\u6388\u6743\u4fdd\u5b58\u5e76\u8fd0\u884c"}[request.capability],
@@ -492,7 +494,7 @@ async def request_interaction(tools, arguments):
                                 target["run_lane_policy"] = lane
                             dispose = True
                         elif purpose == "authorization":
-                            grant(target, args["capability"], features=args.get("execution_features"))
+                            grant(target, args["capability"], features=args.get("execution_features"), db=db)
                         elif purpose == "site_config":
                             from app.services.assistant_site_config import apply_site_config
 

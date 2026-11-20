@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 import grpc
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.auth import safe_compare
@@ -26,6 +26,10 @@ from app.features.plugin_registry import (
 )
 from siteflow_proto import plugin_pb2, plugin_pb2_grpc
 from app.services.plugin_audit import record
+from app.features.base import Category
+from app.models.setting import AppSetting
+from app.services.plugin_feature_policy import CATEGORY_RISKS, category_overrides, category_setting_key
+from app.services.assistant_feature_policy import policy_binding, set_assistant_allowed
 
 PLUGIN_PROTOCOL_VERSION = 1
 PLUGIN_AUTH_METADATA_KEY = "x-plugin-token"
@@ -364,6 +368,44 @@ class PluginRuntimeService:
             raise PluginAuthenticationError("invalid plugin token")
 
     def _view(self, row: PluginRegistration, now: datetime | None = None) -> PluginView:
+        from app.services.assistant_provider_policy import provider_policy_key
+
+        overrides = category_overrides(self.session, row.plugin_id)
+        features = []
+        for item in json.loads(row.features_json):
+            feature = build_remote_feature(row.plugin_id, item)
+            category = overrides.get(feature.key, feature.category)
+            risk_index, risk_label = CATEGORY_RISKS[category]
+            binding = policy_binding(self.session, feature.key)
+            features.append(dict(
+                key=feature.key, name=feature.name, declared_category=feature.category,
+                category=category, category_overridden=feature.key in overrides,
+                risk_index=risk_index, risk_label=risk_label,
+                assistant_allowed=binding["allowed"], assistant_policy_revision=binding["revision"],
+            ))
+        captcha_methods = []
+        for item in json.loads(row.captcha_methods_json):
+            method = build_remote_captcha_method(row.plugin_id, item)
+            binding = policy_binding(self.session, method.key)
+            captcha_methods.append(dict(
+                key=method.key, name=method.label, declared_category="challenge",
+                category="challenge", category_overridden=False,
+                risk_index=CATEGORY_RISKS["challenge"][0],
+                risk_label=CATEGORY_RISKS["challenge"][1],
+                assistant_allowed=binding["allowed"], assistant_policy_revision=binding["revision"],
+            ))
+        secret_providers = []
+        for capability in sorted(set(json.loads(row.capabilities_json)) & HIGH_TRUST_PLUGIN_CAPABILITIES):
+            provider_id = f"plugin.{row.plugin_id}"
+            key = provider_policy_key(provider_id, capability)
+            binding = policy_binding(self.session, key)
+            category = "auth" if capability == "secret.credentials" else "challenge"
+            secret_providers.append(dict(
+                key=key, name=row.name, provider_id=provider_id, capability=capability,
+                declared_category=category, category=category, category_overridden=False,
+                risk_index=5, risk_label="极高风险：秘密访问",
+                assistant_allowed=binding["allowed"], assistant_policy_revision=binding["revision"],
+            ))
         status = row.status
         if row.removed_at is not None:
             status = "removed"
@@ -384,11 +426,15 @@ class PluginRuntimeService:
             endpoint=row.endpoint,
             capabilities=json.loads(row.capabilities_json),
             feature_count=len(json.loads(row.features_json)),
+            features=features,
             captcha_method_count=len(json.loads(row.captcha_methods_json)),
+            captcha_methods=captcha_methods,
+            secret_providers=secret_providers,
             checks=json.loads(row.checks_json),
             status=status,
             enabled=row.enabled,
             generation=row.generation,
+            permission_epoch=row.permission_epoch,
             approved_capabilities=json.loads(row.approved_capabilities_json),
             approved_at=row.approved_at,
             approved_by=row.approved_by,
@@ -612,11 +658,14 @@ class PluginRuntimeService:
         plugin_id: str,
         capabilities: list[str] | None,
         actor: str,
+        generation: int | None = None,
+        permission_epoch: int | None = None,
     ) -> PluginView:
         row = self.session.get(PluginRegistration, plugin_id)
         if row is None:
             raise PluginNotFoundError("plugin is not registered")
         self._require_not_removed(row)
+        self._check_revision(row, generation, permission_epoch)
         declared = set(json.loads(row.capabilities_json))
         requested = declared if capabilities is None else set(capabilities)
         invalid = requested - declared
@@ -635,6 +684,7 @@ class PluginRuntimeService:
                 f"plugin checks are not passed: {', '.join(failed)}"
             )
         now = utcnow()
+        self._advance_permission_epoch(row)
         row.approved_capabilities_json = json.dumps(sorted(requested), ensure_ascii=False)
         row.approved_at = now
         row.approved_by = actor
@@ -643,11 +693,84 @@ class PluginRuntimeService:
         else:
             row.status = "available" if requested == declared else "unapproved"
         row.updated_at = now
-        row.permission_epoch += 1
         record(self.session, "approve", plugin_id=plugin_id, actor=actor, reason="admin")
         self.session.commit()
         refresh_plugin_registry(self.session)
         return self._view(row, now=now)
+
+    @staticmethod
+    def _check_revision(row, generation, permission_epoch) -> None:
+        if generation is not None and generation != row.generation:
+            raise PluginGenerationConflict("plugin generation does not match")
+        if permission_epoch is not None and permission_epoch != row.permission_epoch:
+            raise PluginGenerationConflict("plugin permission_epoch does not match")
+
+    def _advance_permission_epoch(self, row: PluginRegistration) -> None:
+        # Compare-and-swap also protects SQLite, where SELECT FOR UPDATE is ignored.
+        result = self.session.execute(
+            update(PluginRegistration).where(
+                PluginRegistration.plugin_id == row.plugin_id,
+                PluginRegistration.generation == row.generation,
+                PluginRegistration.permission_epoch == row.permission_epoch,
+            ).values(permission_epoch=PluginRegistration.permission_epoch + 1),
+            execution_options={"synchronize_session": False},
+        )
+        if result.rowcount != 1:
+            self.session.rollback()
+            raise PluginGenerationConflict("plugin revision changed")
+        self.session.refresh(row)
+
+    def update_feature_categories(
+        self, plugin_id: str, categories: dict[str, Category | None],
+        generation: int, permission_epoch: int, actor: str,
+        assistant_permissions: dict[str, bool] | None = None,
+    ) -> PluginView:
+        row = self.session.get(PluginRegistration, plugin_id)
+        if row is None:
+            raise PluginNotFoundError("plugin is not registered")
+        self._require_not_removed(row)
+        self._check_revision(row, generation, permission_epoch)
+        keys = {item["key"] for item in json.loads(row.features_json)}
+        if categories.keys() - keys:
+            raise PluginValidationError("unknown plugin feature keys")
+        if any(value is not None and value not in CATEGORY_RISKS for value in categories.values()):
+            raise PluginValidationError("invalid plugin feature category")
+        assistant_permissions = assistant_permissions or {}
+        method_keys = {item["key"] for item in json.loads(row.captcha_methods_json)}
+        provider_keys = {
+            f"plugin.{plugin_id}.{capability}"
+            for capability in json.loads(row.capabilities_json)
+            if capability in HIGH_TRUST_PLUGIN_CAPABILITIES
+        }
+        if assistant_permissions.keys() - (keys | method_keys | provider_keys):
+            raise PluginValidationError("unknown plugin feature, captcha method or secret provider keys")
+        for key, allowed in assistant_permissions.items():
+            set_assistant_allowed(self.session, key, allowed)
+        overrides = category_overrides(self.session, plugin_id)
+        previous_overrides = dict(overrides)
+        for key, value in categories.items():
+            if value is None:
+                overrides.pop(key, None)
+            else:
+                overrides[key] = value
+        if overrides != previous_overrides:
+            if row.permission_epoch == permission_epoch:
+                self._advance_permission_epoch(row)
+            setting = self.session.get(AppSetting, category_setting_key(plugin_id))
+            if setting is None:
+                setting = AppSetting(key=category_setting_key(plugin_id))
+                self.session.add(setting)
+            setting.value_json = json.dumps(overrides, sort_keys=True)
+            setting.updated_at = utcnow()
+            row.approved_capabilities_json = "[]"
+            row.approved_at = None
+            row.approved_by = None
+            row.status = "unapproved" if row.enabled else "disabled"
+        row.updated_at = utcnow()
+        record(self.session, "metadata_change", plugin_id=plugin_id, actor=actor, reason="admin")
+        self.session.commit()
+        refresh_plugin_registry(self.session)
+        return self._view(row)
 
     def revoke(self, plugin_id: str, actor: str) -> PluginView:
         row = self.session.get(PluginRegistration, plugin_id)

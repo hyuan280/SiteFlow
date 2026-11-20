@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
-from app.features.catalog import FEATURES
+from app.services.assistant_categories import Denied, execution_category
 from app.models.assistant_workflow import AssistantWorkflowAction
 from app.models.workflow import SiteResignRecord
 from app.services.assistant_run_guard import _fingerprint
@@ -25,9 +25,15 @@ CONSUMING_FEATURES = frozenset({
 def build_plan(db, service, site):
     steps = []
     for step in service.resolve_site(site.id).steps:
-        if step.feature_type not in FEATURES:
+        try:
+            category = execution_category(db, step.feature_type)
+        except Denied:
             raise WorkflowDenied("workflow_feature_denied")
-        if step.enabled and FEATURES[step.feature_type].category == "post":
+        if step.enabled and category == "post":
+            from app.services.assistant_feature_policy import assistant_explicitly_allowed
+
+            if assistant_explicitly_allowed(db, step.feature_type):
+                continue
             # This set lists reviewed plan builders, not permission classification.
             if step.feature_type not in CONSUMING_FEATURES:
                 raise WorkflowDenied("consumption_feature_denied")
@@ -68,7 +74,7 @@ def build_plan(db, service, site):
                 f"\u6bcf\u4e2a\u65e5\u671f\u9996\u6b21\u63d0\u4ea4\u540e\u6700\u591a\u989d\u5916\u91cd\u8bd5 {max_retries} \u6b21"
                 f"\uff08max_retries={max_retries}\uff0c\u5408\u8ba1\u6700\u591a {1 + max_retries} \u6b21\u63d0\u4ea4\uff09\u3002"
                 "\u7ad9\u70b9\u9700\u4fdd\u8bc1\u91cd\u590d\u8865\u7b7e\u5e42\u7b49\uff0c\u4e0d\u91cd\u590d\u6263\u5361\u3002")
-    fingerprint, _ = _fingerprint(service, site)
+    fingerprint, _ = _fingerprint(service, site, assistant_policy=True)
     return {"binding": workflow_binding(site), "fingerprint": fingerprint,
             "unresolved_dates": unresolved,
             "review": {"name": site.name, "base_url": site.base_url, "site_id": site.id,

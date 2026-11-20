@@ -22,9 +22,12 @@ def providers(session=Depends(get_db), settings=Depends(get_settings)):
     ]
     for plugin in PluginRuntimeService(session, settings).list_plugins():
         if plugin.enabled and plugin.status == "available" and set(plugin.capabilities) == set(plugin.approved_capabilities):
-            for capability in ("secret.credentials", "secret.totp"):
-                if capability in plugin.approved_capabilities:
-                    result.append({"id": f"plugin.{plugin.plugin_id}", "name": plugin.name, "capability": capability})
+            for provider in plugin.secret_providers:
+                result.append({
+                    "id": provider.provider_id, "name": provider.name, "capability": provider.capability,
+                    "assistant_allowed": provider.assistant_allowed,
+                    "assistant_policy_revision": provider.assistant_policy_revision,
+                })
     return result
 
 
@@ -42,6 +45,28 @@ class PluginAuthorizationRequest(BaseModel):
     plugin_id: str = Field(max_length=64)
     generation: int
     capability: str | None = Field(default=None, pattern="^(features|browser_actions|captcha_methods)$")
+
+
+class AssistantPluginAuthorizationRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    operation_id: str = Field(min_length=1, max_length=128)
+    plugin_id: str = Field(min_length=1, max_length=64)
+    generation: int = Field(strict=True, ge=1)
+    capability: Literal["features", "captcha_methods"]
+
+
+@router.post("/api/v1/internal/assistant-plugins/authorize", include_in_schema=False)
+def authorize_assistant_plugin(payload: AssistantPluginAuthorizationRequest,
+                                     authorization: str = Header(default="")):
+    from app.services.assistant_plugin_authorization import assistant_plugin_authorization
+
+    if not authorization.startswith("Bearer ") or len(authorization) > 200:
+        raise HTTPException(403, "Plugin request denied")
+    try:
+        assistant_plugin_authorization.authorize(authorization[7:], **payload.model_dump())
+    except SecretDenied:
+        raise HTTPException(403, "Plugin request denied") from None
+    return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
 
 class ResignCheckpointRequest(BaseModel):
@@ -62,18 +87,24 @@ def resign_checkpoint(
     executor = request.app.state.executor
     with executor.session_factory() as session:
         try:
-            job, feature_type = executor.secret_providers.authorize_resign(
-                authorization[7:], payload.job_id, payload.site_id, payload.step_key, session,
-            )
+            def authorize():
+                try:
+                    return executor.secret_providers.authorize_resign(
+                        authorization[7:], payload.job_id, payload.site_id, payload.step_key, session)
+                except SecretDenied:
+                    from app.services.assistant_plugin_authorization import assistant_plugin_authorization
+
+                    return assistant_plugin_authorization.authorize_resign(
+                        authorization[7:], payload.job_id, payload.site_id, payload.step_key, session)
+
+            job, feature_type = authorize()
             result = payload.result.get("resign")
             if not isinstance(result, dict):
                 raise ValueError("Invalid resign result")
             ResignService(session, executor.settings).checkpoint(
                 job, payload.phase, payload.date, result, feature_type,
             )
-            executor.secret_providers.authorize_resign(
-                authorization[7:], payload.job_id, payload.site_id, payload.step_key, session,
-            )
+            authorize()
             session.commit()
         except SecretDenied:
             session.rollback()

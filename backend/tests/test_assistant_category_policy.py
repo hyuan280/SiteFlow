@@ -174,7 +174,9 @@ def test_atomic_reservation_across_managers(execution):
     def reserve(_):
         manager = AssistantManager(execution.manager.session_factory, execution.manager.settings,
                                    execution.manager.crypto)
+        manager.browsers[execution.session_id] = execution.manager.browsers[execution.session_id]
         helper = AssistantExecution(manager, OWNER, execution.session_id, execution.target)
+        helper._normalize(step)
         try:
             helper._reserve(str(uuid4()), step)
             return "reserved"
@@ -266,5 +268,10 @@ def test_automatic_grant_cannot_be_stolen_or_rebound(execution, monkeypatch):
 def test_post_and_plugin_never_auto_execute(execution):
     host_turn(execution)
     for feature in ("post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog", "plugin.foo"):
+        from app.services.assistant_feature_policy import set_assistant_allowed
+        if feature.startswith("post."):
+            with execution.manager.session_factory() as db:
+                set_assistant_allowed(db, feature, False)
+                db.commit()
         assert run(execution, arguments(feature))["code"] == "execution_feature_denied"
     execution.manager._worker.assert_not_awaited()

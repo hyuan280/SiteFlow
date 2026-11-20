@@ -1866,6 +1866,8 @@ class WorkflowService(WorkflowHistoryMixin):
             raise WorkflowValidationError("Settings patch must be an object")
         # Validate raw input again even when a caller already previewed the patch.
         values = SiteSettingsPatch.model_validate(patch).model_dump(exclude_unset=True)
+        if "credential_provider_id" in values:
+            values["bitwarden_enabled"] = values["credential_provider_id"] == "builtin.bitwarden"
         site = self._get_site(site_id)
         self.session.refresh(site)
         self._check_revision(site, expected_revision, expected_history_key)

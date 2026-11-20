@@ -73,7 +73,7 @@ export function interactionReviewRows(purpose: string, review: Record<string, un
   if (["template_import", "scheduler_config", "run_cancel", "cookie_clear"].includes(purpose)) return [];
   const fields = ["target", "site_config", "consumption"].includes(purpose) ? ["name", "base_url"] :
     ["name", "base_url", "scope", "origins", "trusted_origins", "trusted_urls", "suggested_lane", "current_browser_lane",
-      "current_run_lane_policy", "run_lane_policy", "lane_policy", "proxy", "capability", "credential_mode", "site_id",
+      "current_run_lane_policy", "run_lane_policy", "lane_policy", "proxy", "capability", "credential_mode", "credential_provider_id", "site_id",
       "workflow_site_id", "feature_type", "execution_features", "credential_consent", "allow_sign", "execution_consent",
       "screenshot_consent", "workflow_consent", "required"];
   return fields.filter(field => Object.hasOwn(review, field)).map(field => ({

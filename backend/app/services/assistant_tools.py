@@ -47,6 +47,12 @@ ALLOWED_FEATURES = [
 ]
 
 
+def allowed_features(db):
+    from app.services.config_ai_catalog import ConfigAICatalog
+
+    return list(ConfigAICatalog(db, include_plugins=True)._features())
+
+
 def failure(code: str) -> dict:
     return {"ok": False, "code": code}
 
@@ -80,6 +86,26 @@ class AssistantTools:
             return decision
         if self.interaction_blocked:
             return {**failure("prerequisite_missing"), "terminal": True, "blocking": True}
+        if name == "list_secret_providers":
+            if (not isinstance(arguments, dict) or set(arguments) - {"capability"}
+                    or arguments.get("capability") not in {None, "secret.credentials", "secret.totp"}):
+                return failure("invalid_arguments")
+            from app.services.assistant_provider_policy import authorized_providers
+
+            capabilities = ([arguments["capability"]] if arguments.get("capability") else
+                            ["secret.credentials", "secret.totp"])
+            providers = [
+                {"id": "builtin.manual", "name": "Saved site credentials", "capability": "secret.credentials"},
+                {"id": "builtin.bitwarden", "name": "Bitwarden", "capability": "secret.credentials"},
+                {"id": "builtin.twofauth", "name": "2FAuth", "capability": "secret.totp"},
+            ]
+            with self.manager.session_factory() as db:
+                self.manager._owned(db, self.owner, self.session_id)
+                for capability in capabilities:
+                    providers.extend({key: item[key] for key in ("id", "name", "capability")}
+                                     for item in authorized_providers(db, capability)
+                                     if item["id"].startswith("plugin."))
+            return {"ok": True, "providers": [item for item in providers if item["capability"] in capabilities]}
         if name == "clear_bound_site_cookies":
             from app.services.assistant_cookies import clear_bound_site_cookies
 
@@ -126,10 +152,11 @@ class AssistantTools:
                         or not isinstance(arguments.get("step"), dict)):
                     return failure("invalid_arguments")
                 feature = arguments["step"].get("feature_type")
-                from app.services.assistant_execution import SUPPORTED_FEATURES
+                from app.services.assistant_categories import execution_features
 
-                if not isinstance(feature, str) or feature not in SUPPORTED_FEATURES:
-                    return failure("execution_feature_denied")
+                with self.manager.session_factory() as db:
+                    if not isinstance(feature, str) or feature not in execution_features(db):
+                        return failure("execution_feature_denied")
             elif name == "import_workflow_draft":
                 if (not isinstance(arguments, dict) or set(arguments) != {"proposal_message_id"}
                         or type(arguments["proposal_message_id"]) is not int
@@ -319,7 +346,7 @@ class AssistantTools:
             site = self.target or {"name": "unconfirmed", "base_url": "https://example.com/"}
             tools = ConfigAITools(service, GenerationSite(
                 name=site["name"], base_url=site["base_url"],
-            ), ALLOWED_FEATURES)
+            ), allowed_features(db), include_plugins=True)
             tools._consulted = self.consulted
             result = tools.dispatch(name, arguments)
             if getattr(service, "denial_code", None):
@@ -328,9 +355,15 @@ class AssistantTools:
                 # Local proposal only, never the service's effective/resolved preview.
                 result = {**result, "proposal": tools.proposal}
             if self.target and name in {"validate_workflow_draft", "submit_workflow_draft"} and result.get("ok"):
+                provider_id = "builtin.bitwarden" if self.target["credential_mode"] == "bitwarden" else "builtin.manual"
+                if self.target["credential_mode"] == "site":
+                    selected = db.execute(select(Site.credential_provider_id, Site.bitwarden_enabled).where(
+                        Site.id == self.target.get("site_id"))).first()
+                    provider_id = (selected.credential_provider_id or (
+                        "builtin.bitwarden" if selected.bitwarden_enabled else "builtin.manual")) if selected else None
                 result["required_site_settings"] = {
                     "credential_mode": self.target["credential_mode"],
-                    "credential_provider_id": "builtin.bitwarden" if self.target["credential_mode"] == "bitwarden" else "builtin.manual",
+                    "credential_provider_id": provider_id,
                     "lane_policy": saved_lane(self.target),
                     "trusted_origins": self.target.get("trusted_origins", []),
                     "notice": "Import applies host-confirmed settings only with workflow_consent; manual saving requires separate review. Credentials and Cookie remain outside the proposal. trusted_origins is observation only and does not authorize credential trusted_urls; credential trust requires separate user review.",

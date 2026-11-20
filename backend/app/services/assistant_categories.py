@@ -1,4 +1,4 @@
-"""Builtin-only category policy. Model and plugin metadata confer no authority."""
+"""Host-owned category policy; model-provided categories confer no authority."""
 
 from uuid import uuid4
 
@@ -19,6 +19,73 @@ def builtin_category(feature_key: str) -> Category:
             or feature.category not in {"flow", "auth", "challenge", "sign", "action", "post"}):
         raise Denied("execution_feature_denied")
     return feature.category
+
+
+def execution_category(db, feature_key: str) -> Category:
+    """Resolve approved plugin authority against both the registry and current DB state."""
+    from app.services.assistant_feature_policy import assistant_allowed
+
+    if not isinstance(feature_key, str):
+        raise Denied("execution_feature_denied")
+    if not assistant_allowed(db, feature_key):
+        raise Denied("execution_feature_denied")
+    if not isinstance(feature_key, str) or not feature_key.startswith("plugin."):
+        return builtin_category(feature_key)
+    from app.features.plugin_registry import get_plugin_feature, plugin_metadata_for_row
+    from app.models.plugin import PluginRegistration
+    from app.services.plugin_feature_policy import effective_features, category_setting_key
+    from app.models.setting import AppSetting
+
+    feature = get_plugin_feature(feature_key)
+    row = db.get(PluginRegistration, feature.plugin_id, populate_existing=True) if feature else None
+    if row is None:
+        raise Denied("execution_feature_denied")
+    db.get(AppSetting, category_setting_key(row.plugin_id), populate_existing=True)
+    current, _ = plugin_metadata_for_row(row)
+    current = effective_features(db, row.plugin_id, current)
+    if feature not in current or feature.category not in {
+            "flow", "auth", "challenge", "sign", "action", "post"}:
+        raise Denied("execution_feature_denied")
+    return feature.category
+
+
+def execution_features(db):
+    from app.features.plugin_registry import plugin_features
+
+    result = {}
+    for feature in [*FEATURES.values(), *plugin_features()]:
+        try:
+            execution_category(db, feature.key)
+        except Denied:
+            continue
+        result[feature.key] = feature
+    return result
+
+
+def execution_binding(db, key):
+    from app.services.assistant_feature_policy import policy_binding
+    from app.models.setting import AppSetting
+    import hashlib
+    import json
+
+    execution_category(db, key)
+    settings = db.get(AppSetting, f"feature.{key}", populate_existing=True)
+    return {"policy": policy_binding(db, key),
+            "settings": hashlib.sha256(json.dumps(json.loads(settings.value_json),
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest() if settings else None,
+            **({"plugin": plugin_execution_binding(db, key)} if key.startswith("plugin.") else {})}
+
+
+def plugin_execution_binding(db, feature_key: str) -> dict:
+    execution_category(db, feature_key)
+    from app.features.plugin_registry import get_plugin_feature
+    from app.models.plugin import PluginRegistration
+
+    feature = get_plugin_feature(feature_key)
+    row = db.get(PluginRegistration, feature.plugin_id)
+    return {"generation": row.generation, "permission_epoch": row.permission_epoch,
+            "category": feature.category, "version": feature.version,
+            "schema": feature.config_schema()}
 
 
 def auth_budget_context(manager, db, session_id, data, *, turn=None, auth_limit=None):
@@ -86,9 +153,9 @@ def reserve_run_auth_use(session_factory, settings, crypto, action_id, binding,
     from app.services.assistant_run_guard import validate_guard
     from app.services.config_ai_generation import _json, _strict_json
 
-    if builtin_category(feature) != "auth":
-        return
     with session_factory() as db:
+        if execution_category(db, feature) != "auth":
+            return
         changed = db.execute(update(AssistantSession).where(
             AssistantSession.id == binding["session_id"], AssistantSession.owner == binding["owner"],
         ).values(updated_at=AssistantSession.updated_at))

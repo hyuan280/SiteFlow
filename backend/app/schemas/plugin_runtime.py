@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator
+
+from app.features.base import Category
 
 PLUGIN_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 CAPABILITY_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
@@ -86,6 +89,8 @@ class PluginCheckView(BaseModel):
 
 class PluginApproveRequest(BaseModel):
     capabilities: list[str] | None = None
+    generation: int | None = Field(default=None, ge=1)
+    permission_epoch: int | None = Field(default=None, ge=1)
 
     @field_validator("capabilities")
     @classmethod
@@ -93,6 +98,30 @@ class PluginApproveRequest(BaseModel):
         if value is None:
             return None
         return validate_capabilities(value)
+
+
+class PluginFeatureCategoriesRequest(BaseModel):
+    categories: dict[str, Category | None] = Field(default_factory=dict)
+    assistant_permissions: dict[str, StrictBool] = Field(default_factory=dict)
+    generation: int = Field(ge=1)
+    permission_epoch: int = Field(ge=1)
+
+
+class PluginFeatureView(BaseModel):
+    key: str
+    name: str
+    declared_category: Category
+    category: Category
+    category_overridden: bool
+    risk_index: int = Field(ge=1, le=5)
+    risk_label: str
+    assistant_allowed: bool = False
+    assistant_policy_revision: int = Field(default=0, ge=0)
+
+
+class PluginSecretProviderView(PluginFeatureView):
+    provider_id: str
+    capability: Literal["secret.credentials", "secret.totp"]
 
 
 class PluginView(BaseModel):
@@ -105,11 +134,15 @@ class PluginView(BaseModel):
     endpoint: str
     capabilities: list[str]
     feature_count: int
+    features: list[PluginFeatureView] = Field(default_factory=list)
     captcha_method_count: int
+    captcha_methods: list[PluginFeatureView] = Field(default_factory=list)
+    secret_providers: list[PluginSecretProviderView] = Field(default_factory=list)
     checks: list[PluginCheckView]
     status: str
     enabled: bool
     generation: int
+    permission_epoch: int
     approved_capabilities: list[str]
     approved_at: datetime | None
     approved_by: str | None

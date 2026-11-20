@@ -19,6 +19,8 @@ Feature = Literal[
     "action.fill", "flow.result",
 ]
 FEATURES = frozenset(Feature.__args__)
+POST_FEATURES = frozenset({"post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog"})
+Category = Literal["flow", "auth", "challenge", "sign", "action", "post"]
 
 # Trusted builtin metadata, mirrored from the catalog without a backend dependency.
 # Never infer permission categories from key prefixes or caller-supplied metadata.
@@ -46,8 +48,18 @@ FEATURE_CATEGORIES = {
 
 class ExecutionPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
-    feature_types: list[Feature] = Field(min_length=1, max_length=18)
+    feature_types: list[str] = Field(min_length=1, max_length=256)
     allow_sign: bool = False
+
+    @field_validator("feature_types")
+    @classmethod
+    def feature_keys(cls, values):
+        if any(not re.fullmatch(
+            r"plugin\.[A-Za-z0-9_-]{1,128}\.[A-Za-z0-9_.-]+" if value.startswith("plugin.")
+            else r"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+", value
+        ) for value in values):
+            raise ValueError("Invalid feature key")
+        return values
 
 
 class Credentials(BaseModel):
@@ -117,6 +129,10 @@ class ExecuteRequest(BaseModel):
     operation_id: UUID
     step: dict[str, Any] = Field(repr=False)
     execution: ExecutionPolicy
+    categories: dict[str, Category] = Field(default_factory=dict, max_length=256)
+    feature_schemas: dict[str, dict] = Field(default_factory=dict, max_length=256, repr=False)
+    plugin_runtimes: dict[str, dict] = Field(default_factory=dict, max_length=20, repr=False)
+    job_runtime: dict | None = Field(default=None, repr=False)
     credentials: Credentials | None = Field(default=None, repr=False)
     private_runtime: PrivateRuntime | None = Field(default=None, repr=False)
     site_origin: str = Field(min_length=1, max_length=4096)
@@ -130,6 +146,12 @@ class ExecuteRequest(BaseModel):
                 or self.retry_of == self.operation_id):
             raise ValueError("Invalid retry authorization")
         return self
+
+    @field_validator("feature_schemas", "plugin_runtimes", "job_runtime")
+    @classmethod
+    def bounded_private(cls, value):
+        bounded_json(value, 262144)
+        return value
 
     @field_validator("step")
     @classmethod
@@ -175,16 +197,88 @@ CONFIG_FIELDS = {
 CONFIG_FIELDS["sign.iframe.image_captcha"] = CONFIG_FIELDS["challenge.image_captcha"] | {"iframe_selector", "fields"}
 
 
+def bounded_json(value, maximum=65536):
+    try:
+        if len(json.dumps(value, ensure_ascii=True, allow_nan=False).encode()) > maximum:
+            raise ValueError()
+        pending = [(value, 0)]
+        while pending:
+            item, depth = pending.pop()
+            if depth > 24:
+                raise ValueError()
+            if isinstance(item, dict):
+                pending.extend((child, depth + 1) for child in item.values())
+            elif isinstance(item, list):
+                pending.extend((child, depth + 1) for child in item)
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("Invalid bounded JSON") from None
+
+
+def validate_dynamic_config(config, schema):
+    from jsonschema import Draft202012Validator
+
+    bounded_json(schema)
+    # Pydantic emits local $defs (e.g. buy-card pricing). Expand only acyclic
+    # local references; never let jsonschema resolve a network resource.
+    remaining = 16384
+
+    def expand(item, refs=()):
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or len(refs) > 24:
+            raise ValueError("Schema expansion limit")
+        if isinstance(item, dict):
+            if any(key in item for key in ("$id", "$dynamicRef", "$recursiveRef")):
+                raise ValueError("Schema references denied")
+            if "$ref" in item:
+                ref = item["$ref"]
+                if not isinstance(ref, str) or not ref.startswith("#/$defs/") or ref in refs:
+                    raise ValueError("Schema references denied")
+                target = schema
+                try:
+                    for part in ref[2:].split("/"):
+                        target = target[part.replace("~1", "/").replace("~0", "~")]
+                except (KeyError, TypeError):
+                    raise ValueError("Schema references denied") from None
+                return {"allOf": [expand(target, (*refs, ref)),
+                                  expand({k: v for k, v in item.items() if k != "$ref"}, refs)]}
+            return {key: expand(value, refs) for key, value in item.items()}
+        if isinstance(item, list):
+            return [expand(value, refs) for value in item]
+        return item
+
+    schema = expand(schema)
+    bounded_json(schema, 262144)
+    try:
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema).validate(config)
+    except Exception:
+        raise ValueError("Invalid dynamic config") from None
+
+
+def validate_plugin_runtimes(request):
+    from worker.assistant_runtime import PluginRuntime
+
+    result = {}
+    for key, value in request.plugin_runtimes.items():
+        runtime = PluginRuntime.model_validate(value)
+        if key != runtime.plugin_id or str(runtime.authorization.operation_id) != str(request.operation_id):
+            raise ValueError("Plugin scope denied")
+        result[key] = runtime.model_dump(mode="json")
+    return result
+
+
 def validate_step(request: ExecuteRequest) -> dict[str, Any]:
     step = request.step
     if set(step) - {"step_key", "feature_type", "config", "timeout_seconds", "label",
                     "group_key", "position", "enabled", "condition", "on_error"}:
         raise ValueError("Invalid step")
     feature = step.get("feature_type")
-    if not isinstance(feature, str) or feature not in FEATURES or feature not in request.execution.feature_types:
+    if not isinstance(feature, str) or feature not in request.execution.feature_types:
         raise ValueError("Feature denied")
-    category = FEATURE_CATEGORIES.get(feature)
-    if category not in {"flow", "auth", "challenge", "sign", "action"}:
+    category = (FEATURE_CATEGORIES.get(feature) if feature in FEATURES else
+                "post" if feature in POST_FEATURES else request.categories.get(feature))
+    if category not in {"flow", "auth", "challenge", "sign", "action", "post"} or (feature in FEATURES and category == "post"):
         raise ValueError("Category denied")
     if category in {"sign", "challenge"} and not request.execution.allow_sign:
         raise ValueError("Signing denied")
@@ -196,7 +290,31 @@ def validate_step(request: ExecuteRequest) -> dict[str, Any]:
     if timeout is not None and (type(timeout) is not int or not 1 <= timeout <= 3600):
         raise ValueError("Invalid timeout")
     config = step.get("config")
-    if not isinstance(config, dict) or set(config) - CONFIG_FIELDS[feature]:
+    if not isinstance(config, dict):
+        raise ValueError("Invalid config")
+    bounded_json(config)
+    plugins = validate_plugin_runtimes(request)
+    method = config.get("captcha_method", "ddddocr")
+    plugin_key = feature if feature.startswith("plugin.") else method
+    if isinstance(plugin_key, str) and plugin_key.startswith("plugin."):
+        parts = plugin_key.split(".", 2)
+        capability = "features" if feature.startswith("plugin.") else "captcha_methods"
+        if len(parts) != 3 or not parts[2] or capability not in plugins.get(parts[1], {}).get("approved_capabilities", []):
+            raise ValueError("Plugin runtime unavailable")
+    if feature not in FEATURES:
+        schema = request.feature_schemas.get(feature)
+        if schema is None:
+            raise ValueError("Feature schema unavailable")
+        validate_dynamic_config(config, schema)
+        if request.credentials is not None or request.private_runtime is not None:
+            raise ValueError("Unexpected private runtime")
+        if category == "post":
+            from worker.assistant_runtime import JobRuntime
+            if request.job_runtime is None:
+                raise ValueError("Post context unavailable")
+            JobRuntime.model_validate(request.job_runtime)
+        return {**step, "config": dict(config)}
+    if set(config) - CONFIG_FIELDS[feature]:
         raise ValueError("Invalid config")
     for key, value in config.items():
         if key == "selected_selector":
@@ -252,10 +370,15 @@ def validate_step(request: ExecuteRequest) -> dict[str, Any]:
             raise ValueError("Credentials unavailable")
     elif request.credentials is not None:
         raise ValueError("Unexpected credentials")
-    if config.get("captcha_method", "ddddocr") not in {"ddddocr", "vision", "nexusphp_gd5"}:
+    if method not in {"ddddocr", "vision", "nexusphp_gd5"} and not (isinstance(method, str) and method.startswith("plugin.")):
         raise ValueError("Provider denied")
-    if config.get("totp_provider_id", "builtin.twofauth") != "builtin.twofauth":
-        raise ValueError("Provider denied")
+    provider = config.get("totp_provider_id", "builtin.twofauth")
+    if provider != "builtin.twofauth":
+        # Plugin TOTP is resolved by the host, not by a worker plugin runtime.
+        if feature != "challenge.2fa" or not re.fullmatch(r"plugin\.[a-z][a-z0-9-]{0,62}", provider):
+            raise ValueError("Provider denied")
+        if not config.get("service_hint", "").strip():
+            raise ValueError("Service hint unavailable")
     if config.get("charset", "alnum") not in {"alnum", "digits", "lower", "upper", "letters", "digits_lower", "digits_upper", "any"}:
         raise ValueError("Invalid charset")
     runtime = request.private_runtime

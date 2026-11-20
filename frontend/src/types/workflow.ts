@@ -45,6 +45,10 @@ export interface FeatureExecutionSettings {
 }
 
 export interface Feature {
+  assistant_allowed: boolean;
+  assistant_policy_revision: number;
+  risk_index: number;
+  risk_label: string;
   key: string;
   name: string;
   category: string;

@@ -26,6 +26,7 @@ LABELS = {
     "support_resign": "\u5141\u8bb8\u8865\u7b7e", "resign_max_days": "\u6700\u5927\u8865\u7b7e\u5929\u6570",
     "checkin_after": "\u7b7e\u5230\u8d77\u59cb\u65f6\u95f4", "timezone": "\u65f6\u533a",
     "tags": "\u6807\u7b7e", "notes": "\u5907\u6ce8",
+    "credential_provider_id": "Credential provider",
     "observation.proxy": "\u89c2\u5bdf\u6d4f\u89c8\u5668\u4ee3\u7406",
     "observation.trusted_origins": "\u89c2\u5bdf\u4fe1\u4efb\u6765\u6e90",
 }
@@ -160,12 +161,27 @@ def check_context(db, tools, data, patch):
     return site
 
 
+def credential_provider_binding(db, provider_id):
+    if provider_id in {"builtin.manual", "builtin.bitwarden"}:
+        return {"id": provider_id}
+    from app.services.assistant_categories import Denied
+    from app.services.assistant_provider_policy import provider_binding
+
+    try:
+        return provider_binding(db, provider_id, "secret.credentials")
+    except Denied as exc:
+        raise WorkflowDenied(str(exc)) from None
+
+
 def prepare_site_config(db, tools, request, data):
     args = canonical(request)
     if unsafe_site_config(args, tools.config.get("api_key", "")):
         raise WorkflowDenied("secret_input")
     patch, observation = args["patch"], args["observation"]
     site = check_context(db, tools, data, patch)
+    provider = None
+    if "credential_provider_id" in patch:
+        provider = credential_provider_binding(db, patch["credential_provider_id"])
     target = data["target"]
     workflows = AssistantWorkflows(tools.manager, tools.owner, tools.session_id, target)
     service = workflows._service(db)
@@ -216,7 +232,8 @@ def prepare_site_config(db, tools, request, data):
               "description": "\u4ec5\u6388\u6743\u4e0b\u5217\u7cbe\u786e\u53d8\u66f4\u3002\u5168\u5c40\u81ea\u52a8\u6388\u6743\u4e0d\u9002\u7528\uff0c\u62d2\u7edd\u6216\u8d85\u65f6\u4e0d\u4f1a\u4fee\u6539\u8bbe\u7f6e\u3002",
               "review": review}
     private = {"request": args, "binding": workflow_binding(site) if site else None,
-               "current": current, "actual_patch": actual, "successful_run_id": successful_run_id}
+               "current": current, "actual_patch": actual, "successful_run_id": successful_run_id,
+               "provider_binding": provider}
     from app.services.assistant_retry import fingerprint
 
     return public, private, "site_config:" + fingerprint({"patch": patch, "observation": observation})
@@ -227,6 +244,9 @@ def apply_site_config(db, tools, data, args):
     site = check_context(db, tools, data, request["patch"])
     if site and workflow_binding(site) != args["binding"]:
         raise WorkflowDenied("workflow_binding_changed")
+    if "credential_provider_id" in request["patch"]:
+        if credential_provider_binding(db, request["patch"]["credential_provider_id"]) != args.get("provider_binding"):
+            raise WorkflowDenied("provider_binding_changed")
     if site:
         for name, value in args["current"].items():
             current = (json.loads(getattr(site, name + "_json")) if name in {"tags", "trusted_urls"}
@@ -249,6 +269,8 @@ def apply_site_config(db, tools, data, args):
         target = data["target"]
         target.update(name=site.name, run_lane_policy=site.lane_policy,
                       _workflow_binding=workflow_binding(site))
+        if "credential_provider_id" in args["actual_patch"]:
+            target.update(credential_mode="site", site_id=site.id)
         if target.get("site_id") == site.id:
             target["_credential_binding"] = workflow_binding(site)
     data["target"].update(deepcopy(request["observation"]))

@@ -250,7 +250,7 @@ def test_configured_turn_deadline_and_provider_timeout(
 def test_overlapping_turns_keep_independent_snapshots(runtime_client, provider, monkeypatch):
     client = runtime_client
     save(client, max_tool_calls=2, max_parallel_tool_calls=2, max_model_rounds=3,
-         turn_timeout_seconds=40, context_max_tokens=24000, max_tokens=111, auto_compact=False)
+         turn_timeout_seconds=40, context_max_tokens=32000, max_tokens=111, auto_compact=False)
     manager = client.app.state.assistant_manager
     first, second = create(client), create(client)
     started, release = threading.Event(), threading.Event()
@@ -286,7 +286,7 @@ def test_overlapping_turns_keep_independent_snapshots(runtime_client, provider, 
     release.set()
     assert wait(client, first)["messages"][-1]["content"] == "First complete"
     assert snapshots[first]["max_tool_calls"] == 2 and snapshots[first]["auto_compact"] is False
-    assert snapshots[first]["context_max_tokens"] == 24000
+    assert snapshots[first]["context_max_tokens"] == 32000
     assert snapshots[first]["max_auth_uses_per_turn"] == 3
     assert snapshots[second] == updated.model_dump()
     assert snapshots[second]["max_auth_uses_per_turn"] == 7

@@ -226,11 +226,14 @@ def plugin_metadata_for_row(
 
 
 def refresh_plugin_registry(session: Session) -> None:
+    from app.services.plugin_feature_policy import effective_features
+
     rows = session.scalars(select(PluginRegistration)).all()
     features: dict[str, RemoteFeature] = {}
     methods: dict[str, RemoteCaptchaMethod] = {}
     for row in rows:
         item_features, item_methods = plugin_metadata_for_row(row)
+        item_features = effective_features(session, row.plugin_id, item_features)
         for feature in item_features:
             features[feature.key] = feature
         for method in item_methods:

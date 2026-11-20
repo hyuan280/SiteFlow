@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.models.auth import AuthSession
 from app.schemas.plugin_runtime import (
     PluginApproveRequest,
+    PluginFeatureCategoriesRequest,
     PluginHeartbeatRequest,
     PluginRegisterRequest,
     PluginUnregisterRequest,
@@ -140,7 +141,28 @@ def approve_plugin(
     service: PluginRuntimeService = Depends(get_service),
 ) -> PluginView:
     try:
-        return service.approve(plugin_id, payload.capabilities, current.username)
+        return service.approve(
+            plugin_id, payload.capabilities, current.username,
+            payload.generation, payload.permission_epoch,
+        )
+    except Exception as exc:
+        _raise_runtime_error(exc)
+    raise AssertionError("unreachable")
+
+
+@router.put("/plugins/{plugin_id}/feature-categories", response_model=PluginView)
+def update_feature_categories(
+    plugin_id: str,
+    payload: PluginFeatureCategoriesRequest,
+    current: AuthSession = Depends(require_csrf),
+    service: PluginRuntimeService = Depends(get_service),
+) -> PluginView:
+    try:
+        return service.update_feature_categories(
+            plugin_id, payload.categories, payload.generation,
+            payload.permission_epoch, current.username,
+            assistant_permissions=payload.assistant_permissions,
+        )
     except Exception as exc:
         _raise_runtime_error(exc)
     raise AssertionError("unreachable")

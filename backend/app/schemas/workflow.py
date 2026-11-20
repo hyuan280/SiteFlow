@@ -54,6 +54,10 @@ class FeatureView(BaseModel):
     customized: bool = False
     execution_settings: FeatureExecutionSettings | ResultExecutionSettings | None = None
     source: str = "builtin"
+    assistant_allowed: bool = False
+    assistant_policy_revision: int = Field(default=0, ge=0)
+    risk_index: int = Field(default=1, ge=1, le=5)
+    risk_label: str = ""
 
 
 class GroupInput(BaseModel):
@@ -353,6 +357,9 @@ class SiteSettingsPatch(BaseModel):
     ] | None = Field(default=None, max_length=20)
     enabled: bool | None = None
     lane_policy: LanePolicy | None = None
+    credential_provider_id: str | None = Field(
+        default=None, max_length=80,
+        pattern=r"^(builtin\.(manual|bitwarden)|plugin\.[a-z][a-z0-9-]{0,62})$")
     support_resign: bool | None = None
     resign_max_days: int | None = Field(default=None, ge=1, le=365)
     checkin_after: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")

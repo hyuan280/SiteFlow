@@ -69,6 +69,12 @@ class SecretProviders:
             run = session.get(Run, job.run_id) if job else None
             if not job or not run or run.cancel_requested or job.attempt != grant[1] or job.status not in {"queued", "running"}:
                 raise SecretDenied()
+            if run.trigger == "assistant":
+                from app.services.assistant_run_guard import validate_guard
+
+                site = session.get(Site, job.site_id)
+                if site is None or not validate_guard(session, run.id, site, self.settings, self.crypto):
+                    raise SecretDenied()
             try:
                 runtime = PluginRuntimeService(session, self.settings).runtime_for_plugin(plugin_id)
             except Exception:
@@ -179,6 +185,7 @@ class SecretProviders:
             site = session.get(Site, site_id)
             if not job or not run or not site or run.cancel_requested or job.site_id != site_id or job.attempt != grant[2] or job.status not in {"queued", "running"}:
                 raise SecretDenied()
+            self._assistant_guard(session, run, site)
             if provider.startswith("plugin."):
                 try:
                     runtime = PluginRuntimeService(session, self.settings).runtime_for_plugin(provider[7:])
@@ -258,6 +265,8 @@ class SecretProviders:
             run = session.get(Run, job.run_id) if job else None
             if not job or not run or run.cancel_requested or job.status not in {"queued", "running"} or job.attempt != grant[2]:
                 raise SecretDenied()
+            site = session.get(Site, site_id)
+            self._assistant_guard(session, run, site)
             if provider.startswith("plugin."):
                 try:
                     runtime = PluginRuntimeService(session, self.settings).runtime_for_plugin(provider[7:])
@@ -275,9 +284,20 @@ class SecretProviders:
         with self.session_factory() as session:
             return BitwardenService(session, self.settings, self.crypto).resolve_for_site(SimpleNamespace(**options))
 
-    def _remote(self, provider, purpose, job_id, site_id, step_key, origin, options):
+    def _assistant_guard(self, session, run, site):
+        if run.trigger == "assistant":
+            from app.services.assistant_run_guard import validate_guard
+
+            if site is None or not validate_guard(session, run.id, site, self.settings, self.crypto):
+                raise SecretDenied()
+
+    def _remote(self, provider, purpose, job_id, site_id, step_key, origin, options, *, authorize=None):
         if not provider.startswith("plugin."):
             raise SecretDenied()
+        if authorize is not None:
+            if job_id != 0:
+                raise SecretDenied()
+            authorize()
         plugin_id = provider[len("plugin."):]
         capability = "secret.credentials" if purpose in CREDENTIAL_PURPOSES else "secret.totp"
         with self.session_factory() as session:
@@ -300,13 +320,19 @@ class SecretProviders:
                              timeout=20, metadata=(("x-plugin-token", runtime["token"]),))
                 try:
                     while True:
-                        with self.lock:
-                            granted = job_id in self.jobs
                         session.expire_all()
-                        job = session.get(SiteJob, job_id)
-                        run = session.get(Run, job.run_id) if job else None
+                        if authorize is not None:
+                            authorize()
+                        else:
+                            with self.lock:
+                                granted = job_id in self.jobs
+                            job = session.get(SiteJob, job_id)
+                            run = session.get(Run, job.run_id) if job else None
+                            if not granted or not job or not run or run.cancel_requested or job.status not in {"queued", "running"}:
+                                raise SecretDenied()
+                            self._assistant_guard(session, run, session.get(Site, site_id))
                         current = PluginRuntimeService(session, self.settings).runtime_for_plugin(plugin_id)
-                        if not granted or not job or not run or run.cancel_requested or job.status not in {"queued", "running"} or (current["generation"], current["permission_epoch"]) != (generation, epoch):
+                        if (current["generation"], current["permission_epoch"]) != (generation, epoch):
                             raise SecretDenied()
                         try:
                             value = call.result(timeout=0.1)
@@ -317,6 +343,17 @@ class SecretProviders:
                     call.cancel()
             # Recheck approval after the remote call before releasing a secret.
             session.expire_all()
+            if authorize is not None:
+                authorize()
+            else:
+                with self.lock:
+                    if job_id not in self.jobs:
+                        raise SecretDenied()
+                job = session.get(SiteJob, job_id)
+                run = session.get(Run, job.run_id) if job else None
+                if not job or not run or run.cancel_requested or job.status not in {"queued", "running"}:
+                    raise SecretDenied()
+                self._assistant_guard(session, run, session.get(Site, site_id))
             PluginRuntimeService(session, self.settings).runtime_for_plugin(plugin_id)
             if row.generation != generation or row.permission_epoch != epoch or capability not in json.loads(row.approved_capabilities_json):
                 raise SecretDenied()
@@ -324,6 +361,6 @@ class SecretProviders:
                 if not value.username or not value.password or max(len(value.username), len(value.password)) > 4096:
                     raise SecretDenied()
                 return {"username": value.username, "password": value.password}
-            if not value.code.isdigit() or not 4 <= len(value.code) <= 10:
+            if not value.code.isascii() or not value.code.isdigit() or not 4 <= len(value.code) <= 10:
                 raise SecretDenied()
             return {"code": value.code}

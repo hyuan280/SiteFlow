@@ -75,7 +75,7 @@ def records(assistant_client):
     ({"execution_consent": True, "execution_features": ["plugin.private"]},
      "invalid_execution_features"),
     ({"execution_consent": True, "execution_features": ["post.buy_card"]},
-     "invalid_execution_features"),
+     "sign_consent_required"),
     ({"execution_consent": True, "execution_features": ["auth.form_login"]},
      "credential_consent_required"),
     ({"execution_consent": True, "credential_consent": True,
@@ -194,8 +194,8 @@ def test_overall_target_grant_freezes_reviewed_features_and_private_binding(
         "run_lane_policy": "auto", "workflow_site_id": None, "workflow_consent": False,
     }
     assert {"action.click", "action.fill", "sign.button", "challenge.slider", "flow.result"} <= set(features)
-    assert not any(key.startswith(("post.", "plugin.")) or key == "flow.jump"
-                   for key in features)
+    assert "flow.jump" in features and "post.resign_loop" in features
+    assert not any(key.startswith("plugin.") for key in features)
     private, history = manager._history("admin", identifier)
     assert private == ({**public, "_credential_binding": records["binding"]} if bound else public)
     with manager.session_factory() as db:

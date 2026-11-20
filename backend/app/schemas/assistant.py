@@ -85,7 +85,7 @@ class RenameSession(AssistantInput):
 class SetTarget(AssistantInput):
     name: str = Field(min_length=1, max_length=128)
     base_url: str = Field(min_length=1, max_length=512)
-    credential_mode: Literal["manual", "bitwarden", "cookie", "none"]
+    credential_mode: Literal["manual", "bitwarden", "site", "cookie", "none"]
     authorized: Literal[True] | None = None
     confirmed: Literal[True] = True
     proxy: bool
@@ -98,7 +98,7 @@ class SetTarget(AssistantInput):
     execution_consent: bool = False
     credential_consent: bool = False
     allow_sign: bool = False
-    execution_features: list[str] = Field(default_factory=list, max_length=18)
+    execution_features: list[str] = Field(default_factory=list, max_length=1024)
     trusted_origins: list[str] = Field(default_factory=list, max_length=20)
 
     @field_validator("trusted_origins")
@@ -170,7 +170,7 @@ class InteractionResponse(AssistantInput):
 class InteractionTarget(AssistantInput):
     name: str = Field(min_length=1, max_length=128)
     base_url: str = Field(min_length=1, max_length=512)
-    credential_mode: Literal["manual", "bitwarden", "cookie", "none"] = "none"
+    credential_mode: Literal["manual", "bitwarden", "site", "cookie", "none"] = "none"
     site_id: int | None = Field(default=None, ge=1)
     workflow_site_id: int | None = Field(default=None, ge=1)
 

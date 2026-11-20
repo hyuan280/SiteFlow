@@ -70,6 +70,7 @@ SIDE_EFFECTS = [
     "sign.iframe_form", "sign.unit3d_claim", "action.click", "action.fill",
     "post.buy_card", "post.resign", "post.resign_loop", "post.resign_dialog", "challenge.2fa",
     "challenge.altcha", "challenge.slider", "challenge.image_captcha", "challenge.grid_captcha",
+    "plugin.demo.test",
 ]
 
 
@@ -117,11 +118,11 @@ def test_normal_jobs_keep_existing_exception_status(monkeypatch, job, assistant,
     run_step.assert_awaited_once()
 
 
-@pytest.mark.parametrize("feature", ["flow.open", "action.navigate", "action.wait", "flow.result", "plugin.demo.test"])
+@pytest.mark.parametrize("feature", ["flow.open", "action.navigate", "action.wait", "flow.result"])
 @pytest.mark.parametrize("error,reason", [
     (RuntimeError(PRIVATE), "execution_error"), (TimeoutError(PRIVATE), "execution_timeout"),
 ])
-def test_read_only_and_excluded_features_fail_not_unknown(monkeypatch, job, feature, error, reason):
+def test_read_only_features_fail_not_unknown(monkeypatch, job, feature, error, reason):
     monkeypatch.setattr(executor, "_run_step", AsyncMock(side_effect=error))
     result = job.run(feature)
     assert result["status"] == result["steps"][0]["status"] == "fail"

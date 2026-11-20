@@ -184,7 +184,8 @@ class AssistantManager:
         from app.services.assistant_retry import (
             can_reauthorize, uncertain_operations, fingerprint, credential_binding,
         )
-        from app.services.assistant_execution import AssistantExecution, SUPPORTED_FEATURES, _origin
+        from app.services.assistant_execution import AssistantExecution, _origin
+        from app.services.assistant_categories import execution_features, execution_category
 
         target = data.get("target") or {}
         decode = decode if decode is not None else self._decrypt
@@ -224,21 +225,24 @@ class AssistantManager:
                 and not self._stopping and self.settings.config_ai_enabled
                 and target.get("confirmed") is True and target.get("execution_consent") is True
                 and scope.lane_key == ("proxy_interaction" if target.get("proxy") else "interaction")
-                and step.get("feature_type") in SUPPORTED_FEATURES
+                and step.get("feature_type") in execution_features(db)
                 and step.get("feature_type") in target.get("execution_features", []))
             if can_authorize:
                 try:
                     can_authorize = record.get("origin") == list(_origin(target["base_url"]))
                     feature = step["feature_type"]
-                    if ((feature.startswith("auth.") or feature == "challenge.2fa")
+                    category = execution_category(db, feature)
+                    if ((category == "auth" or feature == "challenge.2fa")
                             and target.get("credential_consent") is not True):
                         can_authorize = False
-                    if (feature.startswith(("sign.", "challenge.")) or feature in {
+                    if (category in {"sign", "challenge", "post"} or feature in {
                         "action.click", "action.fill",
                     }) and target.get("allow_sign") is not True:
                         can_authorize = False
                     helper = AssistantExecution(self, row.owner, row.id, target)
                     if helper._normalize(step) != step:
+                        can_authorize = False
+                    if record.get("feature_bindings") is not None and record["feature_bindings"] != helper._bindings:
                         can_authorize = False
                     helper._bound_site(db)
                 except Exception:
@@ -423,19 +427,22 @@ class AssistantManager:
             self._reserve_idle(db, owner, session_id)
             row = self._owned(db, owner, session_id)
             data = self._decrypt(row)
-            from app.services.assistant_execution import SUPPORTED_FEATURES, _origin
+            from app.services.assistant_execution import _origin
+            from app.services.assistant_categories import execution_features, execution_category
+
+            supported = execution_features(db)
 
             if payload.authorized is True:
                 credentials_available = payload.credential_mode == "bitwarden" or (
-                    payload.credential_mode == "manual" and payload.site_id is not None
+                    payload.credential_mode in {"manual", "site"} and payload.site_id is not None
                 )
                 # Freeze today's reviewed features; future additions require a new grant.
                 payload = payload.model_copy(update={
                     "confirmed": True, "execution_consent": True, "allow_sign": True,
                     "credential_consent": credentials_available,
                     "execution_features": sorted(
-                        key for key in SUPPORTED_FEATURES
-                        if credentials_available or not (key.startswith("auth.") or key == "challenge.2fa")
+                        key for key in supported
+                        if credentials_available or not (execution_category(db, key) == "auth" or key == "challenge.2fa")
                     ),
                 })
             excluded = {"browser_consent"}
@@ -447,7 +454,7 @@ class AssistantManager:
                           workflow_site_id=payload.workflow_site_id,
                           run_lane_policy=payload.run_lane_policy)
             if (len(set(payload.execution_features)) != len(payload.execution_features)
-                    or any(key not in SUPPORTED_FEATURES for key in payload.execution_features)):
+                    or any(key not in supported for key in payload.execution_features)):
                 raise AssistantError("invalid_execution_features", 422)
             if payload.execution_consent and not payload.execution_features:
                 raise AssistantError("execution_features_required", 422)
@@ -455,16 +462,18 @@ class AssistantManager:
                 raise AssistantError("execution_consent_required", 422)
             if payload.execution_features and not payload.execution_consent:
                 raise AssistantError("execution_consent_required", 422)
-            if any(key.startswith("auth.") or key == "challenge.2fa" for key in payload.execution_features):
+            if any(execution_category(db, key) == "auth" or key == "challenge.2fa" for key in payload.execution_features):
                 if not payload.credential_consent:
                     raise AssistantError("credential_consent_required", 422)
-                if payload.credential_mode not in {"manual", "bitwarden"}:
+                if payload.credential_mode not in {"manual", "bitwarden", "site"}:
                     raise AssistantError("credentials_unavailable", 422)
-                if payload.credential_mode == "manual" and payload.site_id is None:
+                if payload.credential_mode in {"manual", "site"} and payload.site_id is None:
                     raise AssistantError("credential_site_required", 422)
-            if any(key.startswith(("sign.", "challenge.")) or key in {"action.click", "action.fill"}
+            if any(execution_category(db, key) in {"sign", "challenge", "post"} or key in {"action.click", "action.fill"}
                    for key in payload.execution_features) and not payload.allow_sign:
                 raise AssistantError("sign_consent_required", 422)
+            if payload.credential_mode == "site" and payload.site_id is None:
+                raise AssistantError("credential_site_required", 422)
             if payload.site_id is not None:
                 site = db.get(Site, payload.site_id)
                 if site is None or _origin(site.base_url) != _origin(payload.base_url):

@@ -251,7 +251,7 @@ def private_context(payload):
     return context
 
 
-async def run_private_step(context, step, vision, cfbox, lane_key):
+async def run_private_step(context, step, vision, cfbox, lane_key, plugin_runtimes=None):
     from worker import executor
 
     feature, config = step['feature_type'], step['config']
@@ -298,7 +298,8 @@ async def run_private_step(context, step, vision, cfbox, lane_key):
         target = await context.target(scope, config['input_selector'], 'code')
         submit = (await context.target(scope, config['submit_selector'], 'submit')
                   if config.get('submit_selector') else None)
-        status, text, _, _ = await executor._read_captcha(scope, image, config, note, vision, private=context)
+        status, text, _, _ = await executor._read_captcha(scope, image, config, note, vision,
+            plugin_runtimes=plugin_runtimes, private=context)
         context.register_secret(text)
         if status != 'ok':
             return 'fail', '', {}

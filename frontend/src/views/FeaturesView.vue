@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
+import { ElMessage } from "element-plus";
 import { useRouter } from "vue-router";
 
 import { ApiError, apiRequest } from "@/api/client";
@@ -15,9 +16,38 @@ const features = ref<Feature[]>([]);
 const loading = ref(true);
 const error = ref("");
 const activeCategory = ref("all");
+const policyBusy = reactive<Record<string, boolean>>({});
 
 function updateFeature(feature: Feature): void {
-  features.value = features.value.map(item => item.key === feature.key ? feature : item);
+  features.value = features.value.map(item => {
+    if (item.key !== feature.key) return item;
+    return item.assistant_policy_revision > feature.assistant_policy_revision
+      ? { ...feature, assistant_allowed: item.assistant_allowed, assistant_policy_revision: item.assistant_policy_revision }
+      : feature;
+  });
+}
+
+async function saveAssistantPolicy(feature: Feature, allowed: boolean): Promise<void> {
+  if (policyBusy[feature.key] || feature.source !== "builtin") return;
+  policyBusy[feature.key] = true;
+  try {
+    const updated = await apiRequest<Feature>(`/features/${encodeURIComponent(feature.key)}/assistant-policy`, {
+      method: "PUT", body: JSON.stringify({ assistant_allowed: allowed }),
+    });
+    const current = features.value.find(item => item.key === feature.key);
+    if (current && updated.assistant_policy_revision >= current.assistant_policy_revision) {
+      // Keep settings drafts intact when only the authorization changes.
+      current.assistant_allowed = updated.assistant_allowed;
+      current.assistant_policy_revision = updated.assistant_policy_revision;
+      current.risk_index = updated.risk_index;
+      current.risk_label = updated.risk_label;
+    }
+    ElMessage.success("助手授权已保存");
+  } catch (cause) {
+    ElMessage.error(cause instanceof Error ? cause.message : "保存助手授权失败");
+  } finally {
+    delete policyBusy[feature.key];
+  }
 }
 
 const categories = computed(() => {
@@ -80,6 +110,7 @@ onMounted(load);
   <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="notice" />
   <el-alert title="这里编辑的是全局默认设置，不是单个步骤配置。已有步骤中显式填写的值（包括创建时写入的默认值）不受影响；仅缺省字段使用当前全局默认值。必填策略变更可能影响后续验证。" type="warning" :closable="false" show-icon class="notice" />
   <el-alert title="验证码识别方式可在步骤中覆盖，功能管理只设置默认值；视觉模型提示词属于执行行为，仅在功能管理修改，步骤编辑器不提供覆盖。" type="info" :closable="false" show-icon class="notice" />
+  <el-alert title="允许助手使用是持续授权：助手可发现、使用及单步执行已授权功能，包括验证码处理与发布（post）。高风险操作可能提交数据、发布内容或产生其他外部副作用；取消勾选可撤回授权。插件功能与验证码方法在插件管理中统一授权。" type="warning" :closable="false" show-icon class="notice" />
 
   <div class="category-filter">
     <el-button
@@ -114,6 +145,29 @@ onMounted(load);
       </div>
 
       <p class="muted description">{{ feature.description }}</p>
+      <div class="assistant-policy">
+        <span>{{ categoryLabel(feature.category) }}</span>
+        <el-tag :type="feature.risk_index >= 4 ? 'danger' : feature.risk_index >= 3 ? 'warning' : 'info'">
+          {{ feature.risk_index }}/5 · {{ feature.risk_label }}
+        </el-tag>
+        <el-checkbox
+          :model-value="feature.assistant_allowed"
+          :indeterminate="feature.category === 'post' && feature.assistant_allowed && feature.assistant_policy_revision === 0"
+          :aria-label="`${feature.name} 允许助手使用`"
+          :disabled="!auth.isAuthenticated || feature.source !== 'builtin' || policyBusy[feature.key]"
+          @update:model-value="saveAssistantPolicy(feature, Boolean($event))"
+        >允许助手使用</el-checkbox>
+        <el-button
+          v-if="feature.source === 'builtin' && feature.category === 'post' && feature.assistant_allowed && feature.assistant_policy_revision === 0"
+          size="small"
+          :loading="policyBusy[feature.key]"
+          :disabled="!auth.isAuthenticated"
+          @click="saveAssistantPolicy(feature, true)"
+        >确认持续授权</el-button>
+        <router-link v-if="feature.source !== 'builtin'" to="/plugins">在插件管理修改</router-link>
+      </div>
+      <p v-if="feature.category === 'post' && feature.assistant_allowed && feature.assistant_policy_revision === 0" class="risk-warning">当前沿用单次审批；确认持续授权后才允许直接单步使用，无需逐次审批。</p>
+      <p v-if="feature.risk_index >= 3" class="risk-warning">可能产生外部副作用，请谨慎授权助手使用。</p>
       <p v-if="feature.requires.length" class="requirements">
         依赖条件：
         <el-tag v-for="item in feature.requires" :key="item" size="small" type="warning" effect="plain">
@@ -246,6 +300,19 @@ onMounted(load);
   margin: 10px 0;
   font-size: 13px;
   line-height: 1.6;
+}
+
+.assistant-policy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.risk-warning {
+  color: #9a6b00;
+  font-size: 12px;
 }
 
 .requirements {

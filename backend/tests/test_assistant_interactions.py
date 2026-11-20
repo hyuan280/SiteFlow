@@ -322,7 +322,7 @@ def test_input_secret_and_selection_validation(assistant_client, provider):
     ({"purpose": "question", "kind": "input", "title": "验证码", "fields": [{"id": "value", "label": "Value"}]}, "secret_input"),
     ({"purpose": "target", "target": {**TARGET["target"], "proxy": True}}, "invalid_arguments"),
     *[({"purpose": "authorization", "capability": "execution", "feature_type": feature},
-       "execution_feature_denied") for feature in ("flow.jump", "post.buy_card", "plugin.example")],
+       "execution_feature_denied") for feature in ("plugin.example",)],
 ])
 def test_model_cannot_request_secrets_or_arbitrary_patches(execution, interaction_request, code):
     async def scenario():

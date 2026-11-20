@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, update
 
 from app.models.assistant import AssistantMessage, AssistantSession
-from app.services.assistant_categories import Denied, auth_budget_context, builtin_category
+from app.services.assistant_categories import Denied, auth_budget_context, execution_category
 from app.services.assistant_tools import failure
 from app.services.config_ai_generation import _strict_json
 
@@ -361,7 +361,7 @@ async def run_with_retry_approval(manager, owner, sid, operation_id, *, turn, in
             preapproved = bool(grant and not grant.get("invocation")
                                and valid_grant(data, scope, operation, grant["id"]))
             record = eligible_record(manager, db, owner, sid, data, operation)
-            automatic = builtin_category(record["step"]["feature_type"]) != "post"
+            automatic = execution_category(db, record["step"]["feature_type"]) != "post"
             if automatic:
                 turn_id, _ = auth_budget_context(
                     manager, db, sid, data, turn=turn, auth_limit=auth_limit)

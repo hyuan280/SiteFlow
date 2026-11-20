@@ -924,7 +924,7 @@ def test_disabled_compaction_live_overflow_fails_without_replaying_tools(
     assistant_client, provider, context_settings, monkeypatch,
 ):
     client = assistant_client
-    context_settings(auto_compact=False, context_max_tokens=24000)
+    context_settings(auto_compact=False, context_max_tokens=28000)
     identifier = create(client)
     dispatched = []
 

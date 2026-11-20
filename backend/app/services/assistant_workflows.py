@@ -132,7 +132,7 @@ def workflow_candidate(service, target, draft):
         local = service._local_snapshot(site)
         from app.services.config_ai_catalog import ConfigAICatalog
 
-        catalog = ConfigAICatalog(service.session)
+        catalog = ConfigAICatalog(service.session, include_plugins=True)
         for step in local["steps"]:
             # A model cannot reconstruct hidden local values. Require the manual
             # editor rather than silently dropping any of these server originals.
@@ -229,7 +229,7 @@ class AssistantWorkflows:
             site.id, site.history_key, site.config_revision)
 
     def import_draft(self, proposal_message_id):
-        from app.services.assistant_tools import ALLOWED_FEATURES
+        from app.services.assistant_tools import allowed_features
         from app.services.config_ai_tools import ConfigAITools
         from app.schemas.config_ai import GenerationSite
 
@@ -279,7 +279,8 @@ class AssistantWorkflows:
 
             validation = ConfigAITools(_AssistantWorkflowService(
                 db, self.manager.settings, self.manager.crypto, target=target),
-                GenerationSite(name=target["name"], base_url=target["base_url"]), ALLOWED_FEATURES)
+                GenerationSite(name=target["name"], base_url=target["base_url"]),
+                allowed_features(db), include_plugins=True)
             validation._consulted = {step.feature_type for step in proposal.draft.steps}
             checked = validation.dispatch("validate_workflow_draft", {
                 "draft": proposal.draft.model_dump(mode="json")})
@@ -332,7 +333,7 @@ class AssistantWorkflows:
     async def run_site(self, *, consumption_permit=None):
         from app.services.execution import ExecutionService
         from app.services.secret_providers import credential_provider
-        from app.services.assistant_tools import ALLOWED_FEATURES
+        from app.services.assistant_tools import allowed_features
         from app.services.assistant_run_guard import create_guard, unresolved_assistant_runs
 
         if self.manager.executor is None:
@@ -384,29 +385,36 @@ class AssistantWorkflows:
             service = self._service(db)
             resolved = service.resolve_site(site.id)
             validate_workflow_urls(resolved, target)
-            from app.features.catalog import FEATURES
             from app.services.assistant_consumption import consume_permit
 
-            if any(step.feature_type not in FEATURES for step in resolved.steps):
-                raise WorkflowDenied("workflow_feature_denied")
             consumption_plan = consume_permit(db, self, site, consumption_permit)
-            if any(step.feature_type not in ALLOWED_FEATURES for step in resolved.steps):
+            if any(step.feature_type not in allowed_features(db) for step in resolved.steps):
                 raise WorkflowDenied("workflow_feature_denied")
-            if any(isinstance(value, str) and value.startswith("plugin.")
-                   for step in resolved.steps for key, value in step.config.items()
-                   if key in {"captcha_method", "credential_provider_id", "totp_provider_id"}):
-                raise WorkflowDenied("workflow_feature_denied")
+            from app.services.assistant_execution import AssistantExecution
+            from app.services.assistant_categories import Denied
+
+            helper = AssistantExecution(self.manager, self.owner, self.session_id, target)
+            try:
+                for step in resolved.steps:
+                    if step.enabled:
+                        helper._step_bindings(db, {"feature_type": step.feature_type, "config": step.config}, site=site)
+            except Denied:
+                raise WorkflowDenied("workflow_feature_denied") from None
             if service._site_lane(site) != ("general" if saved_lane(target) == "auto" else saved_lane(target)):
                 raise WorkflowDenied("workflow_lane_mismatch")
             mode = target.get("credential_mode")
-            expected = "builtin.bitwarden" if mode == "bitwarden" else "builtin.manual"
+            if mode == "site":
+                source = helper._bound_site(db)
+                if source is None or source.id != site.id:
+                    raise WorkflowDenied("credential_site_mismatch")
+            expected = credential_provider(site) if mode == "site" else ("builtin.bitwarden" if mode == "bitwarden" else "builtin.manual")
             if credential_provider(site) != expected:
                 raise WorkflowDenied("workflow_credential_policy_mismatch")
             from app.services.assistant_categories import (
-                Denied, auth_budget_context, builtin_category, require_auth_capacity,
+                Denied, auth_budget_context, execution_category, require_auth_capacity,
             )
 
-            auth = any(step.enabled and builtin_category(step.feature_type) == "auth" for step in resolved.steps)
+            auth = any(step.enabled and execution_category(db, step.feature_type) == "auth" for step in resolved.steps)
             auth_budget = None
             if auth:
                 try:
@@ -566,11 +574,11 @@ class AssistantWorkflows:
                               next_cursor=cursor + limit if cursor + limit < len(items) else None)
             return output
 
-    @staticmethod
-    def _allowed():
-        from app.services.assistant_tools import ALLOWED_FEATURES
+    def _allowed(self):
+        from app.services.assistant_tools import allowed_features
 
-        return ALLOWED_FEATURES
+        with self.manager.session_factory() as db:
+            return allowed_features(db)
 
     async def dispatch(self, name, arguments):
         try:

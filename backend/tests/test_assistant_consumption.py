@@ -289,11 +289,12 @@ def test_guard_requires_plan_when_current_registry_reclassifies_builtin_as_post(
                                       check_consumption=check)
 
 
-def test_nonbuiltin_feature_cannot_enter_consumption_plan():
+def test_nonbuiltin_feature_cannot_enter_consumption_plan(context):
     service = SimpleNamespace(resolve_site=lambda _: SimpleNamespace(steps=[SimpleNamespace(
         enabled=True, feature_type="plugin.custom.consume", category="post")]))
     with pytest.raises(WorkflowDenied, match="workflow_feature_denied"):
-        build_plan(None, service, SimpleNamespace(id=1))
+        with context[0].session_factory() as db:
+            build_plan(db, service, SimpleNamespace(id=1))
 
 
 @pytest.mark.parametrize("second_decision", ["approve", "deny", "timeout"])

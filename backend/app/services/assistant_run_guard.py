@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.crypto import CryptoError, CryptoService
-from app.features.catalog import FEATURES
+from app.services.assistant_categories import Denied, execution_category, plugin_execution_binding
 from app.models.assistant import AssistantSession
 from app.models.assistant_run import AssistantRunGuard
 from app.models.assistant_workflow import AssistantWorkflowAction
@@ -18,9 +18,19 @@ from app.models.workflow import Site
 from app.services.workflows import WorkflowService, WorkflowValidationError
 
 
-def _fingerprint(service: WorkflowService, site: Site) -> tuple[str, str]:
+def _fingerprint(service: WorkflowService, site: Site, *, assistant_policy=False) -> tuple[str, str]:
     # The workflow snapshot includes local config and feature policy, never stored credentials.
     snapshot = service._snapshot(site)
+    from app.services.assistant_execution import AssistantExecution
+
+    bindings = {}
+    for step in (service.resolve_site(site.id).steps if assistant_policy else []):
+        if not step.enabled:
+            continue
+        bindings[step.step_key] = AssistantExecution._step_bindings(None, service.session, {
+            "feature_type": step.feature_type, "config": step.config}, site=site)
+    if bindings:
+        snapshot["assistant_plugin_bindings"] = bindings
     canonical = json.dumps(
         snapshot, allow_nan=False, sort_keys=True, ensure_ascii=True, separators=(",", ":")
     )
@@ -34,7 +44,7 @@ def create_guard(
     # Do not reuse resolution/policy caches from earlier assistant tool calls.
     current = WorkflowService(session, service.settings, service.crypto)
     site = current._get_site(site_id)
-    fingerprint, lane = _fingerprint(current, site)
+    fingerprint, lane = _fingerprint(current, site, assistant_policy=True)
     jobs = list(session.scalars(select(SiteJob).where(
         SiteJob.run_id == run_id, SiteJob.site_id == site_id,
     )))
@@ -63,7 +73,8 @@ def validate_guard(
     ):
         return False
     try:
-        fingerprint, lane = _fingerprint(WorkflowService(session, settings, crypto), site)
+        fingerprint, lane = _fingerprint(WorkflowService(session, settings, crypto), site,
+                                         assistant_policy=True)
         jobs = list(session.scalars(select(SiteJob).where(
             SiteJob.run_id == run_id, SiteJob.site_id == site.id,
         )))
@@ -71,11 +82,11 @@ def validate_guard(
         from app.services.assistant_consumption import build_plan
 
         service = WorkflowService(session, settings, crypto)
-        consuming = any(step.enabled and FEATURES[step.feature_type].category == "post"
+        consuming = any(step.enabled and execution_category(session, step.feature_type) == "post"
                         for step in service.resolve_site(site.id).steps)
         plan = consumption_plan(session, run_id, crypto) if consuming else None
         current_plan = build_plan(session, service, site) if check_consumption else plan
-        if consuming and plan is None:
+        if current_plan is not None and plan is None:
             return False
         if current_plan != plan or (plan is not None and any(job.attempt != 1 for job in jobs)):
             return False
@@ -83,7 +94,7 @@ def validate_guard(
             job.lane == lane or (job.attempt > 1 and job.lane == fallback)
             for job in jobs
         ) and guard.fingerprint == fingerprint
-    except (CryptoError, ValueError, TypeError, KeyError):
+    except (Denied, CryptoError, ValueError, TypeError, KeyError):
         return False
 
 

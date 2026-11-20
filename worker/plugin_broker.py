@@ -74,6 +74,7 @@ class BrokerSession:
     artifacts: Any = None
     authorize: Any = None
     lifecycle: Any = None
+    assistant_context: Any = field(default=None, repr=False)
     actions: set = field(default_factory=set, repr=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
@@ -100,6 +101,7 @@ class PluginBroker:
         approved_capabilities: list[str] | None = None,
         authorize: Any = None,
         lifecycle: Any = None,
+        assistant_context: Any = None,
     ) -> str:
         if not approved_capabilities or "browser_actions" not in approved_capabilities or authorize is None:
             raise BrokerDenied("browser_actions approval and authorization are required")
@@ -117,6 +119,7 @@ class PluginBroker:
             artifacts=artifacts,
             authorize=authorize,
             lifecycle=lifecycle,
+            assistant_context=assistant_context,
         )
         return token
 
@@ -167,6 +170,9 @@ class PluginBroker:
             result = await action
             if self._sessions.get(token) is not session or session.expired():
                 raise BrokerDenied("broker grant revoked")
+            if session.assistant_context is not None:
+                from worker.assistant_browser import _redact_known
+                result = _redact_known(result, session.assistant_context.known)
             return result
         finally:
             action.cancel()
@@ -197,6 +203,10 @@ class PluginBroker:
                 raise BrokerDenied("broker grant revoked") from None
             if session.expired():
                 raise BrokerExpired("broker token is expired")
+            if session.assistant_context is not None:
+                await session.assistant_context.validate_origin()
+                if op == "screenshot":
+                    raise BrokerDenied("assistant screenshot consent required")
             if op != "goto" and _origin(session.page.url) != session.site_origin:
                 raise BrokerDenied("browser action left the current site origin")
             if session.log:
@@ -256,6 +266,11 @@ class PluginBroker:
     async def _click(
         self, session: BrokerSession, payload: dict[str, Any], timeout_ms: int
     ) -> dict[str, Any]:
+        if session.assistant_context is not None:
+            context = session.assistant_context
+            target = await context.target(session.page, _selectors(payload), "click")
+            await context.mutate(target)
+            return {"ok": True, "url": session.page.url, "switched_page": False}
         locator = await self._locator(
             session, _selectors(payload), timeout_ms=timeout_ms, state="visible"
         )
@@ -290,6 +305,15 @@ class PluginBroker:
     async def _fill(
         self, session: BrokerSession, payload: dict[str, Any], timeout_ms: int
     ) -> dict[str, Any]:
+        if session.assistant_context is not None:
+            from worker.assistant_private import run_private_step
+            value = payload.get("value", "")
+            if not isinstance(value, str) or len(value) > 4096:
+                raise BrokerDenied("assistant fill denied")
+            await run_private_step(session.assistant_context,
+                {"feature_type": "action.fill", "config": {"selector": _selectors(payload),
+                    "value": value, "clear": payload.get("clear", True)}}, None, None, "interaction")
+            return {"ok": True}
         locator = await self._locator(
             session, _selectors(payload), timeout_ms=timeout_ms, state="visible"
         )

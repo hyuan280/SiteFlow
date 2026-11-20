@@ -1549,7 +1549,7 @@ class AssistantBrowser:
         elif permit is not None:
             raise HTTPException(422, "Invalid browser retry authorization")
         # Unknown history is evidence, not a blanket veto on fresh approved steps.
-        # validate_step admits only trusted non-post builtin categories.
+        # The authenticated host owns dynamic category and schema metadata.
         if len(session.operations) >= MAX_OPERATIONS:
             raise HTTPException(409, "Browser operation limit reached")
         # Acquire before publishing the task; no lane or page is reacquired.
@@ -1565,7 +1565,11 @@ class AssistantBrowser:
         return await asyncio.shield(task)
 
     async def _execute_locked(self, session, operation_id, step, request):
-        from worker.assistant_step import fingerprints, validate_secret_targets
+        from worker.assistant_step import (
+            FEATURES, FEATURE_CATEGORIES, POST_FEATURES, bounded_json, fingerprints,
+            validate_plugin_runtimes, validate_secret_targets,
+        )
+        from worker.assistant_runtime import AssistantPluginBroker, JobRuntime
         from worker.assistant_private import PrivateContext
         from worker.vision import _result_request_active
         from worker.executor import _run_step
@@ -1587,6 +1591,18 @@ class AssistantBrowser:
         operation_failure = None
         evidence_deadline = None
         secret_payload = {"base_url": session.origin, "trusted_urls": []}
+        feature = step["feature_type"]
+        category = (FEATURE_CATEGORIES.get(feature) if feature in FEATURES else
+                    "post" if feature in POST_FEATURES else request.categories[feature])
+        dynamic_side_effects = category == "post" or feature.startswith("plugin.")
+        plugins = {}
+        broker = None
+
+        async def resign_progress(data):
+            nonlocal result
+            bounded_json(data)
+            result = _redact_known(data, session.known_fingerprints)
+
         deadline = min(session.deadline, time.monotonic() + min(
             EXECUTE_TIMEOUT, step.get("timeout_seconds") or EXECUTE_TIMEOUT,
         ))
@@ -1604,12 +1620,21 @@ class AssistantBrowser:
                     session.secret_fingerprints.update(fingerprints(
                         value for value in values if isinstance(value, str)))
 
+                plugins = validate_plugin_runtimes(request)
+                for plugin in plugins.values():
+                    values = (plugin["endpoint"], plugin["token"], plugin["authorization"]["token"])
+                    register_secret(*values)
+                    session.provider_fingerprints.update(fingerprints(values))
+                if request.job_runtime is not None:
+                    job = JobRuntime.model_validate(request.job_runtime).model_dump()
+                    register_secret(job["secret_access"]["token"])
+                    secret_payload.update(job)
                 for provider in (runtime.get("vision", {}), runtime.get("cfbox", {})):
                     register_secret(*(provider.get(key, "") for key in ("api_key", "base_url", "url", "model")))
                     session.provider_fingerprints.update(fingerprints(
                         provider.get(key, "") for key in ("api_key", "base_url", "url")))
                 register_secret(runtime.get("totp_code", ""))
-                if step["feature_type"] in {
+                if feature.startswith("plugin.") or step["feature_type"] in {
                     "action.fill", "challenge.2fa", "challenge.turnstile", "challenge.image_captcha",
                     "sign.iframe.image_captcha", "challenge.grid_captcha", "sign.image_quiz",
                 }:
@@ -1621,6 +1646,9 @@ class AssistantBrowser:
                         provider_fingerprints=frozenset(session.provider_fingerprints),
                         approved_origins=frozenset(session.approved_origins))
                     secret_payload["_assistant_private_context"] = private
+                    shared_broker = getattr(self.manager, "plugin_broker", None)
+                    if shared_broker is not None:
+                        broker = AssistantPluginBroker(shared_broker, private)
                 if request.credentials is not None or step["feature_type"] == "challenge.2fa":
                     credentials = (request.credentials.model_dump(exclude_none=True)
                                    if request.credentials else {"code": runtime["totp_code"]})
@@ -1645,7 +1673,7 @@ class AssistantBrowser:
                 session.same_origin_only = True
                 session.executing = True
                 session.writes_authorized = step["feature_type"] not in READ_ONLY
-                session.credential_execution = context is not None
+                session.credential_execution = context is not None or category == "auth"
                 session.challenge_resources = step["feature_type"] == "challenge.turnstile"
                 before = await self._collect(session)
                 started = True
@@ -1655,13 +1683,17 @@ class AssistantBrowser:
                     cancel=None, xdisplay=None, lane_key=session.lane_key,
                     log=lambda *_: None, capture_image=None, artifacts=None,
                     secret_payload=secret_payload,
+                    plugin_runtimes=plugins, plugin_broker=broker,
+                    resign_pending_dates=secret_payload.get("resign_pending_dates"),
+                    resign_progress=resign_progress,
                 )
                 if session.failure or session.closed:
                     raise HTTPException(403, session.failure or {"code": "browser_url_denied"})
                 await self._current(session)
                 status = {"success": "success", "fail": "failed", "unknown": "unknown"}.get(raw_status, "unknown")
                 if status == "failed" and ((context is not None and context.action_started)
-                                           or (private is not None and private.action_started)):
+                                           or (private is not None and private.action_started)
+                                           or dynamic_side_effects):
                     status = "unknown"
                 code = {"success": "step_succeeded", "failed": "step_failed", "unknown": "outcome_uncertain"}[status]
                 if isinstance(data, dict):
@@ -1674,6 +1706,9 @@ class AssistantBrowser:
                         evidence = _success_evidence_result(data.get("success_evidence"))
                         if evidence is not None:
                             result["success_evidence"] = evidence
+                    if feature not in FEATURES:
+                        bounded_json(data)
+                        result = _redact_known(data, session.known_fingerprints)
                 if step["feature_type"] == "auth.form_login" and status == "success":
                     result = {"submitted": True, "verified": bool(step["config"].get("success_selector"))}
                 evidence_deadline = min(session.deadline, time.monotonic() + 3)
@@ -1711,7 +1746,8 @@ class AssistantBrowser:
                     diagnostics.setdefault("evidence_errorcode", _exception_code(exc, "browser_snapshot_unavailable"))
             if session.failure is operation_failure:
                 session.failure = None
-            if status == "error" and (context.action_started if context is not None else
+            if status == "error" and (started if dynamic_side_effects else
+                                      context.action_started if context is not None else
                                       private.action_started if private is not None else started):
                 status, code = "unknown", "outcome_uncertain"
             if status == "unknown":
@@ -1773,7 +1809,7 @@ class AssistantBrowser:
             digest = session.operations[operation_id][0]
             session.operations[operation_id] = (digest, response)
             session.lock.release()
-        return response
+        return _redact_known(response, session.known_fingerprints)
 
     async def screenshot(self, session_id: str, token: str) -> dict[str, Any]:
         from PIL import Image

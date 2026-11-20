@@ -144,8 +144,8 @@ def test_secret_fill_defaults_are_not_exported_or_materialized(tools, client):
 def test_prompt_distinguishes_authoring_captcha_tests_and_consumption_approval():
     prompt = " ".join(SYSTEM_PROMPT.split())
     assert "All 23 reviewed built-ins" in SYSTEM_PROMPT
-    assert "Exactly 18 built-ins" in SYSTEM_PROMPT
-    assert "flow.jump and the four post features" in SYSTEM_PROMPT
+    assert "explicitly allowed plugin features" in SYSTEM_PROMPT
+    assert "post features require explicit standing policy" in SYSTEM_PROMPT
     assert "flow.result returns its configured boolean" in SYSTEM_PROMPT
     assert "CAPTCHA handling does not lock the browser" in prompt
     assert "follow-up execute_step calls on the same page without reopening" in prompt
@@ -161,8 +161,8 @@ def test_prompt_distinguishes_authoring_captcha_tests_and_consumption_approval()
     assert "never supplied as model parameters" in guide["guide"]
     assert "post.* and action.fill are unavailable" not in json.dumps(guide)
     definitions = {item["function"]["name"]: item["function"] for item in tool_definitions()}
-    assert "18" in definitions["execute_step"]["description"]
-    assert "fresh per-post-step approval" in definitions["run_site"]["description"]
+    assert "opted-in plugin" in definitions["execute_step"]["description"]
+    assert "standing" in definitions["run_site"]["description"]
     assert set(definitions["run_site"]["parameters"]["properties"]) == {"title"}
 
 

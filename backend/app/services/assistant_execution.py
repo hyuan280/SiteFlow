@@ -26,7 +26,8 @@ from app.models.workflow import Site
 from app.schemas.assistant import public_url
 from app.schemas.workflow import SiteWrite, StepInput
 from app.services.assistant_categories import (
-    Denied as _Denied, auth_budget_context, builtin_category, require_auth_capacity,
+    Denied as _Denied, auth_budget_context, execution_category, execution_features,
+    execution_binding, require_auth_capacity,
 )
 from app.services.assistant_snapshot import POLICY_CODES
 from app.services.assistant_retry import (
@@ -44,14 +45,7 @@ from app.services.login_evidence import project_success_evidence
 from app.services.workflows import _substitute
 
 
-SUPPORTED_FEATURES = frozenset({
-    "flow.open", "action.navigate", "auth.form_login", "auth.password_verify",
-    "action.wait", "sign.button", "sign.unit3d_claim", "challenge.altcha",
-    "challenge.slider", "action.click",
-    "challenge.2fa", "challenge.turnstile", "challenge.image_captcha",
-    "challenge.grid_captcha", "sign.iframe.image_captcha", "sign.image_quiz",
-    "action.fill", "flow.result",
-})
+SUPPORTED_FEATURES = frozenset(FEATURES)
 _CODES = {
     "success": {"step_succeeded"},
     "failed": {"step_failed"},
@@ -90,6 +84,8 @@ class AssistantExecution:
         self.operation_id = None
         self._execution_turn_id = None
         self._reserved = False
+        self._bindings = None
+        self._job_id = None
 
     def _bound_site(self, db):
         identifier = self.target.get("site_id")
@@ -112,7 +108,7 @@ class AssistantExecution:
         return site
 
     def _uncertainty_gate(self, db, data, scope, feature):
-        if builtin_category(feature) != "post":
+        if execution_category(db, feature) != "post":
             return
         from app.services.assistant_run_guard import unresolved_assistant_runs
 
@@ -150,7 +146,10 @@ class AssistantExecution:
 
     def _authorize(self, scope, feature, *, check_uncertain=True, db=None):
         manager = self.manager
-        task = asyncio.current_task()
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
         if (manager._stopping or not manager.settings.config_ai_enabled
                 or (task is not None and task.cancelling())):
             raise _Denied("execution_disabled")
@@ -164,7 +163,19 @@ class AssistantExecution:
             data = manager._decrypt(row)
             if row.status != "running" or data.get("target") != self.target:
                 raise _Denied("execution_authorization_changed")
+            if self._job_id is not None:
+                from app.models.execution import Run, SiteJob
+
+                job = db.get(SiteJob, self._job_id, populate_existing=True)
+                run = db.get(Run, job.run_id, populate_existing=True) if job else None
+                if (job is None or job.status != "running" or run is None
+                        or run.status != "running" or run.cancel_requested):
+                    raise _Denied("execution_authorization_changed")
             if self._reserved:
+                record = data.get(RECORDS, {}).get(self.operation_id)
+                if (record is None or record.get("feature_bindings") != self._bindings
+                        or record.get("state") == "terminal"):
+                    raise _Denied("execution_authorization_changed")
                 turn_id, _ = auth_budget_context(
                     manager, db, self.session_id, data, turn=self.turn, auth_limit=self.auth_limit)
                 if turn_id != self._execution_turn_id:
@@ -187,12 +198,17 @@ class AssistantExecution:
             if self.target.get("execution_consent") is not True:
                 raise _Denied("execution_consent_required")
             allowed = self.target.get("execution_features", [])
-            if (not isinstance(allowed, list) or any(
-                    not isinstance(key, str) or key not in SUPPORTED_FEATURES for key in allowed
-            ) or feature not in allowed or feature not in SUPPORTED_FEATURES):
+            if (not isinstance(allowed, list) or feature not in allowed or any(
+                    not isinstance(key, str) or (key not in FEATURES and (
+                        len(key.split(".", 2)) != 3 or not key.startswith("plugin.")))
+                    for key in allowed)):
                 raise _Denied("execution_feature_denied")
-            category = builtin_category(feature)
-            if ((category in {"sign", "challenge"} or feature in {"action.click", "action.fill"})
+            category = execution_category(db, feature)
+            if category == "auth" and self.target.get("credential_mode") in {"cookie", "none"}:
+                raise _Denied("credentials_unavailable")
+            if self._bindings is not None and self._step_bindings(db, self._normalized_step) != self._bindings:
+                raise _Denied("execution_authorization_changed")
+            if ((category in {"sign", "challenge", "post"} or feature in {"action.click", "action.fill"})
                     and self.target.get("allow_sign") is not True):
                 raise _Denied("sign_consent_required")
             if ((category == "auth" or feature == "challenge.2fa")
@@ -213,32 +229,44 @@ class AssistantExecution:
         step = StepInput.model_validate(raw, strict=True)
         if step.enabled is False or step.condition not in (None, "", "always"):
             raise ValueError()
-        feature = FEATURES[step.feature_type]  # Builtins only, never plugin dispatch.
         protected = {"llm_prompt", "llm_enabled", "fields"}
         if set(step.config) & protected:
             raise ValueError()
-        feature.validate_override(step.config)
         with self.manager.session_factory() as db:
+            feature = execution_features(db)[step.feature_type]
+            remote = hasattr(feature, "plugin_id")
+            if remote and any(key in step.config for key, prop in feature.schema.get("properties", {}).items()
+                              if prop.get("writeOnly") or prop.get("readOnly") or prop.get("ui:hidden")
+                              or prop.get("format") == "password"):
+                raise ValueError()
+            feature.validate_override(step.config)
             settings = FeatureSettingsService(db)
             defaults, _, _ = settings.policy(feature)
             supplied = {key: value for key, value in {**defaults, **step.config}.items()
-                        if key in feature.config_model.model_fields and key not in protected}
+                        if key in (feature.schema.get("properties", {}) if remote else
+                                   feature.config_model.model_fields) and key not in protected}
             if step.feature_type in {"flow.open", "action.navigate"}:
                 if "retry_count" in step.config and (
                         type(step.config["retry_count"]) is not int or step.config["retry_count"] != 0):
                     raise ValueError()
                 supplied["retry_count"] = 0
-            feature.config_model.model_validate(supplied, strict=True)
+            if remote:
+                feature.validate_full(supplied)
+            else:
+                feature.config_model.model_validate(supplied, strict=True)
             config = settings.validate(feature, supplied)
+            if remote and set(config) & protected:
+                raise ValueError()
+            self._normalized_step = {"feature_type": step.feature_type, "config": config}
+            self._bindings = self._step_bindings(db, self._normalized_step)
         config = {key: value for key, value in config.items() if key not in protected}
-        if config.get("totp_provider_id", "builtin.twofauth") != "builtin.twofauth":
-            raise ValueError()
-        if config.get("captcha_method", "ddddocr") not in {"ddddocr", "nexusphp_gd5", "vision"}:
-            raise ValueError()
         base_url = self.target["base_url"]
         if "?" not in base_url and "#" not in base_url:
             base_url = SiteWrite(name=self.target["name"], base_url=base_url).base_url
         config = _substitute(config, base_url)
+        from app.services.assistant_workflows import validate_workflow_urls
+
+        validate_workflow_urls({"steps": [{"enabled": True, "config": config}]}, self.target)
         if contains_redaction(config):
             raise ValueError()
         if step.feature_type in {"flow.open", "action.navigate"}:
@@ -248,14 +276,14 @@ class AssistantExecution:
                 raise ValueError()
             if _origin(config["url"]) != _origin(self.target["base_url"]):
                 raise ValueError()
-        for key, value in config.items():
+        for key, value in (() if remote or step.feature_type.startswith("post.") else config.items()):
             if isinstance(value, list):
                 if len(value) > 30 or any(
                         not isinstance(item, str) or not item.strip() or len(item) > 2048
                         for item in value):
                     raise ValueError()
             elif isinstance(value, str) and (len(value) > 4096 or (not value and key not in {
-                    "username_hint", "value", "message", "message_text",
+                    "username_hint", "value", "message", "message_text", "target_step_key",
             })):
                 raise ValueError()
         if step.feature_type == "sign.unit3d_claim" and not config["claim_selector"]:
@@ -265,6 +293,39 @@ class AssistantExecution:
         if len(_json(normalized).encode()) > 65536:
             raise ValueError()
         return normalized
+
+    def _step_bindings(self, db, step, *, site=None):
+        bindings = {step["feature_type"]: execution_binding(db, step["feature_type"])}
+        from app.services.assistant_provider_policy import provider_binding
+        from app.services.secret_providers import credential_provider
+
+        if site is None and self is not None and self.target.get("credential_mode") == "site":
+            site = self._bound_site(db)
+            if site is None:
+                raise _Denied("credentials_unavailable")
+        if site is not None:
+            provider = credential_provider(site)
+            if provider.startswith("plugin."):
+                bindings[f"{provider}.secret.credentials"] = provider_binding(db, provider, "secret.credentials")
+        if step["feature_type"] == "challenge.2fa":
+            provider = step["config"].get("totp_provider_id") or "builtin.twofauth"
+            if provider.startswith("plugin."):
+                bindings[f"{provider}.secret.totp"] = provider_binding(db, provider, "secret.totp")
+            elif provider != "builtin.twofauth":
+                raise _Denied("credentials_unavailable")
+        method = step["config"].get("captcha_method")
+        if isinstance(method, str) and method.startswith("plugin."):
+            from app.features.plugin_registry import plugin_captcha_methods, plugin_metadata_for_row
+            from app.models.plugin import PluginRegistration
+            from app.services.assistant_feature_policy import assistant_allowed, policy_binding
+
+            candidate = next((m for m in plugin_captcha_methods() if m.key == method), None)
+            row = db.get(PluginRegistration, candidate.plugin_id, populate_existing=True) if candidate else None
+            if row is None or candidate not in plugin_metadata_for_row(row)[1] or not assistant_allowed(db, method):
+                raise _Denied("execution_feature_denied")
+            bindings[method] = {"policy": policy_binding(db, method), "plugin": {
+                "generation": row.generation, "permission_epoch": row.permission_epoch}}
+        return bindings
 
     def _reserve(self, operation_id, step=None):
         # Persist before releasing credentials or issuing HTTP. Lost responses,
@@ -291,7 +352,8 @@ class AssistantExecution:
                 raise _Denied("execution_operation_limit")
             scope = self.manager.browsers.get(self.session_id)
             if step is not None:
-                category = builtin_category(step["feature_type"])
+                self._authorize(scope, step["feature_type"], db=db)
+                category = execution_category(db, step["feature_type"])
                 turn_id, auth_limit = auth_budget_context(
                     self.manager, db, self.session_id, data, turn=self.turn, auth_limit=self.auth_limit)
                 if category == "auth":
@@ -313,6 +375,7 @@ class AssistantExecution:
             if step is not None:
                 data.setdefault(RECORDS, {})[operation_id] = {
                     "category": category, "turn_id": turn_id,
+                    "feature_bindings": deepcopy(self._bindings),
                     "step": deepcopy(step), "step_fingerprint": fingerprint(step),
                     "target_revision": data.get("_target_revision", 0),
                     "target_fingerprint": fingerprint(self.target),
@@ -375,7 +438,24 @@ class AssistantExecution:
         with self.manager.session_factory() as db:
             site = self._bound_site(db)
             mode = self.target.get("credential_mode")
-            if mode == "manual" and site is not None:
+            if mode == "site":
+                from app.services.secret_providers import credential_provider
+
+                if site is None:
+                    raise _Denied("credentials_unavailable")
+                provider = credential_provider(site)
+                if provider.startswith("plugin."):
+                    return self._provider_secret(site, provider, "auth.form_login", {
+                        "bitwarden_match_mode": site.bitwarden_match_mode,
+                        "bitwarden_custom_match": site.bitwarden_custom_match,
+                    })
+                if provider == "builtin.bitwarden":
+                    secret = BitwardenService(db, self.manager.settings, self.manager.crypto).resolve_for_site(site)
+                elif provider == "builtin.manual":
+                    secret = CredentialService(db, self.manager.crypto).resolve(site.id)
+                else:
+                    raise _Denied("credentials_unavailable")
+            elif mode == "manual" and site is not None:
                 secret = CredentialService(db, self.manager.crypto).resolve(site.id)
             elif mode == "bitwarden":
                 # Do not inherit custom/root-domain matching or provider IDs from
@@ -396,14 +476,38 @@ class AssistantExecution:
                 raise _Denied("credentials_unavailable")
             return values
 
+    def _provider_secret(self, site, provider, purpose, options):
+        from app.services.secret_providers import SecretProviders
+
+        def authorize():
+            self._authorize(self.manager.browsers.get(self.session_id), self._normalized_step["feature_type"])
+
+        try:
+            # Zero denotes an assistant operation, not a durable workflow job.
+            # The callback is pinned to this operation's reserved ledger/bindings.
+            return SecretProviders(self.manager.session_factory, self.manager.settings, self.manager.crypto)._remote(
+                provider, purpose, 0, site.id, f"assistant-operation:{self.operation_id}",
+                site.base_url, options, authorize=authorize)
+        except _Denied:
+            raise
+        except Exception:
+            raise _Denied("credentials_unavailable") from None
+
     def _private_runtime(self, step):
         runtime, secrets = {}, []
         feature, config = step["feature_type"], step["config"]
         with self.manager.session_factory() as db:
-            self._bound_site(db)
+            site = self._bound_site(db)
             integrations = IntegrationService(db, self.manager.settings, self.manager.crypto)
             settings = FeatureSettingsService(db)
             if feature == "challenge.2fa":
+                provider = config.get("totp_provider_id") or "builtin.twofauth"
+                if provider.startswith("plugin."):
+                    if site is None or self.target.get("credential_mode") not in {"site", "manual", "bitwarden"}:
+                        raise _Denied("credentials_unavailable")
+                    value = self._provider_secret(site, provider, feature, config)
+                    code = value["code"]
+                    return {"totp_code": code}, [code]
                 # Establish a real same-origin account source, never a fabricated job.
                 credentials = self._credentials()
                 secrets.extend(credentials.values())
@@ -476,6 +580,65 @@ class AssistantExecution:
                 runtime["vision"] = vision
         return runtime, secrets
 
+    def _plugin_runtimes(self, step):
+        from app.services.plugin_runtime import PluginRuntimeService
+
+        keys = [step["feature_type"], step["config"].get("captcha_method", "")]
+        ids = {key.split(".", 2)[1] for key in keys if key.startswith("plugin.")}
+        with self.manager.session_factory() as db:
+            self._authorize(self.manager.browsers.get(self.session_id), step["feature_type"], db=db)
+            return {key: PluginRuntimeService(db, self.manager.settings).runtime_for_plugin(key)
+                    for key in ids}
+
+    def _post_runtime(self, step):
+        from datetime import datetime
+        from sqlalchemy import select
+        from app.models.execution import Run, SiteJob
+        from app.models.workflow import SiteResignRecord
+        from app.services.assistant_feature_policy import assistant_explicitly_allowed
+        from app.services.assistant_workflows import bound_workflow
+        from app.services.resign import ResignService
+
+        with self.manager.session_factory() as db:
+            self._authorize(self.manager.browsers.get(self.session_id), step["feature_type"], db=db)
+            if not assistant_explicitly_allowed(db, step["feature_type"]):
+                raise _Denied("consumption_approval_required")
+            site = bound_workflow(db, self.target)
+            resign = ResignService(db, self.manager.settings)
+            dates = resign.pending_dates(site.id, site.resign_max_days) if site.support_resign else []
+            unresolved = list(db.scalars(select(SiteResignRecord.resign_date).where(
+                SiteResignRecord.site_id == site.id, SiteResignRecord.status == "unknown"
+            ).order_by(SiteResignRecord.resign_date)))
+            if unresolved or db.scalar(select(SiteJob.id).where(
+                    SiteJob.site_id == site.id, SiteJob.status.in_(("queued", "running")))):
+                raise _Denied("workflow_outcome_uncertain")
+            run = Run(trigger="assistant_operation", status="running", created_by=self.owner,
+                      requested_sites_json=_json([site.id]))
+            db.add(run)
+            db.flush()
+            job = SiteJob(run_id=run.id, site_id=site.id, site_name=site.name,
+                          lane="proxy_interaction" if self.target.get("proxy") else "interaction",
+                          status="running")
+            db.add(job)
+            db.flush()
+            self._job_id = job.id
+            runtime = {"job_id": str(job.id), "site_id": str(site.id),
+                       "resign_pending_dates": dates, "resign_unresolved_dates": unresolved,
+                       "resign_today": datetime.now(resign.timezone).date().isoformat()}
+            db.commit()
+            return runtime
+
+    def _finish_post_job(self, status):
+        from datetime import datetime, timezone
+        from app.models.execution import Run, SiteJob
+
+        with self.manager.session_factory() as db:
+            job = db.get(SiteJob, self._job_id)
+            run = db.get(Run, job.run_id)
+            job.status = run.status = {"failed": "fail", "error": "unknown"}.get(status, status)
+            job.finished_at = run.finished_at = datetime.now(timezone.utc)
+            db.commit()
+
     def _project(self, raw, scope, operation_id, feature=None):
         if (not isinstance(raw, dict) or raw.get("session_id") != scope.session_id
                 or raw.get("lane_key") != scope.lane_key or raw.get("operation_id") != operation_id
@@ -545,6 +708,9 @@ class AssistantExecution:
         private_secrets = []
         dispatched = False
         outcome = None
+        plugin_token = None
+        plugin_runtimes = {}
+        job_runtime = None
         try:
             if (not isinstance(arguments, dict) or set(arguments) != {"step", "operation_id"}
                     or not isinstance(arguments["operation_id"], str)
@@ -558,22 +724,40 @@ class AssistantExecution:
             if not self.target:
                 return failure("target_confirmation_required")
             feature = arguments["step"].get("feature_type")
+            with self.manager.session_factory() as db:
+                category = execution_category(db, feature)
             if (self.target.get("authorized") is True and isinstance(feature, str)
-                    and (builtin_category(feature) == "auth" or feature == "challenge.2fa")
+                    and (category == "auth" or feature == "challenge.2fa")
                     and not self.target.get("credential_consent")):
                 return {**failure("credentials_unavailable"),
                         "notice": "Bind a same-origin saved site with credentials or select Bitwarden; do not provide secrets in chat."}
-            if not isinstance(feature, str) or feature not in SUPPORTED_FEATURES:
-                return failure("execution_feature_denied")
             scope = self.manager.browsers.get(self.session_id)
             self._authorize(scope, feature, check_uncertain=False)
             try:
                 step = self._normalize(arguments["step"])
+            except _Denied:
+                raise
             except Exception:
                 return failure("invalid_step")
             self._authorize(scope, feature)
             self._reserve(operation_id, step)
-            if feature.startswith("auth."):
+            if category == "post":
+                job_runtime = self._post_runtime(step)
+            plugin_runtimes = self._plugin_runtimes(step)
+            if plugin_runtimes or job_runtime:
+                from app.services.assistant_plugin_authorization import assistant_plugin_authorization
+
+                plugin_token = assistant_plugin_authorization.register(self, scope, step, plugin_runtimes)
+                for runtime in plugin_runtimes.values():
+                    private_secrets.extend(runtime[key] for key in ("token", "endpoint") if runtime.get(key))
+                    runtime["authorization"] = {
+                        "scope": "assistant_operation", "session_id": self.session_id,
+                        "operation_id": operation_id, "token": plugin_token,
+                    }
+                private_secrets.append(plugin_token)
+                if job_runtime:
+                    job_runtime["secret_access"] = {"token": plugin_token}
+            if category == "auth" and feature in FEATURES:
                 try:
                     async with asyncio.timeout(30):
                         credentials = await asyncio.to_thread(self._credentials)
@@ -581,10 +765,11 @@ class AssistantExecution:
                     raise
                 except Exception:
                     return failure("credentials_unavailable")
-            if feature.startswith("challenge.") or feature in VISION_FEATURES or feature == "flow.result":
+            if feature in FEATURES and (category == "challenge" or feature in VISION_FEATURES or feature == "flow.result"):
                 try:
                     async with asyncio.timeout(30):
-                        private_runtime, private_secrets = await asyncio.to_thread(self._private_runtime, step)
+                        private_runtime, runtime_secrets = await asyncio.to_thread(self._private_runtime, step)
+                        private_secrets.extend(runtime_secrets)
                 except _Denied:
                     raise
                 except Exception:
@@ -593,11 +778,18 @@ class AssistantExecution:
             payload = {
                 "token": scope.token, "operation_id": operation_id,
                 "site_origin": self.target["base_url"], "step": step,
+                "plugin_runtimes": plugin_runtimes,
+                "categories": {feature: category},
+                "feature_schemas": {feature: (self._bindings[feature]["plugin"]["schema"]
+                                    if feature.startswith("plugin.") else
+                                    FEATURES[feature].config_model.model_json_schema())},
                 "execution": {"feature_types": [feature],
                               "allow_sign": self.target.get("allow_sign") is True},
             }
             if credentials is not None:
                 payload["credentials"] = dict(credentials)
+            if job_runtime:
+                payload["job_runtime"] = job_runtime
             if private_runtime:
                 payload["private_runtime"] = private_runtime
             if feature == "flow.result" and private_runtime and private_runtime.get("vision"):
@@ -613,6 +805,8 @@ class AssistantExecution:
             finally:
                 payload.pop("credentials", None)
                 payload.pop("private_runtime", None)
+                payload.pop("plugin_runtimes", None)
+                payload.pop("job_runtime", None)
             self._authorize(scope, feature)
             if any(_has_secret(raw, value)
                    for value in [scope.token, *(credentials or {}).values(), *private_secrets] if value):
@@ -635,6 +829,9 @@ class AssistantExecution:
                 await self.manager._close_browser(self.session_id)
             return failure("execution_unavailable")
         finally:
+            if plugin_token:
+                assistant_plugin_authorization.revoke(plugin_token)
+            plugin_runtimes.clear()
             if credentials is not None:
                 credentials.clear()
             if private_runtime is not None:
@@ -646,4 +843,6 @@ class AssistantExecution:
                     else ("failed", "execution_not_dispatched")
                 )
                 self._execution_state("terminal", status, code)
+                if self._job_id is not None:
+                    self._finish_post_job(status)
                 self._reserved = False

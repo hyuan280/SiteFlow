@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from sqlalchemy import select
@@ -665,16 +666,26 @@ class ExecutionManager:
 
             if run.trigger == "assistant":
                 from app.services.assistant_categories import (
-                    Denied, builtin_category, reserve_run_auth_use, run_auth_binding,
+                    Denied, execution_category, reserve_run_auth_use, run_auth_binding,
                 )
 
                 try:
-                    if any(step.enabled and builtin_category(step.feature_type) == "auth"
+                    if any(step.enabled and execution_category(session, step.feature_type) == "auth"
                            for step in resolved.steps):
                         action_id, binding = run_auth_binding(session, run_id, self.crypto)
                         reserve_auth = partial(
                             reserve_run_auth_use, self.session_factory, self.settings, self.crypto,
                             action_id, binding, job.id, job.attempt)
+                    plugin_auth = [step for step in resolved.steps if step.enabled
+                                   and step.feature_type.startswith("plugin.")
+                                   and execution_category(session, step.feature_type) == "auth"]
+                    # Plugin features do not use the builtin credential lease. Charge
+                    # before dispatch, and reject jumps that could reuse that charge.
+                    if plugin_auth and any(step.enabled and step.feature_type == "flow.jump"
+                                           for step in resolved.steps):
+                        raise Denied("execution_authorization_changed")
+                    for step in plugin_auth:
+                        reserve_auth(step.step_key, step.feature_type, str(uuid4()))
                 except Denied:
                     self._finish_job(job, "fail", "Assistant auth budget binding unavailable",
                                      {"reason": "execution_authorization_changed"})

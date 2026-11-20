@@ -180,7 +180,7 @@ def test_challenge_actions_with_sign_consent_reach_worker(execution, feature):
 
 
 @pytest.mark.parametrize("feature", [
-    "flow.jump", "auth.totp_login", "plugin.example", "post.buy_card",
+    "auth.totp_login", "plugin.example",
 ])
 def test_v1_unsupported_features_are_denied_even_if_host_lists_them(execution, feature):
     save_target(execution, {**execution.target, "execution_features": [feature]})
@@ -285,6 +285,13 @@ def test_fully_normalized_supported_steps_satisfy_worker_contract(execution, mon
     from worker.assistant_step import ExecuteRequest, validate_step
 
     bind(execution)
+    if feature.startswith("post."):
+        from app.services.assistant_feature_policy import set_assistant_allowed
+        save_target(execution, {**execution.target, "workflow_site_id": execution.target["site_id"],
+                               "_workflow_binding": execution.target["_credential_binding"]})
+        with execution.manager.session_factory() as db:
+            set_assistant_allowed(db, feature, True)
+            db.commit()
     if feature == "challenge.2fa":
         monkeypatch.setattr(execution, "_private_runtime", lambda step: ({"totp_code": "123456"}, ["123456"]))
     elif feature in {"sign.image_quiz", "challenge.grid_captcha"}:
@@ -302,6 +309,10 @@ def test_fully_normalized_supported_steps_satisfy_worker_contract(execution, mon
     config = {"selector": ["#button"]} if feature in {"action.click", "action.fill"} else {}
     if feature == "challenge.2fa":
         config = {"service_hint": "Example"}
+    elif feature == "flow.jump":
+        config = {"action": "restart", "texts": ["Complete"]}
+    elif feature == "post.buy_card":
+        config = {"max_price": 1}
     assert run(execution, arguments(feature, config))["ok"]
 
 

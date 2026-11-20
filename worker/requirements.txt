@@ -10,3 +10,4 @@ ddddocr==1.6.1
 grpcio==1.85.0
 protobuf==6.33.6
 mss==10.1.0
+jsonschema==4.26.0

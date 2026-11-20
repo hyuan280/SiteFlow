@@ -630,7 +630,7 @@ def _target(site, *, workflow_consent=False, live_access=False, policy_revision=
         "name": site.name, "base_url": site.base_url, "confirmed": True,
         "site_id": site.id, "workflow_site_id": site.id,
         "_workflow_binding": workflow_binding(site), "_credential_binding": workflow_binding(site),
-        "credential_mode": {"builtin.bitwarden": "bitwarden", "builtin.manual": "manual"}.get(provider, "none"),
+        "credential_mode": {"builtin.bitwarden": "bitwarden", "builtin.manual": "manual"}.get(provider, "site"),
         "workflow_consent": workflow_consent, "run_lane_policy": site.lane_policy,
         "proxy": site.lane_policy in {"proxy_general", "proxy_interaction"},
         "browser_consent": False, "execution_consent": False, "credential_consent": False,

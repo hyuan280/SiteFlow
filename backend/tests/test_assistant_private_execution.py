@@ -162,7 +162,8 @@ def test_totp_requires_credential_consent(execution, integrations):
     ("sign.iframe.image_captcha", {"fields": {"password": PASSWORD}}),
 ])
 def test_private_input_and_plugin_overrides_denied(execution, feature, config):
-    assert run(execution, arguments(feature, config)) == {"ok": False, "code": "invalid_step"}
+    code = "credentials_unavailable" if config.get("totp_provider_id") == "plugin.other" else "invalid_step"
+    assert run(execution, arguments(feature, config)) == {"ok": False, "code": code}
     execution.manager._worker.assert_not_awaited()
 
 

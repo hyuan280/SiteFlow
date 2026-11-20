@@ -5,7 +5,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 
 import { ApiError, apiRequest } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
-import type { PluginRuntimeView } from "@/types/plugin";
+import type { PluginFeatureCategory, PluginRuntimeView } from "@/types/plugin";
 import {
   capabilityLabel,
   capabilityType,
@@ -15,6 +15,7 @@ import {
   pluginStatusType,
 } from "@/utils/plugins";
 import { formatServerDateTime } from "@/utils/datetime";
+import { categoryLabel } from "@/utils/workflow";
 
 const auth = useAuthStore();
 const router = useRouter();
@@ -76,8 +77,59 @@ async function revoke(plugin: PluginRuntimeView): Promise<void> {
   finally { setBusy(plugin.plugin_id, "revoke", false); }
 }
 const approvalSelection = reactive<Record<string, string[]>>({});
+const featureCategories: PluginFeatureCategory[] = ["flow", "auth", "challenge", "sign", "action", "post"];
+type CategoryDraft = {
+  categories: Record<string, PluginFeatureCategory | null>;
+  assistant_permissions: Record<string, boolean>;
+  generation: number;
+  permission_epoch: number;
+};
+const categoryDrafts = reactive<Record<string, CategoryDraft>>({});
+
+function editCategory(plugin: PluginRuntimeView, key: string, category: PluginFeatureCategory | null): void {
+  const draft = categoryDrafts[plugin.plugin_id] ??= {
+    categories: {}, assistant_permissions: {}, generation: plugin.generation, permission_epoch: plugin.permission_epoch,
+  };
+  draft.categories[key] = category;
+}
+
+function editAssistantPermission(plugin: PluginRuntimeView, key: string, allowed: boolean): void {
+  const draft = categoryDrafts[plugin.plugin_id] ??= {
+    categories: {}, assistant_permissions: {}, generation: plugin.generation, permission_epoch: plugin.permission_epoch,
+  };
+  draft.assistant_permissions[key] = allowed;
+}
+
+function staleCategoryDraft(plugin: PluginRuntimeView): boolean {
+  const draft = categoryDrafts[plugin.plugin_id];
+  return !!draft && (draft.generation !== plugin.generation || draft.permission_epoch !== plugin.permission_epoch);
+}
+
+async function saveCategories(plugin: PluginRuntimeView): Promise<void> {
+  const draft = categoryDrafts[plugin.plugin_id];
+  if (!draft || staleCategoryDraft(plugin)) return;
+  setBusy(plugin.plugin_id, "categories", true);
+  try {
+    const updated = await apiRequest<PluginRuntimeView>(
+      `/plugin-runtime/plugins/${encodeURIComponent(plugin.plugin_id)}/feature-categories`,
+      { method: "PUT", body: JSON.stringify(draft) },
+    );
+    delete categoryDrafts[plugin.plugin_id];
+    replacePlugin(updated);
+    ElMessage.success(Object.keys(draft.categories).length
+      ? "功能分类与助手授权已保存，旧审批已撤销，请重新审批插件权限"
+      : "助手授权已保存，插件通用审批保持不变");
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 409) await load(true);
+    ElMessage.error(cause instanceof Error ? cause.message : "保存分类与助手授权失败");
+  } finally {
+    setBusy(plugin.plugin_id, "categories", false);
+  }
+}
+
 const busy = reactive<Record<string, string>>({});
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let loadVersion = 0;
 
 const pendingCount = computed(
   () => plugins.value.filter((plugin) => plugin.status === "unapproved").length,
@@ -104,38 +156,41 @@ function setBusy(pluginId: string, action: string, value: boolean): void {
   }
 }
 
-function syncSelection(plugin: PluginRuntimeView): void {
+function syncSelection(plugin: PluginRuntimeView, previous?: PluginRuntimeView): void {
   const existing = approvalSelection[plugin.plugin_id];
   if (!existing) {
-    approvalSelection[plugin.plugin_id] = plugin.approved_capabilities.length
-      ? [...plugin.approved_capabilities]
-      : [...plugin.capabilities];
+    approvalSelection[plugin.plugin_id] = [...plugin.approved_capabilities];
     return;
   }
   approvalSelection[plugin.plugin_id] = existing.filter((item) =>
-    plugin.capabilities.includes(item),
+    plugin.capabilities.includes(item) &&
+    (!previous || (previous.generation === plugin.generation && previous.permission_epoch === plugin.permission_epoch) ||
+      plugin.approved_capabilities.includes(item)),
   );
 }
 
 function applyPlugins(items: PluginRuntimeView[]): void {
-  plugins.value = items;
   for (const plugin of items) {
-    syncSelection(plugin);
+    syncSelection(plugin, plugins.value.find((previous) => previous.plugin_id === plugin.plugin_id));
   }
+  plugins.value = items;
 }
 
 function replacePlugin(updated: PluginRuntimeView): void {
+  loadVersion++;
+  syncSelection(updated, plugins.value.find((plugin) => plugin.plugin_id === updated.plugin_id));
   plugins.value = plugins.value.map((plugin) =>
     plugin.plugin_id === updated.plugin_id ? updated : plugin,
   );
-  syncSelection(updated);
 }
 
 async function load(silent = false): Promise<void> {
+  const version = ++loadVersion;
   if (!silent) loading.value = true;
   error.value = "";
   try {
-    applyPlugins(await apiRequest<PluginRuntimeView[]>("/plugin-runtime/plugins"));
+    const items = await apiRequest<PluginRuntimeView[]>("/plugin-runtime/plugins");
+    if (version === loadVersion) applyPlugins(items);
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 401) {
       auth.clear();
@@ -151,6 +206,7 @@ async function load(silent = false): Promise<void> {
 }
 
 async function approve(plugin: PluginRuntimeView): Promise<void> {
+  if (categoryDrafts[plugin.plugin_id] || isBusy(plugin.plugin_id, "categories")) return;
   setBusy(plugin.plugin_id, "approve", true);
   try {
     const updated = await apiRequest<PluginRuntimeView>(
@@ -159,6 +215,8 @@ async function approve(plugin: PluginRuntimeView): Promise<void> {
         method: "POST",
         body: JSON.stringify({
           capabilities: approvalSelection[plugin.plugin_id] ?? [],
+          generation: plugin.generation,
+          permission_epoch: plugin.permission_epoch,
         }),
       },
     );
@@ -304,6 +362,18 @@ onUnmounted(() => {
     </div>
   </div>
 
+  <el-alert
+    title="助手持续授权说明"
+    type="warning"
+    :closable="false"
+    show-icon
+    class="notice"
+  >
+    <p class="approval-note">勾选并保存即持续授权助手发现、使用及单步执行该功能或验证码方法，包括验证码处理与发布（post）。高风险操作可能提交数据、发布内容或产生其他外部副作用；取消勾选可撤回助手授权。插件仍须满足通用审批和可用状态。</p>
+    <p class="approval-note">勾选并保存秘密提供商即允许后端在助手操作中私下使用该提供商的凭据或 TOTP，不会向模型透露密码、TOTP 种子或验证码值。凭据与 TOTP 分别授权；取消勾选可撤回助手授权，插件仍须满足通用审批和可用状态。</p>
+    <p class="approval-note">仅保存助手授权不会撤销插件通用审批，但会更新权限版本。分类调整保存后会撤销旧审批，必须重新审批；风险指数显示当前已保存分类的风险。</p>
+  </el-alert>
+
   <div v-loading="loading" class="plugin-list">
     <el-empty
       v-if="!loading && !plugins.length"
@@ -342,6 +412,7 @@ onUnmounted(() => {
             size="small"
             type="primary"
             :loading="isBusy(plugin.plugin_id, 'approve')"
+            :disabled="!!categoryDrafts[plugin.plugin_id] || isBusy(plugin.plugin_id, 'categories')"
             @click="approve(plugin)"
           >
             通过审批
@@ -443,10 +514,75 @@ onUnmounted(() => {
         </div>
       </section>
 
+      <section class="section">
+        <div class="section-head">
+          <h3>功能分类、风险与助手授权</h3>
+          <span class="muted">风险指数越高，审批时越需谨慎</span>
+        </div>
+        <el-table :data="[...plugin.features.map(feature => ({ ...feature, isMethod: false })), ...plugin.captcha_methods.map(method => ({ ...method, isMethod: true })), ...plugin.secret_providers.map(provider => ({ ...provider, isProvider: true }))]" row-key="key" empty-text="无功能、验证码方法或秘密提供商" style="width: 100%">
+          <el-table-column label="功能" min-width="180">
+            <template #default="{ row }">{{ row.name }} <el-tag v-if="row.isMethod" size="small" type="info">验证码方法</el-tag><el-tag v-if="row.isProvider" size="small" type="danger">{{ row.capability === 'secret.credentials' ? '私有凭据提供商' : 'TOTP 提供商' }}</el-tag><div class="mono muted">{{ row.key }}</div><div v-if="row.isProvider" class="mono muted">{{ row.provider_id }}</div></template>
+          </el-table-column>
+          <el-table-column label="声明分类" min-width="100">
+            <template #default="{ row }">{{ categoryLabel(row.declared_category) }}</template>
+          </el-table-column>
+          <el-table-column label="生效分类" width="110">
+            <template #default="{ row }">
+              {{ categoryLabel(row.category) }}
+              <el-tag v-if="row.category_overridden" size="small" type="info">已覆盖</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="风险指数" min-width="280">
+            <template #default="{ row }">
+              <el-tag :type="row.risk_index >= 4 ? 'danger' : row.risk_index >= 3 ? 'warning' : 'info'">
+                {{ row.risk_index }}/5 · {{ row.risk_label }}
+              </el-tag>
+              <div v-if="row.risk_index >= 3" class="approval-note risk-warning">可能产生外部副作用，请谨慎授权。</div>
+            </template>
+          </el-table-column>
+          <el-table-column v-if="auth.isAuthenticated && plugin.status !== 'removed'" label="管理分类" min-width="290">
+            <template #default="{ row }">
+              <span v-if="row.isProvider" class="muted">提供商分类固定，不可修改</span>
+              <span v-else-if="row.isMethod" class="muted">验证码方法固定为验证分类</span>
+              <div v-else class="category-editor">
+                <el-select
+                  :model-value="categoryDrafts[plugin.plugin_id]?.categories[row.key] === null ? row.declared_category : categoryDrafts[plugin.plugin_id]?.categories[row.key] ?? row.category"
+                  :aria-label="`${row.name} 分类`"
+                  :disabled="isBusy(plugin.plugin_id, 'categories') || isBusy(plugin.plugin_id, 'approve') || staleCategoryDraft(plugin)"
+                  @update:model-value="editCategory(plugin, row.key, $event)"
+                >
+                  <el-option v-for="category in featureCategories" :key="category" :label="categoryLabel(category)" :value="category" />
+                </el-select>
+                <el-button
+                  :disabled="isBusy(plugin.plugin_id, 'categories') || isBusy(plugin.plugin_id, 'approve') || staleCategoryDraft(plugin)"
+                  @click="editCategory(plugin, row.key, null)"
+                >恢复声明</el-button>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="允许助手使用" width="140" align="center" header-align="center">
+            <template #default="{ row }">
+              <el-checkbox
+                :model-value="categoryDrafts[plugin.plugin_id]?.assistant_permissions[row.key] ?? row.assistant_allowed"
+                :aria-label="`${row.name} 允许助手使用`"
+                :disabled="!auth.isAuthenticated || plugin.status === 'removed' || isBusy(plugin.plugin_id, 'categories') || isBusy(plugin.plugin_id, 'approve') || staleCategoryDraft(plugin)"
+                @update:model-value="editAssistantPermission(plugin, row.key, Boolean($event))"
+              />
+            </template>
+          </el-table-column>
+        </el-table>
+        <div v-if="categoryDrafts[plugin.plugin_id]" class="category-draft-actions">
+          <span v-if="staleCategoryDraft(plugin)" class="danger">插件版本或权限已变化，请放弃草稿后重新编辑。</span>
+          <span v-else class="muted">有未保存的分类或助手授权修改</span>
+          <el-button type="primary" :loading="isBusy(plugin.plugin_id, 'categories')" :disabled="staleCategoryDraft(plugin) || isBusy(plugin.plugin_id, 'approve')" @click="saveCategories(plugin)">{{ Object.keys(categoryDrafts[plugin.plugin_id]!.categories).length ? '保存并撤销旧审批' : '保存助手授权' }}</el-button>
+          <el-button :disabled="isBusy(plugin.plugin_id, 'categories')" @click="delete categoryDrafts[plugin.plugin_id]">放弃修改</el-button>
+        </div>
+      </section>
+
       <section v-if="plugin.status === 'unapproved'" class="approval-box">
         <div class="section-head">
           <h3>权限审批</h3>
-          <span class="muted">勾选允许插件使用的能力</span>
+          <span class="muted">请先核对上方功能分类与风险，再勾选允许使用的能力；新增权限不会自动勾选</span>
         </div>
         <el-checkbox-group v-model="approvalSelection[plugin.plugin_id]" class="capability-select">
           <el-checkbox
@@ -500,7 +636,7 @@ onUnmounted(() => {
     <el-collapse-item title="安全审计" name="audit">
       <el-form inline @submit.prevent="loadAudit(true)">
         <el-form-item label="插件"><el-input v-model="auditFilter.plugin_id" placeholder="插件 ID" /></el-form-item>
-        <el-form-item label="事件"><el-select v-model="auditFilter.event" clearable style="width: 180px"><el-option v-for="item in ['register', 'approve', 'revoke', 'disable', 'enable', 'lease_issue', 'lease_consume', 'lease_reject', 'provider_resolve']" :key="item" :label="item" :value="item" /></el-select></el-form-item>
+        <el-form-item label="事件"><el-select v-model="auditFilter.event" clearable style="width: 180px"><el-option v-for="item in ['register', 'approve', 'revoke', 'metadata_change', 'disable', 'enable', 'lease_issue', 'lease_consume', 'lease_reject', 'provider_resolve']" :key="item" :label="item" :value="item" /></el-select></el-form-item>
         <el-form-item label="结果"><el-select v-model="auditFilter.result" clearable style="width: 140px"><el-option v-for="item in ['success', 'denied', 'failed']" :key="item" :label="item" :value="item" /></el-select></el-form-item>
         <el-button :loading="auditLoading" @click="loadAudit(true)">查询</el-button>
       </el-form>
@@ -522,6 +658,10 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.risk-warning {
+  white-space: nowrap;
+}
+
 .page-head {
   display: flex;
   align-items: flex-start;
@@ -685,6 +825,7 @@ onUnmounted(() => {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
   margin-bottom: 10px;
 }
 
@@ -764,6 +905,22 @@ onUnmounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.category-editor,
+.category-draft-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.category-editor .el-select {
+  width: 130px;
+}
+
+.category-draft-actions {
+  margin-top: 12px;
+  flex-wrap: wrap;
 }
 
 .approval-note {

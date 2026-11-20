@@ -101,6 +101,12 @@ def test_guard_is_canonical_hash_only_and_never_decrypts_credentials(context, mo
     with context.factory() as session:
         site = session.get(Site, context.site_id)
         snapshot = WorkflowService(session, context.settings, context.crypto)._snapshot(site)
+        from app.services.assistant_execution import AssistantExecution
+        service = WorkflowService(session, context.settings, context.crypto)
+        snapshot["assistant_plugin_bindings"] = {
+            step.step_key: AssistantExecution._step_bindings(None, session, {
+                "feature_type": step.feature_type, "config": step.config})
+            for step in service.resolve_site(site.id).steps if step.enabled}
         expected = hashlib.sha256(json.dumps(
             snapshot, allow_nan=False, sort_keys=True, ensure_ascii=True, separators=(",", ":")
         ).encode("utf-8")).hexdigest()
