@@ -350,9 +350,10 @@ def test_draft_trust_settings_are_host_owned_and_never_saved(assistant_client, m
     captured = []
     validate = WorkflowService.validate_draft
 
-    def inspect(service, owner_type, payload, owner_id=None):
+    def inspect(service, owner_type, payload, owner_id=None, *, replace_local):
+        assert replace_local is True
         captured.append(payload)
-        return validate(service, owner_type, payload, owner_id)
+        return validate(service, owner_type, payload, owner_id, replace_local=replace_local)
     monkeypatch.setattr(WorkflowService, "validate_draft", inspect)
 
     async def scenario():

@@ -112,6 +112,7 @@ def _snapshot(value: dict, count: int, chars: int) -> dict:
 
 def compact_tool_result(
     name: str, result: dict, message_id: int | None = None, budget: int = 10000,
+    *, required_only: bool = False,
 ) -> dict:
     """Copy an OLD result for model context only; modest results stay exactly equal.
 
@@ -122,7 +123,7 @@ def compact_tool_result(
     if type(budget) is not int or budget < 2 or not isinstance(result, dict):
         raise ValueError("invalid context budget or result")
     original_size = len(_json(result))
-    if original_size <= budget:
+    if original_size <= budget and not required_only:
         return deepcopy(result)
     marker = {"context_compacted": True, "omitted": True,
               "source_message_id": message_id, "source_bytes": original_size, "notice": _NOTICE}
@@ -140,6 +141,8 @@ def compact_tool_result(
     base = {**required, **marker}
     if len(_json(base)) > budget:
         raise ValueError("protected tool context exceeds budget")
+    if required_only:
+        return base
     for count, chars in ((8, 600), (4, 300), (2, 120), (1, 40)):
         if name == "get_feature_schema":
             projected = {}

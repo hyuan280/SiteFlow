@@ -456,11 +456,12 @@ def test_bitwarden_proxy_draft_uses_host_sitewrite_settings_without_exporting_bi
     captured = []
     validate = WorkflowService.validate_draft
 
-    def inspect(service, owner_type, payload, owner_id=None):
+    def inspect(service, owner_type, payload, owner_id=None, *, replace_local):
         assert isinstance(service, _AssistantWorkflowService)
         assert isinstance(payload, SiteWrite)
+        assert replace_local is True
         captured.append(payload.model_dump())
-        return validate(service, owner_type, payload, owner_id)
+        return validate(service, owner_type, payload, owner_id, replace_local=replace_local)
 
     monkeypatch.setattr(WorkflowService, "validate_draft", inspect)
     draft = {"steps": [{"step_key": "login", "feature_type": "auth.form_login",

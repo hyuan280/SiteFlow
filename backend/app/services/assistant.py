@@ -1125,12 +1125,13 @@ class AssistantManager:
             return self.detail(owner, session_id)
 
     @staticmethod
-    def _context_tool_result(name, result, message_id, budget):
+    def _context_tool_result(name, result, message_id, budget, *, required_only=False):
         # Required provenance (notably escaped Unicode URLs) can exceed the soft
         # projection budget. Retry without dropping it; the request cap still wins.
         for candidate in sorted({budget, 32000, 128 * 1024}):
             try:
-                return compact_tool_result(name, result, message_id=message_id, budget=candidate)
+                return compact_tool_result(name, result, message_id=message_id, budget=candidate,
+                                           **({"required_only": True} if required_only else {}))
             except ValueError:
                 continue
         raise GenerationError("context_limit")
@@ -1435,6 +1436,7 @@ class AssistantManager:
                     messages[index] = self._context_note(self._bounded_context_text(item["content"], 1000))
         # Keep the newest batch verbatim if it fits the hard cap, even when it
         # exceeds the soft watermark. Otherwise project results, never split pairs.
+        tool_sources = []
         if size(messages) > watermark:
             overhead = size([item for item in messages if item["role"] != "tool"])
             result_count = sum(item["role"] == "tool" for item in messages)
@@ -1446,11 +1448,29 @@ class AssistantManager:
                     continue
                 name, message_id = self._tool_reference(item, references)
                 result = _strict_json(item["content"])
+                tool_sources.append((index, item, name, message_id, result))
                 messages[index] = {**item, "content": _json(self._context_tool_result(
                     name, result, message_id, result_budget,
                 ))}
                 if references is not None:
                     references[id(messages[index])] = (name, message_id)
+        # Byte budgets are only estimates. Reproject original results until the
+        # complete request fits, without resampling already-compacted evidence.
+        if tool_sources and size(messages) > watermark:
+            budget = result_budget
+            while budget > 2 and size(messages) > watermark:
+                budget = max(2, budget // 2)
+                for index, item, name, message_id, result in tool_sources:
+                    content = _json(self._context_tool_result(
+                        name, result, message_id, budget, required_only=budget == 2,
+                    ))
+                    # Required provenance may exceed the soft budget and trigger
+                    # a larger fallback; never replace a smaller projection with it.
+                    if len(content) >= len(messages[index]["content"]):
+                        continue
+                    messages[index] = {**item, "content": content}
+                    if references is not None:
+                        references[id(messages[index])] = (name, message_id)
         # Very large parallel call arguments are evidence too, not a reason to
         # replay a batch. Keep IDs/names and explicitly mark the argument projection.
         if size(messages) > watermark:

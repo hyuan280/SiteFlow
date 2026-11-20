@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import threading
 from uuid import uuid4
@@ -167,6 +168,100 @@ def test_small_live_context_is_verbatim(assistant_client, provider, monkeypatch)
     assert wait(client, identifier)["messages"][-1]["content"] == "Complete"
     messages = json.loads(provider[1][-1].content)["messages"]
     assert [item["content"] for item in messages if item["role"] == "tool"] == [_json(result)] * 2
+
+
+def test_live_projection_rechecks_token_budget_without_resampling(assistant_client, monkeypatch):
+    manager = assistant_client.app.state.assistant_manager
+    user = {"role": "user", "content": "Keep this original request"}
+    calls = [{"id": f"call-{index}", "type": "function", "function": {
+        "name": "browser_observe", "arguments": "{}",
+    }} for index in range(4)]
+    head = [{"role": "system", "content": "System"}] * 2 + [
+        user, {"role": "assistant", "content": None, "tool_calls": calls},
+    ]
+    result = {"ok": True, "snapshot_id": "snapshot", "frame_id": "main",
+              "elements": [{"node_id": f"n{i}", "text": "DOM" * 1900} for i in range(22)]}
+    messages = head + [{"role": "tool", "tool_call_id": call["id"], "content": _json(result)}
+                       for call in calls]
+    original = deepcopy(messages)
+    references = {id(item): ("browser_observe", index + 1)
+                  for index, item in enumerate(messages[len(head):])}
+    project = manager._context_tool_result
+    budgets = []
+
+    def inspect(name, source, message_id, budget, **kwargs):
+        assert source == result, "each attempt must project the original full result"
+        budgets.append(budget)
+        return project(name, source, message_id, budget, **kwargs)
+
+    monkeypatch.setattr(manager, "_context_tool_result", inspect)
+    cap = estimate_context_tokens(head) + 800
+    fitted = manager._fit_context(messages, references, protected_users=[user], cap=cap)
+    assert estimate_context_tokens(fitted) <= cap
+    assert min(budgets) < 2000, "the old per-result floor cannot block further fitting"
+    assert messages == original
+    assert user in fitted
+    results = [item for item in fitted if item["role"] == "tool"]
+    assert [item["tool_call_id"] for item in results] == [call["id"] for call in calls]
+    for index, item in enumerate(results, 1):
+        assert references[id(item)] == ("browser_observe", index)
+        assert json.loads(item["content"])["source_message_id"] == index
+
+
+def test_live_projection_keeps_required_unknown_state_when_cap_cannot_fit(assistant_client):
+    manager = assistant_client.app.state.assistant_manager
+    user = {"role": "user", "content": "Do not lose this request"}
+    head = [{"role": "system", "content": "System"}] * 2 + [user, {
+        "role": "assistant", "content": None, "tool_calls": [{
+            "id": "call", "type": "function", "function": {
+                "name": "execute_step", "arguments": "{}",
+            },
+        }],
+    }]
+    result = {"ok": False, "operation_id": "uncertain-operation", "status": "unknown",
+              "code": "outcome_uncertain", "after": {
+                  "url": "https://example.com/", "elements": [{"text": "x" * 100000}],
+              }}
+    item = {"role": "tool", "tool_call_id": "call", "content": _json(result)}
+    messages = head + [item]
+    original = deepcopy(messages)
+    cap = estimate_context_tokens(head) + 1
+    fitted = manager._fit_context(messages, {id(item): ("execute_step", 7)},
+                                  protected_users=[user], cap=cap)
+    # The caller must still reject an impossible context, rather than lose safety facts.
+    assert estimate_context_tokens(fitted) > cap
+    projected = json.loads(fitted[-1]["content"])
+    assert projected["operation_id"] == "uncertain-operation"
+    assert projected["status"] == "unknown" and projected["code"] == "outcome_uncertain"
+    assert projected["no_retry"] is True
+    assert projected["after"]["url"] == result["after"]["url"]
+    assert user in fitted and messages == original
+
+
+def test_live_projection_fits_required_metadata_between_sampling_budgets(assistant_client):
+    manager = assistant_client.app.state.assistant_manager
+    user = {"role": "user", "content": "Keep original user text"}
+    head = [{"role": "system", "content": "System"}] * 2 + [user, {
+        "role": "assistant", "content": None, "tool_calls": [{
+            "id": "call", "type": "function", "function": {
+                "name": "browser_observe", "arguments": "{}",
+            },
+        }],
+    }]
+    result = {"ok": True, "snapshot_id": "snapshot", "url": "https://example.com/" + "a" * 900,
+              "elements": [{"node_id": f"n{i}", "text": "DOM" * 1900} for i in range(22)]}
+    item = {"role": "tool", "tool_call_id": "call", "content": _json(result)}
+    messages = head + [item]
+    required = manager._context_tool_result("browser_observe", result, 7, 2000, required_only=True)
+    assert 1000 < len(_json(required)) < 2000
+    cap = estimate_context_tokens(head + [{**item, "content": _json(required)}]) + 10
+    fitted = manager._fit_context(messages, {id(item): ("browser_observe", 7)},
+                                  protected_users=[user], cap=cap)
+    assert estimate_context_tokens(fitted) <= cap
+    projected = json.loads(fitted[-1]["content"])
+    assert projected["url"] == result["url"] and projected["source_message_id"] == 7
+    assert "elements" not in projected
+    assert item["content"] == _json(result) and user in fitted
 
 
 def test_summary_reopens_reuses_and_target_invalidation_preserves_ledger(assistant_client, provider):
