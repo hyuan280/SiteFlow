@@ -124,19 +124,21 @@ PAGE_ERROR_MARKERS = (
     "error code 522",
     "error code 523",
     "error code 524",
-    "网站正在维护",
-    "站点正在维护",
-    "系统维护中",
-    "站点维护中",
-    "网站维护中",
-    "正在维护",
-    "关闭维护",
     "the website has been stopped",
-    "under maintenance",
-    "maintenance mode",
     "site is down",
     "404 not found",
     "页面不存在",
+)
+PAGE_MAINTENANCE_MARKERS = (
+    "网站正在维护", "站点正在维护", "系统维护中", "站点维护中", "网站维护中",
+    "正在维护", "关闭维护", "under maintenance", "maintenance mode",
+)
+PAGE_MAINTENANCE_RECOVERED_RE = re.compile(
+    r"(?:维护|维护工作|维护任务)(?:已|已经)?(?:完成|结束|完毕)"
+    r"|(?:已|已经)恢复(?:正常)?(?:访问|开放|运行|服务)"
+    r"|(?:maintenance\s+(?:(?:has\s+been|is)\s+)?(?:completed?|finished|over)"
+    r"|(?:site|website|service)\s+(?:is\s+)?(?:back\s+online|restored))\b",
+    re.IGNORECASE,
 )
 PAGE_ERROR_TITLE_RE = re.compile(
     r"(?:^|\D)(?:403|404|500|502|503|504|520|521|522|523|524)(?:\D|$)"
@@ -1714,6 +1716,8 @@ async def _run_slider(
     cancel: asyncio.Event | None,
     log: Callable[[str, str], None] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
+    from worker.browser_input import hold_page_input
+
     note = log or (lambda _level, _message: None)
     container_selectors = list(config.get("container_selector") or [])
     handle_selectors = list(config.get("handle_selector") or [])
@@ -1736,30 +1740,50 @@ async def _run_slider(
     )
     if container is None or handle is None:
         return "fail", "未找到滑块容器或手柄", {}
-    container_box = await container.bounding_box()
-    handle_box = await handle.bounding_box()
-    if not container_box or not handle_box:
-        return "fail", "无法读取滑块位置", {}
-    start_x = handle_box["x"] + handle_box["width"] / 2
-    start_y = handle_box["y"] + handle_box["height"] / 2
-    end_x = container_box["x"] + container_box["width"] - handle_box["width"] / 2
-    note("INFO", f"拖动滑块 x={round(start_x, 1)} -> {round(end_x, 1)}")
-    await page.mouse.move(start_x, start_y)
-    await page.mouse.down()
-    try:
-        await page.mouse.move(end_x, start_y, steps=25)
-    finally:
-        await page.mouse.up()
-    await asyncio.sleep(0.6)
+    data: dict[str, Any] = {"verified": False}
+    # Keep focus and pointer ownership for the entire drag, not each mouse call.
+    async with hold_page_input(page):
+        container_box = await container.bounding_box()
+        handle_box = await handle.bounding_box()
+        if not container_box or not handle_box:
+            return "fail", "无法读取滑块位置", {}
+        start_x = handle_box["x"] + handle_box["width"] / 2
+        start_y = handle_box["y"] + handle_box["height"] / 2
+        end_x = container_box["x"] + container_box["width"] - handle_box["width"] / 2
+        data["planned_distance"] = round(end_x - start_x, 2)
+        note(
+            "INFO",
+            f"拖动滑块 x={round(start_x, 1)} -> {round(end_x, 1)}；"
+            f"计划位移={data['planned_distance']}px，"
+            f"容器宽={round(container_box['width'], 2)}px，手柄宽={round(handle_box['width'], 2)}px",
+        )
+        await page.mouse.move(start_x, start_y)
+        await page.mouse.down()
+        try:
+            # Explicit steps use native interpolation in CloakBrowser 0.6.3.
+            await page.mouse.move(end_x, start_y, steps=25)
+            try:
+                # Sample before mouseup: a failed widget may immediately reset.
+                final_box = await handle.bounding_box(timeout=1000)
+                if final_box:
+                    data["handle_displacement"] = round(final_box["x"] - handle_box["x"], 2)
+                    note("INFO", f"滑块松开前手柄实际位移={data['handle_displacement']}px")
+            except Exception:
+                note("INFO", "滑块松开前手柄位置不可读（可能已跳转或移除）")
+        finally:
+            await page.mouse.up()
     success = list(config.get("success_selector") or [])
-    if success and await _find_locator(
+    if success:
+        note("INFO", f"等待滑块成功元素（最多 {SELECTOR_WAIT_MS / 1000:g}s）：{_short(', '.join(success))}")
+    if success and await _find_success_locator(
         page,
         success,
         wait_ms=SELECTOR_WAIT_MS,
         on_match=lambda value: note("INFO", f"滑块成功元素命中选择器：{value}"),
     ) is None:
-        return "unknown", "滑块拖动后未识别到成功元素", {}
-    return "success", "滑块已拖动", {}
+        return "unknown", "滑块拖动后未识别到成功元素", data
+    data["verified"] = bool(success)
+    return "success", "滑块验证通过" if success else "滑块已拖动", data
 
 
 _ocr_engine: Any = None
@@ -2931,6 +2955,55 @@ async def _detect_page_error(
             break
     if not reason and title and PAGE_ERROR_TITLE_RE.search(title):
         reason = f"页面标题显示 {_short(title, 80)}"
+    if not reason:
+        title_marker = next(
+            (marker for marker in PAGE_MAINTENANCE_MARKERS if marker in title.casefold()), "",
+        )
+        body_marker = next(
+            (marker for marker in PAGE_MAINTENANCE_MARKERS if marker in body.casefold()), "",
+        )
+        if title_marker or body_marker:
+            # A dated announcement is not an outage when the account UI works.
+            compact_body = re.sub(r"\s+", "", body).casefold()
+            account_ui = (
+                any(marker in compact_body for marker in ("欢迎回来", "welcomeback"))
+                and any(marker in compact_body for marker in ("退出", "登出", "logout", "signout"))
+                and any(marker in compact_body for marker in (
+                    "控制面板", "魔力值", "上传量", "下载量", "usercp", "bonus",
+                ))
+            )
+            # A later outage supersedes recovery. Negated/conditional recovery
+            # is not proof that maintenance has finished.
+            recovery_pattern = r"[^\n\r。.!！？?；;]+"
+            recovery_points = []
+            lines = re.findall(recovery_pattern, body.casefold())
+            for index, text in enumerate(lines):
+                match = PAGE_MAINTENANCE_RECOVERED_RE.search(text)
+                if match is None:
+                    continue
+                if re.search(
+                    r"尚未|还未|未能|没有|并未|未$|不$|预计|计划|等待|待维护|如果|若|将|"
+                    r"\b(?:not|once|when|until|expected|will)\b",
+                    text[:match.start()],
+                ) or re.match(r"\s*(?:后|之后|前|之前|时|日期)", text[match.end():]):
+                    continue
+                recovery_points.append((index, match.end()))
+            recovered_index, recovered_end = max(recovery_points, default=(-1, 0))
+            active_lines = [
+                text for index, text in enumerate(lines)
+                if index >= recovered_index
+                and any(
+                    marker in (text[recovered_end:] if index == recovered_index else text)
+                    for marker in PAGE_MAINTENANCE_MARKERS
+                )
+            ]
+            recovered = bool(recovery_points) and not active_lines
+            if not title_marker and (account_ui or recovered):
+                if log is not None:
+                    evidence = "正常的登录状态及账户信息" if account_ui else "维护完成或恢复访问的说明"
+                    log("INFO", f"页面含维护文字“{body_marker}”，但检测到{evidence}，不判定为维护页")
+            else:
+                reason = title_marker or body_marker
     if not reason:
         return None
     message = f"站点错误页面：{reason}"

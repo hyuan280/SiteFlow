@@ -686,6 +686,136 @@ def test_navigation_detects_http_error_and_maintenance_pages() -> None:
     ) is None
 
 
+@pytest.mark.parametrize("announcement", [
+    "公告：今晚关闭维护。",
+    "公告：网站正在维护，稍后开放。",
+    "公告：系统维护中。",
+    "Announcement: under maintenance.",
+    "Announcement: maintenance mode.",
+])
+def test_maintenance_announcement_does_not_override_usable_account_page(announcement):
+    page = _ErrorPage(
+        "音乐乌托邦 :: 首页 - Powered by NexusPHP",
+        "音乐乌托邦 汇聚每一个人的影响力，让音乐流行起来吧！\n"
+        "首  页 论  坛 音 乐 保 种 区 发 布\n"
+        "欢迎回来, fixture-user [退出] [控制面板] [收藏] 魔力值 [使用]: 440\n"
+        + announcement,
+    )
+    logs = []
+    assert asyncio.run(_detect_page_error(page, lambda *args: logs.append(args))) is None
+    assert any(level == "INFO" and "不判定为维护页" in message for level, message in logs)
+    assert not any(level == "WARN" for level, _ in logs)
+
+
+@pytest.mark.parametrize("body", [
+    "此前关闭维护，目前维护完成。",
+    "网站正在维护的公告已过期，维护已经结束。",
+    "正在维护的页面已更新，维护工作已完成。",
+    "系统维护中断后已恢复正常访问。",
+    "关闭维护后已经恢复开放。",
+    "系统维护中\n维护已完成，欢迎访问。",
+    "昨日关闭维护。今日维护已完成。",
+    "Previously under maintenance, maintenance is complete.",
+    "Maintenance mode disabled, the site is back online.",
+])
+def test_maintenance_recovery_notice_is_not_an_outage(body):
+    assert asyncio.run(_detect_page_error(_ErrorPage("站点公告", body))) is None
+
+
+@pytest.mark.parametrize("body", [
+    "网站正在维护，维护尚未完成。",
+    "网站正在维护，维护未完成。",
+    "网站正在维护，没有恢复访问。",
+    "网站正在维护，预计维护完成时间为明天。",
+    "网站正在维护，维护完成后恢复访问。",
+    "网站正在维护，等待维护完成。",
+    "网站正在维护，如果维护完成会另行通知。",
+    "网站正在维护，未维护完成。",
+    "网站正在维护，尚未恢复正常访问。",
+    "Under maintenance, maintenance is not complete.",
+    "Under maintenance, when maintenance is complete we will reopen.",
+    "Under maintenance, maintenance will be complete tomorrow.",
+    "昨日维护完成。今日网站正在维护，请稍后再试。",
+    "昨日维护已完成，但今日网站正在维护，请稍后再试。",
+    "维护已经结束\n网站正在维护，请稍后再试",
+    "Maintenance is complete. The site is under maintenance again.",
+    "首 页 论坛 登录 注册 网站正在维护，请稍后再试。",
+    "欢迎回来，网站正在维护，请稍后再试。",
+])
+def test_active_maintenance_is_not_overridden_by_weak_or_old_recovery_evidence(body):
+    assert asyncio.run(_detect_page_error(_ErrorPage("站点公告", body)))
+
+
+@pytest.mark.parametrize("title,body,reason", [
+    ("网站正在维护", "欢迎回来 [退出] [控制面板] 魔力值 440", "网站正在维护"),
+    ("Under maintenance", "Maintenance is complete", "under maintenance"),
+    ("502 Bad Gateway", "维护完成，已恢复访问", "bad gateway"),
+    ("503 Service Unavailable", "欢迎回来 [退出] [控制面板] 维护完成", "service unavailable"),
+    ("音乐乌托邦 :: 首页", "欢迎回来 [退出] [控制面板] 维护完成 bad gateway", "bad gateway"),
+    ("example.com | 522", "维护完成，已恢复访问", "页面标题显示 example.com | 522"),
+])
+def test_maintenance_recovery_does_not_override_explicit_outage_title_or_hard_error(title, body, reason):
+    assert asyncio.run(_detect_page_error(_ErrorPage(title, body))) == reason
+
+
+@pytest.mark.parametrize("feature_type", ["flow.open", "action.navigate"])
+@pytest.mark.parametrize("same_url", [False, True])
+def test_navigation_maintenance_announcement_does_not_retry_or_disable_cache(
+    navigation_retry_sleep, feature_type, same_url,
+):
+    page = _CachedErrorPage(["音乐乌托邦 :: 首页"], same_url=same_url)
+    page.title_text = "音乐乌托邦 :: 首页"
+    page.text = "欢迎回来, fixture-user [退出] [控制面板] 魔力值: 440\n公告：关闭维护"
+    status, _, data = asyncio.run(_run_step(
+        page, {"feature_type": feature_type, "config": {
+            "url": "https://pt.example.com/", "retry_count": 5,
+        }}, None, None, None, None, None, "general",
+    ))
+    assert status == "success"
+    assert data == {"url": "https://pt.example.com/"}
+    assert page.visits == ([] if same_url else ["https://pt.example.com/"])
+    assert page.commands == []
+    navigation_retry_sleep.assert_not_awaited()
+
+
+def test_real_chromium_distinguishes_maintenance_notice_from_outage():
+    async def run():
+        from playwright.async_api import async_playwright
+
+        candidates = list(Path("/opt/opencode/.cache/ms-playwright").glob(
+            "chromium_headless_shell-*/**/chrome-headless-shell"))
+        candidates += list(Path("/opt/opencode/.cache/ms-playwright").glob(
+            "chromium_headless_shell-*/**/headless_shell"))
+        async with async_playwright() as playwright:
+            try:
+                browser = await playwright.chromium.launch(
+                    executable_path=str(candidates[0]) if candidates else None, headless=True,
+                )
+            except Exception:
+                pytest.skip("Local Chromium executable unavailable")
+            try:
+                page = await browser.new_page()
+                await page.set_content("""<title>音乐乌托邦 :: 首页 - Powered by NexusPHP</title>
+                    <nav>首 页 论 坛 音 乐 发 布</nav>
+                    <header>欢迎回来, fixture-user <a href='/logout.php'>退出</a>
+                        <a href='/usercp.php'>控制面板</a> 魔力值: 440</header>
+                    <article>公告：站点关闭维护</article>""")
+                assert await _detect_page_error(page) is None
+                await page.set_content("""<title>站点公告</title>
+                    <p>昨日网站正在维护。</p><p>目前维护已完成，已恢复正常访问。</p>""")
+                assert await _detect_page_error(page) is None
+                await page.set_content("""<title>音乐乌托邦</title>
+                    <p>网站正在维护，预计维护完成后恢复访问。</p>""")
+                assert await _detect_page_error(page) == "网站正在维护"
+                await page.set_content("""<title>503 Service Unavailable</title>
+                    <p>此前公告：维护已完成，已恢复访问。</p>""")
+                assert await _detect_page_error(page) == "service unavailable"
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
 def test_flow_open_returns_failure_for_error_page() -> None:
     page = _ErrorPage("502 Bad Gateway", "bad gateway")
     status, message, data = asyncio.run(
