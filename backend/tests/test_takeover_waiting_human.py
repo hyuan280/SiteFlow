@@ -69,8 +69,11 @@ def test_waiting_and_mixed_sources_planned_once(ctx, planner, trigger):
 
 @pytest.mark.parametrize("changes", [
     {"trigger": "assistant"}, {"historical": True}, {"cancel": True},
-    {"run_status": "unknown"}, {"run_status": "interrupted"}, {"run_status": "deferred"},
-    {"run_status": "running"}, {"run_status": "canceled"}, {"run_status": "queued"},
+    {"run_status": "unknown", "status": "unknown"},
+    {"run_status": "interrupted", "status": "interrupted"},
+    {"run_status": "deferred", "status": "deferred"},
+    {"run_status": "running"}, {"run_status": "canceled", "cancel": True},
+    {"run_status": "queued"},
     {"status": "deferred"}, {"status": "unknown"}, {"status": "interrupted"},
     {"status": "canceled"}, {"status": "queued"}, {"status": "running"},
 ])
@@ -211,7 +214,7 @@ def test_coordinator_dispatches_waiting_without_resuming_source(ctx, monkeypatch
         assert session_data(ctx[1], sid)["target"]["workflow_consent"] is safe
         messages = ctx[1].detail(OWNER, sid)["messages"]
         prompt = next(message["content"] for message in messages if message["role"] == "user")
-        assert "source status waiting_human" in prompt and "does not resume the source run" in prompt
+        assert "status `waiting_human`" in prompt and "Do not resume the source run" in prompt
 
     install_model(monkeypatch, ctx[1], inspect)
     ctx[0].reconcile()

@@ -170,6 +170,8 @@ def register_run_notification(db, settings, crypto, run_id):
 
 def register_investigation_notification(db, settings, crypto, action_id):
     """Register a separate notice only after a valid terminal investigation."""
+    from app.services.assistant_takeover import DIAGNOSTIC_RUN_STATUSES, DIAGNOSTIC_STATUSES
+
     existing = db.get(AssistantTakeoverNotice, action_id)
     if existing is not None:
         return existing
@@ -181,8 +183,8 @@ def register_investigation_notification(db, settings, crypto, action_id):
     site = db.get(Site, action.site_id)
     if (run is None or job is None or job.run_id != action.source_run_id
             or job.site_id != action.site_id
-            or job.status not in {"fail", "error", "waiting_human"}
-            or run.status not in {"fail", "error", "waiting_human"}):
+            or job.status not in DIAGNOSTIC_STATUSES
+            or run.status not in DIAGNOSTIC_RUN_STATUSES):
         return None
     if site is not None and site.history_key != action.site_history_key:
         site = None

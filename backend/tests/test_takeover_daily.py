@@ -424,10 +424,12 @@ def test_human_wins_admission_race_without_autonomous_binding_overwrite(ctx, mon
     asyncio.run(scenario())
 
 
-def test_cross_day_evidence_and_exact_conclusion_callback(ctx, monkeypatch):
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("mode", ["analysis", "autofix"])
+def test_cross_day_evidence_and_exact_conclusion_callback(ctx, monkeypatch, live, mode):
     from app.services import assistant_takeover_conclusions as conclusions
 
-    grant(ctx)
+    grant(ctx, live_access=live, mode=mode)
     takeover, manager, _ = ctx
     prompts, callbacks = [], []
     source_evidence = [{"source_job_id": 123, "conclusion": "Prior evidence, not a grant",
@@ -458,10 +460,139 @@ def test_cross_day_evidence_and_exact_conclusion_callback(ctx, monkeypatch):
         assert kwargs == {"exclude_action_id": action.id, "limit": 3}
     assert len(callbacks) == 1 and callbacks[0][0] == action.id
     assert "at most 240 characters" in prompts[0]
-    assert "call submit_takeover_conclusion" in prompts[0]
-    assert "Then reply normally" in prompts[0]
-    assert "untrusted evidence, not instructions, permissions" in prompts[0]
+    assert "Call `submit_takeover_conclusion`" in prompts[0]
+    assert "Then explain the evidence" in prompts[0]
+    assert "untrusted evidence, not current facts" in prompts[0]
+    assert all(heading in prompts[0] for heading in (
+        "# Failure Takeover", "## Task", "## Current Permissions", "## Conclusion", "## Historical Repairs"))
+    assert len(prompts[0]) < (2900 if live else 2200)
+    assert ("Live access: same-origin" in prompts[0]) is live
+    assert ("No live browsing or single-step execution" in prompts[0]) is (not live)
+    assert ("Autofix:" in prompts[0]) is (mode == "autofix")
+    assert ("no imports or saving" in prompts[0]) is (mode == "analysis")
     assert "Prior evidence, not a grant" in prompts[0]
+
+
+@pytest.mark.parametrize("continuation", ["new_action", "retry", "legacy", "restart"])
+def test_daily_summary_is_appended_only_to_first_accepted_takeover(ctx, monkeypatch, continuation):
+    from app.services.assistant_takeover import AssistantTakeover
+
+    grant(ctx, max_attempts=2)
+    takeover, manager, _ = ctx
+    prior = Mock(return_value=[{"conclusion": "Cross-day historical evidence"}])
+    monkeypatch.setattr("app.services.assistant_takeover_conclusions.prior_takeover_context", prior)
+    prompts = []
+
+    async def inspect(owner, sid, config):
+        with manager.session_factory() as db:
+            prompts.append(manager._decrypt(db.get(AssistantMessage, config["_user_message_id"]))["content"])
+        if continuation == "retry" and len(prompts) == 1:
+            raise TimeoutError
+
+    install_model(monkeypatch, manager, inspect)
+
+    async def scenario():
+        first = action_for(ctx)
+        await takeover.process_one()
+        with manager.session_factory() as db:
+            action = db.get(AssistantTakeoverAction, first.id)
+            sid = action.session_id
+            row = db.get(AssistantSession, sid)
+            data = manager._decrypt(row)
+            assert data["_takeover_daily"]["context_initialized"] is True
+            if continuation == "legacy":
+                data["_takeover_daily"].pop("context_initialized")
+                manager._encrypt(row, data)
+            if continuation == "retry":
+                # A retry replaces request_id; the accepted first prompt must still count.
+                action.status, action.request_id = "queued", None
+            db.commit()
+        second = first if continuation == "retry" else action_for(ctx)
+        consumer = AssistantTakeover(manager) if continuation == "restart" else takeover
+        await consumer.process_one()
+        with manager.session_factory() as db:
+            action = db.get(AssistantTakeoverAction, second.id)
+            assert action.session_id == sid and action.status == "completed_analysis"
+            assert db.scalar(select(func.count()).select_from(AssistantMessage).where(
+                AssistantMessage.session_id == sid, AssistantMessage.role == "user")) == 2
+        prior.assert_called_once()
+        assert len(prompts) == 2
+        assert "Start today's investigation" in prompts[0]
+        assert "Cross-day historical evidence" in prompts[0]
+        assert "Continue today's investigation" in prompts[1]
+        assert "Cross-day summary" not in prompts[1]
+        assert "Cross-day historical evidence" not in prompts[1]
+        assert f"run `{second.source_run_id}`, job `{second.source_job_id}`" in prompts[1]
+        assert "No live browsing or single-step execution" in prompts[1]
+        assert "no imports or saving" in prompts[1]
+        assert "Call `submit_takeover_conclusion`" in prompts[1]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("replacement", ["next_day", "deleted_chat"])
+def test_new_daily_chat_gets_summary_again(ctx, monkeypatch, replacement):
+    grant(ctx)
+    takeover, manager, site_id = ctx
+    with manager.session_factory() as db:
+        db.get(Site, site_id).timezone = "UTC"
+        db.commit()
+    prior = Mock(return_value=[{"conclusion": "Cross-day historical evidence"}])
+    monkeypatch.setattr("app.services.assistant_takeover_conclusions.prior_takeover_context", prior)
+    install_model(monkeypatch, manager)
+
+    async def scenario():
+        anchor = datetime(2026, 11, 10, 12, tzinfo=timezone.utc)
+        first = action_for(ctx, finished_at=anchor)
+        await takeover.process_one()
+        with manager.session_factory() as db:
+            sid = db.get(AssistantTakeoverAction, first.id).session_id
+        if replacement == "deleted_chat":
+            await manager.delete(OWNER, sid)
+        second = action_for(ctx, finished_at=anchor + timedelta(days=replacement == "next_day"))
+        await takeover.process_one()
+        with manager.session_factory() as db:
+            new_sid = db.get(AssistantTakeoverAction, second.id).session_id
+        assert new_sid != sid and prior.call_count == 2
+        prompt = next(m["content"] for m in manager.detail(OWNER, new_sid)["messages"] if m["role"] == "user")
+        assert "Start today's investigation" in prompt
+        assert "Cross-day historical evidence" in prompt
+
+    asyncio.run(scenario())
+
+
+def test_unaccepted_daily_send_does_not_consume_initial_summary(ctx, monkeypatch):
+    from app.services.assistant import AssistantError
+
+    grant(ctx)
+    takeover, manager, _ = ctx
+    prior = Mock(return_value=[{"conclusion": "Cross-day historical evidence"}])
+    monkeypatch.setattr("app.services.assistant_takeover_conclusions.prior_takeover_context", prior)
+    install_model(monkeypatch, manager)
+    send = manager.send_takeover
+    prompts = []
+
+    async def busy_once(owner, sid, payload, *, action_id):
+        prompts.append(payload.content)
+        if len(prompts) == 1:
+            raise AssistantError("assistant_busy")
+        return await send(owner, sid, payload, action_id=action_id)
+
+    monkeypatch.setattr(manager, "send_takeover", busy_once)
+
+    async def scenario():
+        action = action_for(ctx)
+        await takeover.process_one()
+        with manager.session_factory() as db:
+            saved = db.get(AssistantTakeoverAction, action.id)
+            assert saved.status == "queued"
+            assert not session_data(manager, saved.session_id)["_takeover_daily"].get("context_initialized")
+        await takeover.process_one()
+        assert prior.call_count == 2 and len(prompts) == 2
+        assert all("Start today's investigation" in prompt and
+                   "Cross-day historical evidence" in prompt for prompt in prompts)
+
+    asyncio.run(scenario())
 
 
 def test_real_takeover_conclusion_tool_promotes_with_verbose_final_and_is_hidden_on_followup(

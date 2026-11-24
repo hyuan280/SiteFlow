@@ -116,6 +116,32 @@ def test_all_jobs_planned_and_sent_before_fresh_analysis(ctx, deliveries, monkey
     assert len(deliveries) == 2
 
 
+def test_scheduled_mixed_deferred_batch_notifies_failed_job_takeover(ctx, deliveries):
+    grant(ctx)
+    _, manager, _ = ctx
+    job_id, run_id = failed_job(ctx, trigger="schedule", other_status="deferred")
+    with manager.session_factory() as db:
+        db.get(Run, run_id).status = "running"
+        job = db.get(SiteJob, job_id)
+        job.site_name = "天雪"
+        job.message = "登录成功元素未出现"
+        db.commit()
+    manager.executor._finalize_run(run_id)
+    planned = actions(ctx, run_id)
+    assert len(planned) == 1 and planned[0].source_job_id == job_id
+    manager.executor.notification_dispatch.dispatch_pending()
+    assert len(deliveries) == 2
+    event = deliveries[1][3]
+    assert event["status"] == "deferred"
+    assert event["sites"][0]["message"] == "助手复查中，结果稍后发出。原任务结果：登录成功元素未出现"
+    assert "天雪：失败" in deliveries[0][2]["body"]
+    assert "助手复查中" in deliveries[0][2]["body"]
+    assert "助手复查中" not in event["sites"][1]["message"]
+    with manager.session_factory() as db:
+        assert db.get(Run, run_id).status == "deferred"
+        assert db.get(SiteJob, job_id).message == "登录成功元素未出现"
+
+
 @pytest.mark.parametrize("status", ["queued", "dispatched"])
 def test_fresh_actions_never_delay_or_rewrite_task_notification(ctx, deliveries, status):
     grant(ctx)
@@ -555,7 +581,9 @@ def notice(context):
 
 
 @pytest.mark.parametrize("updated", [False, True])
-@pytest.mark.parametrize("source_status", ["fail", "waiting_human"])
+@pytest.mark.parametrize("source_status", [
+    "success", "fail", "error", "waiting_human", "deferred", "unknown", "interrupted", "canceled",
+])
 @pytest.mark.parametrize("fault", [None, "registration", "missing_notice", "wake"])
 def test_complete_atomically_queues_distinct_investigation_once(
     context, investigation_deliveries, monkeypatch, updated, source_status, fault,
@@ -573,8 +601,15 @@ def test_complete_atomically_queues_distinct_investigation_once(
         run_id, job_id = action.source_run_id, action.source_job_id
         action.status = "dispatched"
         run, job = db.get(Run, run_id), db.get(SiteJob, job_id)
-        run.status = job.status = source_status
-        run.summary_json = json.dumps({source_status: 1})
+        run.status = source_status
+        job_status = "waiting_human" if source_status == "waiting_human" else "fail"
+        job.status = job_status
+        counts = {job_status: 1}
+        if source_status == "deferred":
+            counts["deferred"] = 1
+            db.add(SiteJob(run_id=run_id, site_name="Deferred sibling", lane="general",
+                           status="deferred", finished_at=datetime.now(timezone.utc)))
+        run.summary_json = json.dumps(counts)
         manager._message(db, sid, "assistant", GOOD, reasoning_content="private raw reasoning")
         conversation = db.get(AssistantSession, sid)
         data = manager._decrypt(conversation)
@@ -637,13 +672,14 @@ def test_complete_atomically_queues_distinct_investigation_once(
     assert email[2]["title"] == f"[SiteFlow] 助手调查结果 #{run_id}"
     assert ("已更新配置但未重新验证" if updated else "仅调查") in email[2]["body"]
     assert f"站点任务 #{job_id}" in email[2]["body"]
-    assert source_status in email[2]["body"] and "private raw reasoning" not in email[2]["body"]
+    assert job_status in email[2]["body"] and "private raw reasoning" not in email[2]["body"]
     assert http[3]["event"] == "assistant.investigation"
-    assert http[3]["job_status"] == http[3]["run_status"] == source_status
+    assert http[3]["job_status"] == job_status
+    assert http[3]["run_status"] == source_status
     with manager.session_factory() as db:
         assert db.get(Run, run_id).status == source_status
-        assert json.loads(db.get(Run, run_id).summary_json) == {source_status: 1}
-        assert db.get(SiteJob, job_id).status == source_status
+        assert json.loads(db.get(Run, run_id).summary_json) == counts
+        assert db.get(SiteJob, job_id).status == job_status
         assert db.get(SiteJob, job_id).message == "Original failure"
     row = notice(context)
     assert row.state == "completed"

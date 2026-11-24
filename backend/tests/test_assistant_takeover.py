@@ -188,15 +188,46 @@ def test_settings_reject_coercion_and_extra_authority(changes):
     ({"status": "waiting_human"}, True), ({"status": "deferred"}, False),
     ({"status": "waiting_human", "run_status": "waiting_human"}, True),
     ({"run_status": "waiting_human"}, True),
+    ({"run_status": "deferred"}, True),
+    ({"status": "waiting_human", "run_status": "deferred"}, True),
+    ({"status": "deferred", "run_status": "deferred"}, False),
     ({"status": "interrupted"}, False), ({"run_status": "running"}, False),
     ({"uncertain": True}, True), ({"other_status": "unknown"}, True),
     ({"other_status": "interrupted"}, True), ({"other_status": "success"}, True),
-    ({"run_status": "unknown"}, False), ({"run_status": "interrupted"}, False),
+    ({"run_status": "unknown"}, True), ({"run_status": "interrupted"}, True),
+    ({"run_status": "success"}, True), ({"run_status": "canceled"}, True),
 ])
 def test_reconciliation_status_matrix_and_no_historical_backfill(ctx, changes, expected):
     grant(ctx)
     failed_job(ctx, **changes)
     assert bool(queued(ctx)) is expected
+
+
+@pytest.mark.parametrize("run_status", [
+    "success", "fail", "error", "waiting_human", "deferred", "unknown", "interrupted", "canceled",
+])
+def test_finished_batch_allows_failed_job_claim_and_bound_diagnostics(ctx, run_status):
+    grant(ctx)
+    job_id, run_id = failed_job(ctx, trigger="schedule", run_status=run_status,
+                                other_status="deferred")
+    tools, action_id = tools_for(ctx)
+    manager = tools.manager
+    with manager.session_factory() as db:
+        action = db.get(AssistantTakeoverAction, action_id)
+        action.status = "queued"
+        db.get(AssistantSession, tools.session_id).status = "idle"
+        db.commit()
+    claimed = ctx[0]._claim(action_id, tools.session_id, False)
+    assert claimed is not None and claimed[3] == run_id and claimed[5] == job_id
+    with manager.session_factory() as db:
+        action = db.get(AssistantTakeoverAction, action_id)
+        row = db.get(AssistantSession, tools.session_id)
+        activate_takeover(manager, db, row, action_id, action.request_id)
+        tools.turn.update(_takeover_request_id=action.request_id, _request_id=action.request_id)
+        db.commit()
+    assert takeover_tool_allowed(tools, "get_run_results", {"run_id": run_id}) is True
+    assert takeover_tool_allowed(tools, "run_site", {}) == {
+        "ok": False, "code": "takeover_tool_denied"}
 
 
 def test_snapshot_encrypted_last_attempt_and_dedup_survives_chat_delete(ctx):

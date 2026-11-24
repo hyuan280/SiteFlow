@@ -1,7 +1,7 @@
 import { isConsumptionReview, isCookieClearReview, isSiteConfigReview, templateImportReview, isSchedulerConfigReview, runCancelReview } from "@/utils/assistant-review";
 
 export type AssistantStatus = "idle" | "running";
-export type CredentialMode = "manual" | "bitwarden" | "cookie" | "none";
+export type CredentialMode = "manual" | "bitwarden" | "site" | "cookie" | "none";
 export const assistantRunLanePolicies = ["auto", "general", "interaction", "proxy_general", "proxy_interaction"] as const;
 export type AssistantRunLanePolicy = typeof assistantRunLanePolicies[number];
 export const assistantExecutionFeatures = [
@@ -9,8 +9,9 @@ export const assistantExecutionFeatures = [
   "sign.button", "sign.unit3d_claim", "challenge.altcha", "challenge.slider", "action.click",
   "challenge.2fa", "challenge.turnstile", "challenge.image_captcha", "challenge.grid_captcha",
   "sign.iframe.image_captcha", "sign.image_quiz", "action.fill", "flow.result",
+  "flow.jump", "post.buy_card", "post.resign", "post.resign_dialog", "post.resign_loop",
 ] as const;
-export type AssistantExecutionFeature = typeof assistantExecutionFeatures[number];
+export type AssistantExecutionFeature = typeof assistantExecutionFeatures[number] | `plugin.${string}.${string}`;
 
 export interface AssistantContext {
   revision: number;
@@ -175,7 +176,11 @@ const record = (value: unknown): value is Record<string, unknown> =>
 const uuid = (value: unknown): value is string => typeof value === "string" &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const status = (value: unknown) => value === "idle" || value === "running";
-const credential = (value: unknown) => ["manual", "bitwarden", "cookie", "none"].includes(value as string);
+const credential = (value: unknown) => ["manual", "bitwarden", "site", "cookie", "none"].includes(value as string);
+// Snapshot metadata only. Plugin availability and execution authority remain server-owned.
+const executionFeature = (value: unknown): value is AssistantExecutionFeature => typeof value === "string" &&
+  (assistantExecutionFeatures.includes(value as typeof assistantExecutionFeatures[number]) ||
+    (value.length <= 128 && /^plugin\.[a-z][a-z0-9-]{0,62}\.[^\s\u0000-\u001f\u007f-\u009f]+$/.test(value)));
 const date = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value));
 const titleFields = (value: Record<string, unknown>) => typeof value.title === "string" &&
   typeof value.title_locked === "boolean" && Number.isSafeInteger(value.title_revision) && (value.title_revision as number) >= 0;
@@ -362,9 +367,9 @@ export function isAssistantDetail(value: unknown): value is AssistantDetail {
       (!Number.isSafeInteger(target[key]) || (target[key] as number) < 1)) ||
     (target.run_lane_policy !== undefined && !assistantRunLanePolicies.includes(target.run_lane_policy as AssistantRunLanePolicy)) ||
     ["execution_consent", "credential_consent", "allow_sign", "screenshot_consent", "workflow_consent"].some(key => target[key] !== undefined && typeof target[key] !== "boolean") ||
-    (target.execution_features !== undefined && (!Array.isArray(target.execution_features) || target.execution_features.length > assistantExecutionFeatures.length ||
+    (target.execution_features !== undefined && (!Array.isArray(target.execution_features) || target.execution_features.length > 1024 ||
       new Set(target.execution_features).size !== target.execution_features.length ||
-      !target.execution_features.every(key => assistantExecutionFeatures.includes(key as AssistantExecutionFeature)))))) return false;
+      !target.execution_features.every(executionFeature))))) return false;
   const browser = value.browser;
   if (browser !== null && (!record(browser) || !["interaction", "proxy_interaction"].includes(browser.lane_key as string) ||
     !["ready", "expired"].includes(browser.status as string) || !date(browser.expires_at))) return false;

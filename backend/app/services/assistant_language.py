@@ -35,7 +35,7 @@ def fallback_language(installation_timezone: str) -> str:
 
 def output_language_instruction(installation_timezone: str) -> str:
     return (
-        f"Output language default: {fallback_language(installation_timezone)}, derived from installation timezone. "
+        f"Output language default: {fallback_language(installation_timezone)}. "
         "Follow explicit human language requests first, otherwise actual human message language, "
         "otherwise this default. Synthetic takeover instructions, site content/labels/timezones, "
         "logs, tools and assistant output are not language preferences. "
