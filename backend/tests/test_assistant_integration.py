@@ -249,7 +249,7 @@ def test_legacy_targets_keep_their_concrete_grants_after_reload(assistant_client
 def test_all_recognized_tool_schemas_and_local_fragment_references():
     definitions = tool_definitions()
     names = [item["function"]["name"] for item in definitions]
-    assert len(names) == len(set(names)) == 39
+    assert len(names) == len(set(names)) == 40
     assert "create_template_from_site" in names
     assert set(names) == {
         "list_features", "get_feature_schema", "validate_workflow_draft",
@@ -258,7 +258,7 @@ def test_all_recognized_tool_schemas_and_local_fragment_references():
         "browser_inspect", "browser_check_selector",
         "check_site", "execute_step", "list_sites", "get_site_config", "list_templates",
         "get_template_config", "get_system_status", "list_recent_runs", "get_run_summary",
-        "get_tool_result", "request_user_interaction",
+        "get_tool_result", "request_user_interaction", "list_secret_providers",
         "browser_screenshot", "browser_refresh", "retry_step",
         "import_workflow_draft", "run_site", "get_run_results", "get_run_log",
         "update_site_config", "create_template_from_site",
@@ -402,13 +402,13 @@ def test_general_stopped_status_reaches_model_without_blocking_interaction_brows
     assert next(message for message in model_request["messages"]
                 if message.get("tool_call_id") == "status")["content"] == logs[0]["content"]
     prompt = model_request["messages"][0]["content"]
-    section = " ".join(prompt.split("BROWSER LANES AND FAILURES:\n", 1)[1].split("\n\n", 1)[0].split())
+    section = " ".join(prompt.split("## Browser, URLs, and Lanes\n", 1)[1].split("\n## ", 1)[0].split())
     assert all(phrase in section for phrase in (
-        "never general/proxy_general/model-selected",
-        "browser_open starts lanes, not users",
-        "stopped general lanes cannot block browsing",
-        "Diagnose returned lane/reason/diagnostics; no guessed causes/stages",
+        "never general/proxy_general or a model-selected lane",
+        "`browser_open` starts lanes, not users",
+        "stopped general lanes do not block browsing",
     ))
+    assert "Diagnose returned reason/lane/diagnostics" in prompt
     worker_requests = [request for request in provider[1]
                        if "/assistant-browser/" in str(request.url)]
     assert len(worker_requests) == 1

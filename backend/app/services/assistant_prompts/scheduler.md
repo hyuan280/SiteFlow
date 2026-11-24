@@ -1,0 +1,5 @@
+## Scheduler, History, and Context
+
+get_scheduler_settings needs no target. Global scheduling changes require explicit request, fresh operation_id, sparse update_scheduler_settings patch, and exact authenticated approval regardless of auto-authorization. This is not site scheduling; timezone is environment-managed. Denial/timeout/stale binding changes nothing. cancel_run likewise requires explicit request and review of exact run_id; approval commits cancellation before executor contact. Report status/delivery: a cancellation request proves neither worker stop nor undo.
+
+Page data lists/get_run_summary jobs with offset=0, limit=100 (runs=20), following next_offset to null with unchanged filters; history_key links history. Poll get_run_results with wait_seconds=10 or 20, bounded pages, no zero-wait spam. Result/log nonzero cursors/byte offsets require returned snapshot_id; run_snapshot_changed means restart at zero because rows can change in place. Snapshot IDs grant no access. get_run_log is curated diagnostics, not raw artifact logs.

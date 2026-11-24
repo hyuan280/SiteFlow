@@ -28,7 +28,7 @@ from app.services.assistant_images import (
     IMAGE_NOTICE, artifact_provenance, image_message, omit_images,
     revoke_browser_images, text_projection, validate_image,
 )
-from app.services.assistant_prompt import SYSTEM_PROMPT, tool_definitions
+from app.services.assistant_prompt import SYSTEM_PROMPT, build_system_prompt, tool_definitions
 from app.services.assistant_settings import AssistantSettingsService
 from app.services.assistant_snapshot import safe_selector_result
 from app.services.assistant_titles import generate_title
@@ -1507,7 +1507,7 @@ class AssistantManager:
         return target, (self._fit_context(messages, references, protected_users=users,
                                          safety_note=safety_note) if auto_compact else messages)
 
-    async def _prepare_context(self, owner, session_id, config):
+    async def _prepare_context(self, owner, session_id, config, definitions=None):
         from app.services.assistant_tokens import estimate_context_tokens
         from app.services.assistant_usage import pending_context_usage
 
@@ -1518,7 +1518,58 @@ class AssistantManager:
         (target, head, records, summary, revision,
          protected_users, safety) = self._context_history(
             owner, session_id, auto_compact=auto_compact, references=references)
-        definitions = tool_definitions()
+        if definitions is None:
+            from app.services.assistant_takeover import takeover_tool_definitions
+
+            definitions = takeover_tool_definitions(self, owner, session_id, tool_definitions())
+        with self.session_factory() as db:
+            data = self._decrypt(self._owned(db, owner, session_id))
+        takeover = bool(
+            (self._active_turns.get(session_id) or {}).get("_takeover_action_id")
+            or config.get("_takeover_action_id") or "_takeover" in data
+        )
+        from app.services.assistant_language import output_language_instruction
+
+        names = {item["function"]["name"] for item in definitions}
+        head[0] = {"role": "system", "content": build_system_prompt(
+            takeover=takeover, tool_names=names,
+        ) + "\n\n" + output_language_instruction(self.settings.scheduler_timezone) + "\n\n" + URL_NOTICE}
+        head[0]["content"] += (
+            "\n\nCurrent host-enforced turn budgets (override static prompt budget examples only): "
+            f"max_parallel_tool_calls={values.get('max_parallel_tool_calls', 4)}, "
+            f"max_tool_calls={values.get('max_tool_calls', 20)}, "
+            f"max_model_rounds={values.get('max_model_rounds', 12)}, "
+            f"max_auth_uses_per_turn={values.get('max_auth_uses_per_turn', 3)}. "
+            "Tool calls in a response are dispatched sequentially. These limits do not grant target consent."
+        )
+        if takeover and "browser_open" in names:
+            head[0]["content"] += (
+                "\n\nCurrent host takeover scope overrides the static FAILURE TAKEOVER live-tool restriction: "
+                "the user explicitly granted same-origin browsing, observations, screenshots (vision models "
+                "only), and the supported single-step features including login, challenge and sign/click. "
+                "Analysis means no saving, NOT no live execution. Disclose that live actions may change the "
+                "site. Use only the bound site's interaction lane/proxy policy without fallback. No arbitrary "
+                "POST tools, workflow full runs, retry_step, permission popups, global/site-settings or template "
+                "mutation are authorized unattended. Autofix may import the exact validated proposal once "
+                "only when that tool is available; configuration-write uncertainty guards still apply. "
+                "Historical uncertainty does not block supported non-post execute_step calls under current "
+                "category consent, but does not grant retry_step permission. Only builtin Feature.category "
+                "is trusted. Auth login/password attempts and retries share the host per-user-turn cap, "
+                "reserved before credentials with failures charged; challenge.2fa is challenge, not auth, "
+                "and keeps OTP private. Permission does not prove no website side effects. Persisted "
+                "site permissions are inherited by subsequent ordinary human turns, not this autonomous "
+                "tool restriction. Report only evidenced actions and results."
+            )
+        elif target and target.get("_takeover_site_grant") and not takeover:
+            head[0]["content"] += (
+                "\n\nThis is an ordinary human follow-up, not an autonomous takeover turn. The user's "
+                "explicit persisted site permissions remain in the host-confirmed target, independent "
+                "of global auto-authorization defaults and whether future takeover is enabled. Do not "
+                "ask to reauthorize browsing, supported steps, credentials or screenshots already granted. "
+                "Workflow import/run authority is exactly workflow_consent in that target; normal fresh "
+                "consumption approval and category-based auth limits still apply. Do not broaden the URL, trusted "
+                "origins or other permissions without ordinary explicit user authorization."
+            )
         if estimate_context_tokens(head + protected_users, definitions) > cap:
             raise GenerationError("context_limit")
         with self.session_factory() as db:
@@ -1895,49 +1946,15 @@ class AssistantManager:
         max_calls = values.get("max_parallel_tool_calls", 4)
         tool_limit = values.get("max_tool_calls", 20)
         round_limit = values.get("max_model_rounds", 12)
-        (target, messages, protected_users,
-         safety_note, revision, references) = await self._prepare_context(owner, session_id, config)
-        messages[0] = {**messages[0], "content": messages[0]["content"] + (
-            "\n\nCurrent host-enforced turn budgets (override static prompt budget examples only): "
-            f"max_parallel_tool_calls={max_calls}, max_tool_calls={tool_limit}, "
-            f"max_model_rounds={round_limit}, max_auth_uses_per_turn={values.get('max_auth_uses_per_turn', 3)}. "
-            "Tool calls in a response are dispatched sequentially. These limits do not grant target consent."
-        )}
-        tools = AssistantTools(self, owner, session_id, target, config=config,
-                               turn=self._active_turns.get(session_id))
-        definitions = tool_definitions()
         from app.services.assistant_takeover import takeover_tool_definitions
 
-        definitions = takeover_tool_definitions(self, owner, session_id, definitions)
+        definitions = takeover_tool_definitions(self, owner, session_id, tool_definitions())
+        (target, messages, protected_users,
+         safety_note, revision, references) = await self._prepare_context(
+             owner, session_id, config, definitions)
+        tools = AssistantTools(self, owner, session_id, target, config=config,
+                               turn=self._active_turns.get(session_id))
         names = {item["function"]["name"] for item in definitions}
-        if config.get("_takeover_action_id") and "browser_open" in names:
-            messages[0] = {**messages[0], "content": messages[0]["content"] + (
-                "\n\nCurrent host takeover scope overrides the static FAILURE TAKEOVER live-tool restriction: "
-                "the user explicitly granted same-origin browsing, observations, screenshots (vision models "
-                "only), and the supported single-step features including login, challenge and sign/click. "
-                "Analysis means no saving, NOT no live execution. Disclose that live actions may change the "
-                "site. Use only the bound site's interaction lane/proxy policy without fallback. No arbitrary "
-                "POST tools, workflow full runs, retry_step, permission popups, global/site-settings or template "
-                "mutation are authorized unattended. Autofix may import the exact validated proposal once "
-                "only when that tool is available; configuration-write uncertainty guards still apply. "
-                "Historical uncertainty does not block supported non-post execute_step calls under current "
-                "category consent, but does not grant retry_step permission. Only builtin Feature.category "
-                "is trusted. Auth login/password attempts and retries share the host per-user-turn cap, "
-                "reserved before credentials with failures charged; challenge.2fa is challenge, not auth, "
-                "and keeps OTP private. Permission does not prove no website side effects. Persisted "
-                "site permissions are inherited by subsequent ordinary human turns, not this autonomous "
-                "tool restriction. Report only evidenced actions and results."
-            )}
-        elif target and target.get("_takeover_site_grant") and not config.get("_takeover_action_id"):
-            messages[0] = {**messages[0], "content": messages[0]["content"] + (
-                "\n\nThis is an ordinary human follow-up, not an autonomous takeover turn. The user's "
-                "explicit persisted site permissions remain in the host-confirmed target, independent "
-                "of global auto-authorization defaults and whether future takeover is enabled. Do not "
-                "ask to reauthorize browsing, supported steps, credentials or screenshots already granted. "
-                "Workflow import/run authority is exactly workflow_consent in that target; normal fresh "
-                "consumption approval and category-based auth limits still apply. Do not broaden the URL, trusted "
-                "origins or other permissions without ordinary explicit user authorization."
-            )}
         key = config["api_key"]
         seen = set()
         count = 0

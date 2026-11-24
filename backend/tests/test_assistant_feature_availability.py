@@ -143,7 +143,7 @@ def test_secret_fill_defaults_are_not_exported_or_materialized(tools, client):
 
 def test_prompt_distinguishes_authoring_captcha_tests_and_consumption_approval():
     prompt = " ".join(SYSTEM_PROMPT.split())
-    assert "All 23 reviewed built-ins" in SYSTEM_PROMPT
+    assert "Reviewed built-ins and explicitly allowed plugin features support authoring and authorized tests" in prompt
     assert "explicitly allowed plugin features" in SYSTEM_PROMPT
     assert "post features require explicit standing policy" in SYSTEM_PROMPT
     assert "flow.result returns its configured boolean" in SYSTEM_PROMPT
@@ -152,7 +152,7 @@ def test_prompt_distinguishes_authoring_captcha_tests_and_consumption_approval()
     assert "Form input values remain omitted from all DOM/selector evidence" in prompt
     assert "fresh dialog for EACH enabled post step" in prompt
     assert "All step dialogs must be approved before the full workflow starts" in prompt
-    assert "There is no popup for each date or internal click" in prompt
+    assert "there is no popup for each date or internal click" in prompt.lower()
     assert "Legacy post.resign has full support" in SYSTEM_PROMPT
     assert "not a claim that every physical click's business effects can be detected or blocked" in prompt
     assert "password, cookie, token or OTP substitutes" in SYSTEM_PROMPT
@@ -201,7 +201,8 @@ def test_category_policy_prompt_and_protected_context_preserve_scope_and_provena
                      "failures", "challenge.2fa", "OTP", "without a human dialog",
                      "internal click", "autonomous takeover"):
             assert text.lower() in policy.lower(), text
-        assert "per-post-step" in policy or "per-step" in policy
+        assert ("per-post-step" in policy or "per-step" in policy
+                or "fresh dialog for EACH enabled post step" in policy)
     assert json.dumps(facts, ensure_ascii=False, separators=(",", ":")) in note
     assert "provenance, not current" in _SUMMARY_PROMPT
     assert "Analysis cannot save or import configuration" in SYSTEM_PROMPT

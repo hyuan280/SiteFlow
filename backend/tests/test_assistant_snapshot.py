@@ -488,5 +488,9 @@ def test_tool_schemas_and_prompt_explain_capture_limits():
         assert definitions[name]["parameters"]["additionalProperties"] is False
         assert "token" not in definitions[name]["parameters"]["properties"]
     assert set(definitions["browser_inspect"]["parameters"]["required"]) == {"snapshot_id", "node_id", "title"}
-    for phrase in ("visible=false", "parent_id", "captured_subtree", "next_offset", "not a subtree-targeted", "screenshots"):
-        assert phrase in SYSTEM_PROMPT
+    section = SYSTEM_PROMPT.split("## DOM and Image Evidence\n", 1)[1].split("\n## ", 1)[0]
+    for phrase in ("visible=false", "parent_id", "snapshot_id/frame_id", "captured_subtree",
+                   "next_offset", "not a subtree-targeted or unlimited scan", "Screenshots",
+                   "never live nodes", "capture scan/depth/byte caps",
+                   "Form input values remain omitted", "fully masks other frames"):
+        assert phrase in section

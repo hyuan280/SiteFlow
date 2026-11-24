@@ -53,7 +53,7 @@ def dispatch_context(client):
 def test_retrieval_protocol_schema_and_no_replay_prompt():
     definitions = tool_definitions()
     names = [item["function"]["name"] for item in definitions]
-    assert len(names) == len(set(names)) == 39
+    assert len(names) == len(set(names)) == 40
     for definition in definitions:
         assert definition["type"] == "function"
         Draft202012Validator.check_schema(definition["function"]["parameters"])
@@ -80,7 +80,7 @@ def test_retrieval_protocol_schema_and_no_replay_prompt():
         assert not validator.is_valid({"title": "Read", **args})
     assert "character page" in definition["description"]
     assert "no browser action or replay" in definition["description"]
-    section = SYSTEM_PROMPT.split("CONTEXT ECONOMY:\n", 1)[1].split("\n\n", 1)[0]
+    section = SYSTEM_PROMPT.split("## Scheduler, History, and Context\n", 1)[1].split("\n## ", 1)[0]
     assert "get_tool_result(message_id, offset, limit)" in section
     assert "without rerunning it" in section
     assert "character page of the original JSON" in section

@@ -633,7 +633,7 @@ def test_real_takeover_conclusion_tool_promotes_with_verbose_final_and_is_hidden
         await manager.tasks[sid]
         followups = [json.loads(request.content) for request in provider[1][before:]]
         assert followups
-        assert all(len(request["tools"]) == 38 and "submit_takeover_conclusion" not in {
+        assert all(len(request["tools"]) == 39 and "submit_takeover_conclusion" not in {
             entry["function"]["name"] for entry in request["tools"]} for request in followups)
 
     asyncio.run(scenario())

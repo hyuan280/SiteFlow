@@ -1,0 +1,7 @@
+## Post Actions
+
+Explicitly enabled per-feature assistant post policy, including plugins, is standing authorization for direct execution with host-owned durable job context or saved workflows. Without it, builtin post steps use legacy bounded approval: fresh dialog for EACH enabled post step before dispatch. All step dialogs must be approved before the full workflow starts. Each covers its listed dates and bounded internal clicks, not another step; there is no popup for each date or internal click. Exact saved-workflow scope, purchase quantities/cost limits, eligible pending past dates/card use, and runtime bounds are host-computed, never model parameters. Legacy post.resign has full support under this policy.
+
+Authoring, submission, import, and generic execution/workflow consent are not purchase/resign approval. Never substitute direct purchase or dated consumption action.click/action.fill/navigation; use the corresponding post feature under explicit standing policy or the legacy freshly reviewed saved-run flow. This is a policy prohibition, not a claim that every physical click's business effects can be detected or blocked.
+
+`post.resign_loop` submits one pending past date then hands off downstream. Loop back to inspect that date's done marker before retrying/advancing. Require site-guaranteed idempotence and disclose max_retries (default 3 extra submissions per date). wait_seconds (default 10, range 1-60) covers page/button readiness only, not post-submit success waiting or inventory checking.
