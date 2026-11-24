@@ -17,6 +17,7 @@ from app.models.assistant_workflow import AssistantWorkflowAction
 from app.models.execution import JobStep, Run, SiteJob
 from app.models.workflow import Site
 from app.services.assistant_execution import AssistantExecution, SUPPORTED_FEATURES
+from app.services.assistant_categories import builtin_category
 from app.services.assistant_retry import READ_ONLY, RECORDS
 from app.services.assistant_takeover import (
     _mutation_clear, activate_takeover, remove_takeover, takeover_site_uncertain, takeover_tool_allowed,
@@ -79,7 +80,9 @@ def test_piggo_old_unknown_then_ten_successes_diagnoses_once_and_reuses(ctx, mon
         assert (await tools.dispatch("browser_observe", {}))["ok"]
         for feature in SUPPORTED_FEATURES - READ_ONLY:
             step = arguments(feature, {"selector": ["#submit"]})
-            assert takeover_tool_allowed(tools, "execute_step", step) is True
+            decision = takeover_tool_allowed(tools, "execute_step", step)
+            assert decision == ({"ok": False, "code": "takeover_tool_denied"}
+                                if builtin_category(feature) == "post" else True)
         assert (await tools.dispatch("execute_step", arguments(
             "action.click", {"selector": ["#submit"]})))["ok"]
         for feature in READ_ONLY:

@@ -591,7 +591,9 @@ def test_dispatch_routes_conclusion_only_for_authorized_takeover(context):
         "ok": False, "code": "takeover_tool_denied"}
     assert asyncio.run(ordinary.dispatch(TOOL_NAME, {"conclusion": GOOD}))["ok"] is False
     ordinary_definitions = takeover_tool_definitions(manager, OWNER, sid, registry())
-    assert len(ordinary_definitions) == 38
+    assert {item["function"]["name"] for item in ordinary_definitions} == {
+        item["function"]["name"] for item in registry()
+    } - {TOOL_NAME}
     assert TOOL_NAME not in {item["function"]["name"] for item in ordinary_definitions}
     tools, args = candidate_tools(context)
     allowed = takeover_tool_definitions(manager, OWNER, sid, registry())

@@ -60,7 +60,7 @@ def patch(context, db, values, **kwargs):
 
 def rows(db, model):
     return [{column.name: getattr(row, column.name) for column in model.__table__.columns}
-            for row in db.scalars(select(model).order_by(model.id))]
+            for row in db.scalars(select(model).order_by(*model.__table__.primary_key.columns))]
 
 
 def test_patch_preserves_workflow_protected_fields_and_records_history(context):
@@ -110,7 +110,9 @@ def test_noop_does_not_write_revision_history_or_timestamp(context, values):
     {"notes": "a" * 4001}, {"checkin_after": "24:00"}, {"checkin_after": "1:00"},
     {"timezone": "Invalid/Timezone"}, {"timezone": "../UTC"}, {"lane_policy": "invalid"},
     {"base_url": "https://other.test"}, {"template_id": 1}, {"steps": []}, {"groups": []},
-    {"signals": []}, {"credential_provider_id": "builtin.manual"}, {"config_revision": 2},
+    {"signals": []}, {"credential_provider_id": "builtin.twofauth"}, {"config_revision": 2},
+    {"credential_provider_id": None}, {"credential_provider_id": "plugin."},
+    {"credential_provider_id": "plugin.Invalid"}, {"credential_provider_id": 1},
 ])
 def test_strict_patch_schema_and_service_reject_invalid_input(context, values):
     with pytest.raises(ValidationError):
@@ -121,6 +123,30 @@ def test_strict_patch_schema_and_service_reject_invalid_input(context, values):
             patch(context, db, values)
         assert rows(db, WorkflowHistory) == before
         assert db.get(Site, context.site.id).config_revision == 1
+
+
+@pytest.mark.parametrize("provider", ["builtin.manual", "builtin.bitwarden", "plugin.vault"])
+def test_patch_credential_provider_preserves_secrets_workflow_and_records_only_changes(context, provider):
+    values = {"credential_provider_id": provider}
+    assert SiteSettingsPatch.model_validate(values).model_dump(exclude_unset=True) == values
+    with context.factory() as db:
+        preserved = {model: rows(db, model) for model in (
+            SiteCredential, WorkflowStep, WorkflowGroup, WorkflowSignal)}
+        before = rows(db, WorkflowHistory)
+        result = patch(context, db, values)
+        changed = provider != "builtin.bitwarden"
+        assert result.credential_provider_id == provider
+        assert result.bitwarden_enabled is (provider == "builtin.bitwarden")
+        assert result.config_revision == (2 if changed else 1)
+        assert {model: rows(db, model) for model in preserved} == preserved
+        site = db.get(Site, context.site.id)
+        assert site.bitwarden_match_mode == "custom" and site.bitwarden_custom_match == "private match"
+        if changed:
+            history = service_for(context, db).get_version("site", site.id, 2)
+            assert history.snapshot.local["credential_provider_id"] == provider
+            assert history.snapshot.local["bitwarden_enabled"] is False
+        else:
+            assert rows(db, WorkflowHistory) == before
 
 
 @pytest.mark.parametrize("values", [{}, {"notes": "change"}])

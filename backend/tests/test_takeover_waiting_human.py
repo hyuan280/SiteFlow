@@ -13,6 +13,7 @@ from app.models.assistant_takeover_dedup import TakeoverFailureSignature
 from app.models.execution import JobStep, Run, SiteJob
 from app.models.workflow import Site, SiteResignRecord
 from app.services.assistant_execution import AssistantExecution, SUPPORTED_FEATURES
+from app.services.assistant_categories import builtin_category
 from app.services.assistant_retry import READ_ONLY
 from app.services.assistant_takeover import _mutation_clear, _site_uncertain, takeover_tool_allowed
 from app.services.assistant_takeover_dedup import record_signature
@@ -128,7 +129,9 @@ def test_known_pre_submit_waiting_retains_live_grant_and_import(ctx, feature, da
         assert record_signature(db, action) is None  # Fresh challenges are never reused.
         assert not list(db.scalars(select(TakeoverFailureSignature)))
     for live_feature in SUPPORTED_FEATURES:
-        assert takeover_tool_allowed(tools, "execute_step", arguments(live_feature)) is True
+        decision = takeover_tool_allowed(tools, "execute_step", arguments(live_feature))
+        assert decision == ({"ok": False, "code": "takeover_tool_denied"}
+                            if builtin_category(live_feature) == "post" else True)
     proposal = submit(tools)
     assert asyncio.run(AssistantWorkflows(tools.manager, OWNER, tools.session_id, tools.target).dispatch(
         "import_workflow_draft", {"proposal_message_id": proposal}))["ok"]
@@ -192,7 +195,9 @@ def test_uncertain_waiting_allows_nonpost_steps_but_not_import(ctx, monkeypatch,
     assert asyncio.run(tools.dispatch("browser_observe", {}))["ok"]
     assert takeover_tool_allowed(tools, "browser_open", {}) is True
     for feature in SUPPORTED_FEATURES - READ_ONLY:
-        assert takeover_tool_allowed(tools, "execute_step", arguments(feature)) is True
+        decision = takeover_tool_allowed(tools, "execute_step", arguments(feature))
+        assert decision == ({"ok": False, "code": "takeover_tool_denied"}
+                            if builtin_category(feature) == "post" else True)
     assert asyncio.run(tools.dispatch("execute_step", arguments(
         "action.click", {"selector": ["#submit"]})))["ok"]
     assert takeover_tool_allowed(tools, "import_workflow_draft", {})["ok"] is False

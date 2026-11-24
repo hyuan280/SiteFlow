@@ -306,13 +306,24 @@ def test_concurrent_leases_across_providers_share_atomic_budget(fullrun):
     assert len(load(tools)[RECORDS]) == 3
 
 
-def test_lease_category_comes_from_catalog_and_ordinary_jobs_unchanged(fullrun, monkeypatch):
+def test_lease_category_comes_from_catalog(fullrun, monkeypatch):
+    tools, executor = fullrun
+    monkeypatch.setitem(FEATURES, "auth.form_login", replace(FEATURES["auth.form_login"], category="challenge"))
+    _, job_id = queued(fullrun)
+    scope, _ = registration(fullrun, job_id)
+    for _ in range(5):
+        lease(executor, scope)
+    assert not load(tools).get(RECORDS)
+
+
+def test_lease_rejects_category_changed_after_dispatch_binding(fullrun, monkeypatch):
     tools, executor = fullrun
     _, job_id = queued(fullrun)
     scope, _ = registration(fullrun, job_id)
     monkeypatch.setitem(FEATURES, "auth.form_login", replace(FEATURES["auth.form_login"], category="challenge"))
-    for _ in range(5):
+    with pytest.raises(SecretDenied):
         lease(executor, scope)
+    assert not executor.secret_providers.leases
     assert not load(tools).get(RECORDS)
 
 

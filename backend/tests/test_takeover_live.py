@@ -20,6 +20,7 @@ from app.models.workflow import Site
 from app.schemas.assistant import SendMessage
 from app.schemas.assistant_takeover import TakeoverSettingsUpdate, TakeoverValues
 from app.services.assistant import BrowserScope
+from app.services.assistant_categories import builtin_category
 from app.services.assistant_execution import AssistantExecution, SUPPORTED_FEATURES
 from app.services.assistant_takeover import (
     LIVE_TOOLS, _target, remove_takeover, takeover_tool_allowed, takeover_tool_definitions,
@@ -230,7 +231,7 @@ def test_changed_site_identity_revokes_active_and_inherited_service_access(ctx, 
     ("proxy_general", True), ("proxy_interaction", True),
 ])
 @pytest.mark.parametrize("provider,mode", [
-    ("builtin.manual", "manual"), ("builtin.bitwarden", "bitwarden"), ("plugin.private", "none"),
+    ("builtin.manual", "manual"), ("builtin.bitwarden", "bitwarden"), ("plugin.private", "site"),
 ])
 def test_target_grants_saved_identity_supported_features_and_independent_lane(ctx, lane, proxy, provider, mode):
     with ctx[1].session_factory() as db:
@@ -272,9 +273,10 @@ def test_live_analysis_is_not_read_only_but_never_authorizes_full_run_or_mutatio
         "takeover_write_denied" if mode == "autofix" else "workflow_consent_required")
 
 
-@pytest.mark.parametrize("feature", sorted(SUPPORTED_FEATURES))
+@pytest.mark.parametrize("feature", sorted(
+    key for key in SUPPORTED_FEATURES if builtin_category(key) != "post"))
 @pytest.mark.parametrize("source_status", ["fail", "waiting_human"])
-def test_all_eighteen_single_steps_use_private_saved_credentials_and_worker_contract(
+def test_nonpost_single_steps_use_private_saved_credentials_and_worker_contract(
     ctx, monkeypatch, integrations, feature, source_status,
 ):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2]))
@@ -302,6 +304,8 @@ def test_all_eighteen_single_steps_use_private_saved_credentials_and_worker_cont
 
     monkeypatch.setattr(tools.manager, "_worker", AsyncMock(side_effect=worker))
     config = {"selector": ["#button"]} if feature in {"action.click", "action.fill"} else {}
+    if feature == "flow.jump":
+        config = {"match_mode": "always", "action": "restart"}
     if feature == "challenge.2fa":
         config = {"service_hint": "Example", "username_hint": USERNAME}
     result = asyncio.run(tools.dispatch("execute_step", arguments(feature, config)))
@@ -454,7 +458,9 @@ def test_model_failure_after_live_dispatch_is_never_automatically_replayed(ctx, 
     assert len(seen) == 1
 
 
-@pytest.mark.parametrize("feature", ["post.buy_card", "post.resign", "flow.jump", "plugin.custom"])
+@pytest.mark.parametrize("feature", [
+    *sorted(key for key in SUPPORTED_FEATURES if builtin_category(key) == "post"), "plugin.custom",
+])
 def test_unattended_unsupported_steps_are_denied_before_any_popup_or_worker(ctx, monkeypatch, feature):
     grant(ctx, live_access=True)
     failed_job(ctx)
