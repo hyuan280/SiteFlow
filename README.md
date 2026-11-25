@@ -71,6 +71,8 @@ docker compose ps
 
 首次部署前需确保所选版本已发布；私有 GHCR 镜像需要先登录。镜像版本、数据备份及 HTTPS 部署见 [部署与运维](docs/deployment.md) 和 [镜像发布](docs/releases.md)。
 
+可选的 [Docker Socket 系统资源监控](docs/system-resources.md) 需单独启用，主 Compose 默认不挂载 socket；启用前请阅读权限风险说明。
+
 ### 首次登录
 
 未设置 `SITEFLOW_ADMIN_PASSWORD` 且尚未保存管理员密码时，API 每次启动会生成随机的 `admin` 密码。通过日志查看：
@@ -222,6 +224,7 @@ git diff --check
 - [NexusPHP 示例](docs/examples/nexusphp-assistant-workflow.json)：源模板只读脱敏改编、默认禁用且不含购买/补签；配合[证据发现指南](docs/assistant-discovery.md)，不是在线实测或通用适配保证。
 - [AI 配置协议](docs/config-ai.md)：功能生成说明、受控目录、编排指南与工具定义。
 - [部署与运维](docs/deployment.md)：Docker 部署、端口、数据与备份。
+- [系统资源监控](docs/system-resources.md)：可选 Docker Socket 部署、host 统计口径与安全边界。
 - [集成配置](docs/configuration.md)：代理、凭据提供商、CFbox 和多模型配置。
 - [模型与功能设置](docs/vision-feature-settings.md)：有序注册表 API、旧配置兼容/环境变量条目只读、用途与视觉选择、保存冲突、历史密钥脱敏及功能执行路由。
 - [通知设置](docs/notifications.md)：邮件、HTTP 通知与内容模板。

@@ -1,0 +1,6 @@
+# Optional Docker resource monitoring. Review docs/system-resources.md before use.
+# A read-only socket mount does NOT make the Docker API read-only.
+services:
+  api:
+    volumes:
+      - ${SITEFLOW_DOCKER_SOCKET_HOST:-/var/run/docker.sock}:/var/run/docker.sock:ro

@@ -63,6 +63,8 @@ docker compose ps
 
 镜像版本、GHCR 访问权限和组件标签发布见 [镜像发布](releases.md)。
 
+根目录主 Compose 默认不挂载 Docker Socket。需要可选的 SiteFlow 项目容器资源拆分时，先更新到支持此功能的 API 镜像，再使用 `docker compose -f docker-compose.yml -f docker-compose.resources.yml up -d`，并在系统设置中开启「显示系统资源占用」。挂载具有高权限风险，启用、项目名匹配、统计口径与撤销步骤见 [系统资源监控](system-resources.md)；不启用挂载时只显示 host 指标。
+
 源码构建与启动仍使用 `ops/`：
 
 ```bash

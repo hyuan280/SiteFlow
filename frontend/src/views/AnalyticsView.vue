@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 
 import { ApiError, apiRequest } from "@/api/client";
+import PageHeader from "@/components/PageHeader.vue";
 import TrendChart from "@/components/TrendChart.vue";
 import { useAuthStore } from "@/stores/auth";
 import type {
@@ -274,13 +275,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <section class="page-head">
-    <div>
-      <p class="eyebrow">ANALYTICS</p>
-      <h1>运行分析</h1>
-      <p class="muted">站点每日状态、失败分析和执行趋势。</p>
-    </div>
-    <div class="head-actions">
+  <PageHeader eyebrow="ANALYTICS" title="运行分析" description="站点每日状态、失败分析和执行趋势。">
+    <template #actions>
       <el-radio-group v-model="days" size="small">
         <el-radio-button :value="7">7 天</el-radio-button>
         <el-radio-button :value="14">14 天</el-radio-button>
@@ -302,8 +298,8 @@ onMounted(async () => {
           :value="site.id"
         />
       </el-select>
-    </div>
-  </section>
+    </template>
+  </PageHeader>
 
   <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="notice" />
 
@@ -526,38 +522,6 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.page-head {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 18px;
-  margin-bottom: 18px;
-}
-
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
-}
-
-.page-head p {
-  margin: 0;
-}
-
-.head-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
 .site-filter {
   width: 180px;
 }
@@ -837,11 +801,6 @@ onMounted(async () => {
 }
 
 @media (max-width: 1000px) {
-  .page-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
   .summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

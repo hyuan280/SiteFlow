@@ -4,6 +4,7 @@ import { onBeforeRouteLeave, useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { ApiError, apiRequest } from "@/api/client";
+import PageHeader from "@/components/PageHeader.vue";
 import { useAuthStore } from "@/stores/auth";
 import type { RunDetail, RunSummary, SiteDetail, SiteOption } from "@/types/workflow";
 import { formatServerDateTime } from "@/utils/datetime";
@@ -590,17 +591,12 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="page-head">
-    <div>
-      <p class="eyebrow">SCHEDULE</p>
-      <h1>任务调度</h1>
-      <p class="muted">手动执行站点任务，查看每次运行产生的任务和步骤结果。</p>
-    </div>
-    <div class="head-actions">
+  <PageHeader eyebrow="SCHEDULE" title="任务调度" description="手动执行站点任务，查看每次运行产生的任务和步骤结果。">
+    <template #actions>
       <el-tag v-if="hasActiveRuns" type="warning" effect="plain">有运行中的任务</el-tag>
       <el-button @click="loadRuns()">刷新</el-button>
-    </div>
-  </section>
+    </template>
+  </PageHeader>
 
   <el-alert
     v-if="schedulerInfo"
@@ -955,37 +951,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.page-head {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 18px;
-  margin-bottom: 20px;
-}
-
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
-}
-
-.page-head p {
-  margin: 0;
-}
-
-.head-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
 .panel {
   border-radius: 16px;
   border-color: #e4e9f0;
@@ -1299,11 +1264,6 @@ onUnmounted(() => {
 }
 
 @media (max-width: 760px) {
-  .page-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
   .site-select {
     min-width: 0;
     width: 100%;

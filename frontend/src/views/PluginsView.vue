@@ -4,6 +4,8 @@ import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { ApiError, apiRequest } from "@/api/client";
+import HorizontalTabs from "@/components/HorizontalTabs.vue";
+import PageHeader from "@/components/PageHeader.vue";
 import { useAuthStore } from "@/stores/auth";
 import type { PluginFeatureCategory, PluginRuntimeView } from "@/types/plugin";
 import {
@@ -20,6 +22,12 @@ import { categoryLabel } from "@/utils/workflow";
 const auth = useAuthStore();
 const router = useRouter();
 const plugins = ref<PluginRuntimeView[]>([]);
+const selectedPluginId = ref("");
+const pluginTabs = computed(() => plugins.value.map((plugin) => ({
+  value: plugin.plugin_id,
+  label: plugin.name,
+  badge: pluginStatusLabel(plugin.status),
+})));
 const loading = ref(true);
 type References = { reference_count: number; incompatible_count: number; items: { owner_type: string; owner_id: number; name: string; step_key: string | null; enabled: boolean; reference: string; errors: string[] }[] };
 const references = reactive<Record<string, References>>({});
@@ -53,6 +61,7 @@ const auditTotal = ref(0);
 const auditPage = ref(1);
 const auditFilter = reactive({ plugin_id: "", event: "", result: "" });
 const auditLoading = ref(false);
+const auditOpen = ref(false);
 async function loadAudit(reset = false): Promise<void> {
   if (reset) auditPage.value = 1;
   auditLoading.value = true;
@@ -174,6 +183,9 @@ function applyPlugins(items: PluginRuntimeView[]): void {
     syncSelection(plugin, plugins.value.find((previous) => previous.plugin_id === plugin.plugin_id));
   }
   plugins.value = items;
+  if (!items.some((plugin) => plugin.plugin_id === selectedPluginId.value)) {
+    selectedPluginId.value = items[0]?.plugin_id ?? "";
+  }
 }
 
 function replacePlugin(updated: PluginRuntimeView): void {
@@ -311,16 +323,16 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="page-head">
-    <div>
-      <p class="eyebrow">PLUGINS</p>
-      <h1>插件管理</h1>
-      <p class="muted">
-        插件首次接入时会执行协议、端点、能力、健康检查和 manifest 校验；管理员审批权限后才会标记为正常。
-      </p>
-    </div>
-    <el-button :loading="loading" @click="load()">刷新</el-button>
-  </section>
+  <PageHeader
+    eyebrow="PLUGINS"
+    title="插件管理"
+    description="插件接入后执行协议、端点、能力、健康与 manifest 检查，经管理员审批权限后方可正常工作。"
+  >
+    <template #actions>
+      <el-button @click="auditOpen = true">审计日志</el-button>
+      <el-button :loading="loading" @click="load()">刷新</el-button>
+    </template>
+  </PageHeader>
 
   <el-alert
     v-if="error"
@@ -374,13 +386,23 @@ onUnmounted(() => {
     <p class="approval-note">仅保存助手授权不会撤销插件通用审批，但会更新权限版本。分类调整保存后会撤销旧审批，必须重新审批；风险指数显示当前已保存分类的风险。</p>
   </el-alert>
 
+  <HorizontalTabs
+    v-model="selectedPluginId"
+    :items="pluginTabs"
+    aria-label="选择插件"
+  >
   <div v-loading="loading" class="plugin-list">
     <el-empty
       v-if="!loading && !plugins.length"
       description="暂无已注册插件。启动 demo 插件后会自动注册并出现在这里。"
     />
 
-    <article v-for="plugin in plugins" :key="plugin.plugin_id" class="plugin-card">
+    <article
+      v-for="plugin in plugins"
+      v-show="selectedPluginId === plugin.plugin_id"
+      :key="plugin.plugin_id"
+      class="plugin-card"
+    >
       <header class="plugin-head">
         <div class="plugin-title">
           <div class="plugin-mark">{{ plugin.name.slice(0, 1).toUpperCase() }}</div>
@@ -632,15 +654,16 @@ onUnmounted(() => {
       </section>
     </article>
   </div>
-  <el-collapse class="section" @change="loadAudit()">
-    <el-collapse-item title="安全审计" name="audit">
-      <el-form inline @submit.prevent="loadAudit(true)">
+  </HorizontalTabs>
+
+  <el-dialog v-model="auditOpen" title="审计日志" width="min(1200px, 94vw)" destroy-on-close @open="loadAudit()">
+      <el-form inline class="audit-filters" @submit.prevent="loadAudit(true)">
         <el-form-item label="插件"><el-input v-model="auditFilter.plugin_id" placeholder="插件 ID" /></el-form-item>
         <el-form-item label="事件"><el-select v-model="auditFilter.event" clearable style="width: 180px"><el-option v-for="item in ['register', 'approve', 'revoke', 'metadata_change', 'disable', 'enable', 'lease_issue', 'lease_consume', 'lease_reject', 'provider_resolve']" :key="item" :label="item" :value="item" /></el-select></el-form-item>
         <el-form-item label="结果"><el-select v-model="auditFilter.result" clearable style="width: 140px"><el-option v-for="item in ['success', 'denied', 'failed']" :key="item" :label="item" :value="item" /></el-select></el-form-item>
         <el-button :loading="auditLoading" @click="loadAudit(true)">查询</el-button>
       </el-form>
-      <el-table :data="auditItems" v-loading="auditLoading" style="width: 100%">
+       <el-table :data="auditItems" v-loading="auditLoading" max-height="55vh" style="width: 100%">
         <el-table-column label="时间" min-width="170"><template #default="{ row }">{{ formatDate(row.timestamp) }}</template></el-table-column>
         <el-table-column prop="plugin_id" label="插件" width="110" />
         <el-table-column prop="provider_id" label="提供商" min-width="150" />
@@ -652,9 +675,9 @@ onUnmounted(() => {
         <el-table-column prop="step_key" label="步骤" min-width="130" />
         <el-table-column prop="actor" label="管理员" width="110" />
       </el-table>
-      <el-pagination v-model:current-page="auditPage" :page-size="25" :total="auditTotal" layout="prev, pager, next, total" @current-change="loadAudit()" />
-    </el-collapse-item>
-  </el-collapse>
+       <el-pagination v-model:current-page="auditPage" :page-size="25" :total="auditTotal" layout="prev, pager, next, total" class="audit-pagination" @current-change="loadAudit()" />
+       <template #footer><el-button @click="auditOpen = false">关闭</el-button></template>
+  </el-dialog>
 </template>
 
 <style scoped>
@@ -662,54 +685,34 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.page-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 18px;
-}
-
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
-}
-
-.page-head p {
-  margin: 0;
-  max-width: 760px;
-}
-
 .notice {
   margin-bottom: 14px;
 }
 
+.audit-filters { display: flex; flex-wrap: wrap; gap: 0 12px; }
+.audit-filters :deep(.el-form-item) { margin-right: 0; max-width: 100%; }
+.audit-pagination { margin-top: 16px; overflow-x: auto; }
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 12px;
+  gap: 8px;
   margin-bottom: 16px;
 }
 
 .summary-card {
-  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
   border: 1px solid #e4e9f0;
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.78);
 }
 
 .summary-card strong {
-  display: block;
-  margin-top: 4px;
-  font-size: 24px;
+  font-size: 20px;
 }
 
 .summary-label {
@@ -736,9 +739,11 @@ onUnmounted(() => {
 .plugin-list {
   display: grid;
   gap: 14px;
+  min-width: 0;
 }
 
 .plugin-card {
+  min-width: 0;
   border: 1px solid #e4e9f0;
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.88);
@@ -757,9 +762,16 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
+}
+
+.plugin-title > div:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .plugin-mark {
+  flex-shrink: 0;
   width: 42px;
   height: 42px;
   border-radius: 12px;
@@ -794,6 +806,11 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 
+.plugin-actions .el-button,
+.category-draft-actions .el-button {
+  margin-left: 0;
+}
+
 .meta-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -809,6 +826,8 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 3px;
   font-size: 13px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .meta-label {
@@ -965,6 +984,7 @@ onUnmounted(() => {
   display: flex;
   align-items: flex-start;
   gap: 12px;
+  flex-wrap: wrap;
   border: 1px solid #d9efd4;
   background: #f6fcf4;
   color: #3d7a35;
@@ -1016,9 +1036,20 @@ onUnmounted(() => {
 }
 
 @media (max-width: 560px) {
-  .summary-grid,
+  .summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .meta-grid {
     grid-template-columns: 1fr;
+  }
+
+  .plugin-card {
+    padding: 14px;
+  }
+
+  .plugin-actions {
+    width: 100%;
   }
 }
 </style>

@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "SiteFlow"
+    docker_socket_path: str = Field(
+        default="/var/run/docker.sock", validation_alias="SITEFLOW_DOCKER_SOCKET"
+    )
+    docker_project: str = Field(default="siteflow", validation_alias="SITEFLOW_DOCKER_PROJECT")
     siteflow_domain: str = Field(default="", validation_alias="SITEFLOW_DOMAIN")
     database_url: str = "sqlite:///./data/siteflow.db"
     artifact_root: str = Field(default="./data/artifacts", validation_alias="SITEFLOW_ARTIFACT_ROOT")

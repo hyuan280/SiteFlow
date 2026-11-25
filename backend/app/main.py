@@ -25,6 +25,7 @@ from app.api.v1 import (
     scheduler as scheduler_api,
     sites,
     secrets,
+    system,
     templates,
     workflow_history,
     workflow_drafts,
@@ -41,6 +42,7 @@ from app.services.executor import ExecutionManager
 from app.services.run_notification_dispatch import RunNotificationDispatcher
 from app.services.scheduler import Scheduler
 from app.services.scheduler_settings import reset_next_run_for_timezone
+from app.services.system_resources import SystemResourceSampler
 from app.models.auth import AuthSession, User  # noqa: F401  (register tables)
 from app.models.assistant import AssistantMessage, AssistantSession  # noqa: F401
 from app.models.assistant_workflow import AssistantWorkflowAction  # noqa: F401
@@ -124,6 +126,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.bootstrap = bootstrap
     app.state.rate_limiter = LoginRateLimiter()
     app.state.config_ai_slot = BoundedSemaphore(1)
+    app.state.system_resource_sampler = SystemResourceSampler(settings)
     app.state.executor = executor
     app.state.scheduler = scheduler
     app.state.artifact_cleanup = artifact_cleanup
@@ -140,6 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.include_router(health.router)
+    app.include_router(system.router)
     app.include_router(secrets.router)
     app.include_router(auth_api.router)
     app.include_router(integrations.router)

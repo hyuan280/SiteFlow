@@ -1,6 +1,22 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { harness, id, otherId, base, session, message, date } from "./helpers/assistant-harness.mjs";
+
+// SSR has no layout engine; keep the spacing and scroll-container CSS contract explicit.
+const source = await readFile(new URL("../src/views/AIAssistantView.vue", import.meta.url), "utf8");
+const css = source.match(/<style\b[^>]*>([\s\S]*?)<\/style>/)[1];
+assert.deepEqual([...css.matchAll(/\.assistant-grid\s*\{([^}]+)\}/g)].map(([, rule]) => rule.match(/\bgap:\s*(\d+)px\s*;/)?.[1]),
+  ["4", "2", "1"], "panel gaps stay 4/2/1px in desktop/tablet/mobile cascade order");
+assert.match(css, /@media\s*\(max-width:\s*1100px\)\s*\{\s*\.assistant-grid\s*\{[^}]*\bgap:\s*2px\s*;/);
+assert.match(css, /@media\s*\(max-width:\s*720px\)\s*\{\s*\.assistant-grid\s*\{[^}]*\bgap:\s*1px\s*;/);
+const timelineCss = css.match(/\.timeline\s*\{([^}]+)\}/)[1];
+for (const declaration of [/\bdisplay:\s*flex\s*;/, /\bflex-direction:\s*column\s*;/, /\bgap:\s*2px\s*;/,
+  /\bmin-height:\s*0\s*;/, /\boverflow:\s*auto\s*;/]) assert.match(timelineCss, declaration);
+assert.match(css, /\.timeline\s*>\s*\*\s*\{[^}]*\bflex-shrink:\s*0\s*;/,
+  "long messages retain intrinsic height inside the scrolling timeline");
+assert.match(css, /\.message-card\s*\{[^}]*\bmargin:\s*0\s*;/, "message margins must not add to the 2px gap");
+assert.match(css, /\.composer\s*\{[^}]*\bflex:\s*none\s*;/, "the composer must not shrink out of view");
 
 const h = await harness("detail, sessions, connection, error, selectSession, refreshDetail, toggleMessage, openMessageIds, messageCache, approvalSeconds, pendingApproval");
 const { ui, respond, choose, emit } = h;

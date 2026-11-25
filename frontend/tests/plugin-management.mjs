@@ -13,7 +13,7 @@ const server = await createServer({
       .replace('import { ElMessage, ElMessageBox } from "element-plus";', 'const { ElMessage, ElMessageBox } = globalThis.__pluginMocks;')
       .replace('import { ApiError, apiRequest } from "@/api/client";', 'const { ApiError, apiRequest } = globalThis.__pluginMocks;')
       .replace('import { useAuthStore } from "@/stores/auth";', 'const { useAuthStore } = globalThis.__pluginMocks;')
-      .replace("</script>", "defineExpose({ applyPlugins, approvalSelection, categoryDrafts, editCategory, editAssistantPermission, staleCategoryDraft, saveCategories, approve });\n</script>");
+      .replace("</script>", "defineExpose({ applyPlugins, approvalSelection, categoryDrafts, editCategory, editAssistantPermission, staleCategoryDraft, saveCategories, approve, auditOpen, auditFilter, auditPage, auditItems, auditTotal, auditLoading, loadAudit });\n</script>");
   } }],
 });
 const originalSetInterval = globalThis.setInterval;
@@ -55,6 +55,9 @@ try {
   assert.ok(view.includes("/revoke"));
   assert.ok(view.includes("/plugin-runtime/audit?"));
   assert.ok(view.includes("el-pagination"));
+  assert.match(view, /<template #actions>\s*<el-button @click="auditOpen = true">审计日志<\/el-button>\s*<el-button[^>]*@click="load\(\)">刷新/);
+  assert.match(view, /<el-dialog v-model="auditOpen"[^>]*destroy-on-close @open="loadAudit\(\)"/);
+  assert.doesNotMatch(view, /<el-collapse/);
   assert.ok(view.includes("/references"));
   assert.ok(view.includes("/change-impacts"));
   assert.ok(view.includes("不会停止或删除容器"));
@@ -102,6 +105,29 @@ try {
   app.provide(ssrContextKey, { modules: new Set() });
   app.mount({});
   await nextTick();
+  assert.equal(ui.auditOpen.value, false);
+  assert.equal(requests.some(request => request.url.startsWith("/plugin-runtime/audit?")), false,
+    "initial page load does not fetch audit logs");
+  ui.auditOpen.value = true;
+  ui.auditFilter.plugin_id = "demo/example";
+  ui.auditFilter.event = "approve";
+  ui.auditFilter.result = "success";
+  ui.auditPage.value = 3;
+  response = { items: [{ id: 1, event: "approve" }], total: 60 };
+  await ui.loadAudit();
+  const auditQuery = new URLSearchParams(requests.at(-1).url.split("?")[1]);
+  assert.equal(auditQuery.get("plugin_id"), "demo/example");
+  assert.equal(auditQuery.get("event"), "approve");
+  assert.equal(auditQuery.get("result"), "success");
+  assert.equal(auditQuery.get("page"), "3");
+  assert.equal(auditQuery.get("page_size"), "25");
+  assert.equal(ui.auditTotal.value, 60);
+  assert.equal(ui.auditItems.value[0].id, 1);
+  assert.equal(ui.auditLoading.value, false);
+  await ui.loadAudit(true);
+  assert.equal(ui.auditPage.value, 1, "filter query resets the audit page");
+  ui.auditOpen.value = false;
+  response = [];
   const plugin = {
     plugin_id: "demo/example", generation: 2, permission_epoch: 3,
     capabilities: ["features", "secret.totp"], approved_capabilities: [], status: "unapproved",

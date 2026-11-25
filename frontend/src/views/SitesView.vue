@@ -7,6 +7,7 @@ import { ApiError, apiRequest } from "@/api/client";
 import CopyConfigDialog from "@/components/CopyConfigDialog.vue";
 import ExportSelectionDialog from "@/components/ExportSelectionDialog.vue";
 import FloatingField from "@/components/FloatingField.vue";
+import PageHeader from "@/components/PageHeader.vue";
 import SignalEditor from "@/components/SignalEditor.vue";
 import StringListField from "@/components/StringListField.vue";
 import WorkflowStepEditor from "@/components/WorkflowStepEditor.vue";
@@ -1319,13 +1320,8 @@ onMounted(() => {
 
 <template>
   <section v-if="!editorOpen">
-    <div class="page-head">
-      <div>
-        <p class="eyebrow">SITES</p>
-        <h1>站点管理</h1>
-        <p class="muted">站点引用模板，并按 step_key 覆盖、禁用或追加功能步骤。</p>
-      </div>
-      <div class="head-actions">
+    <PageHeader eyebrow="SITES" title="站点管理" description="站点引用模板，并按 step_key 覆盖、禁用或追加功能步骤。">
+      <template #actions>
         <input
           ref="siteImportInput"
           type="file"
@@ -1336,8 +1332,8 @@ onMounted(() => {
         <el-button :loading="siteImporting" @click="openSiteImport">导入站点</el-button>
         <el-button @click="exportOpen = true">导出站点</el-button>
         <el-button type="primary" @click="openCreate">新建站点</el-button>
-      </div>
-    </div>
+      </template>
+    </PageHeader>
 
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="notice" />
 
@@ -1436,17 +1432,15 @@ onMounted(() => {
     @pointerdown="interactionStarted = true"
     @keydown="interactionStarted = true"
   >
-    <div class="page-head">
-      <div>
+    <PageHeader eyebrow="SITES" :title="title" description="模板步骤固定；修改会生成子步骤卡片，新增步骤使用上下移动调整顺序。">
+      <template #leading>
         <el-button link @click="closeEditor">← 返回站点列表</el-button>
-        <h1>{{ title }}</h1>
-        <p class="muted">模板步骤固定；修改会生成子步骤卡片，新增步骤使用上下移动调整顺序。</p>
-      </div>
-      <div class="head-actions">
+      </template>
+      <template #actions>
         <el-button @click="closeEditor">取消</el-button>
         <el-button type="primary" :loading="saving" :disabled="loadingForm || configBusy" @click="() => save()">保存站点</el-button>
-      </div>
-    </div>
+      </template>
+    </PageHeader>
 
     <el-alert
       v-if="editorError"
@@ -1981,31 +1975,6 @@ onMounted(() => {
   font-family: monospace;
 }
 
-.page-head {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 18px;
-  margin-bottom: 20px;
-}
-
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
-}
-
-.page-head p {
-  margin: 0;
-}
-
 .head-actions {
   display: flex;
   gap: 8px;
@@ -2202,11 +2171,6 @@ onMounted(() => {
 @media (max-width: 760px) {
   .editor-page :deep(.el-card__header) {
     top: -16px;
-  }
-
-  .page-head {
-    align-items: flex-start;
-    flex-direction: column;
   }
 }
 </style>

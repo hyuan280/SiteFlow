@@ -4,6 +4,8 @@ import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { ApiError, apiRequest } from "@/api/client";
+import HorizontalTabs from "@/components/HorizontalTabs.vue";
+import PageHeader from "@/components/PageHeader.vue";
 import StringListField from "@/components/StringListField.vue";
 import { useAuthStore } from "@/stores/auth";
 import { formatServerDateTime } from "@/utils/datetime";
@@ -98,8 +100,24 @@ interface ArtifactStatsView {
   cleanup_enabled: boolean;
 }
 
+interface SystemSettingsView {
+  show_system_resources: boolean;
+}
+
 const auth = useAuthStore();
 const router = useRouter();
+const activeTab = ref("integrations");
+const settingsTabs = [
+  { value: "integrations", label: "集成" },
+  { value: "models", label: "大模型" },
+  { value: "logs", label: "日志" },
+  { value: "system", label: "系统" },
+];
+const systemSettings = ref<SystemSettingsView | null>(null);
+const showSystemResources = ref(false);
+const systemSettingsLoading = ref(true);
+const systemSettingsSaving = ref(false);
+const systemSettingsError = ref("");
 const loading = ref(true);
 const loadError = ref("");
 const integrations = ref<IntegrationsView | null>(null);
@@ -204,13 +222,6 @@ const schedulerError = computed(() => {
 const canSaveScheduler = computed(
   () => Boolean(scheduler.value?.editable) && !schedulerError.value,
 );
-const authSourceLabel = computed(() => {
-  const source = auth.user?.auth_source;
-  if (source === "env") return "环境变量";
-  if (source === "db") return "数据库";
-  if (source === "bootstrap") return "初始随机密码";
-  return "未配置";
-});
 
 function schedulerSourceLabel(): string {
   if (scheduler.value?.source === "env") return "环境变量";
@@ -307,6 +318,44 @@ async function handleUnauthorized(error: unknown): Promise<boolean> {
     return true;
   }
   return false;
+}
+
+async function loadSystemSettings(): Promise<void> {
+  systemSettingsLoading.value = true;
+  systemSettingsError.value = "";
+  try {
+    const response = await apiRequest<SystemSettingsView>("/system-settings");
+    systemSettings.value = response;
+    showSystemResources.value = response.show_system_resources;
+  } catch (error) {
+    if (await handleUnauthorized(error)) return;
+    systemSettingsError.value = error instanceof Error ? error.message : "加载系统显示设置失败";
+  } finally {
+    systemSettingsLoading.value = false;
+  }
+}
+
+async function saveSystemSettings(): Promise<void> {
+  if (!systemSettings.value || systemSettingsLoading.value || systemSettingsSaving.value) return;
+  const previous = systemSettings.value.show_system_resources;
+  systemSettingsSaving.value = true;
+  systemSettingsError.value = "";
+  try {
+    const response = await apiRequest<SystemSettingsView>("/system-settings", {
+      method: "PUT",
+      body: JSON.stringify({ show_system_resources: showSystemResources.value }),
+    });
+    systemSettings.value = response;
+    showSystemResources.value = response.show_system_resources;
+    ElMessage.success("系统显示设置已保存");
+  } catch (error) {
+    showSystemResources.value = previous;
+    if (await handleUnauthorized(error)) return;
+    systemSettingsError.value = error instanceof Error ? error.message : "保存系统显示设置失败";
+    ElMessage.error(systemSettingsError.value);
+  } finally {
+    systemSettingsSaving.value = false;
+  }
 }
 
 async function loadSchedulerSettings(): Promise<void> {
@@ -635,6 +684,7 @@ onMounted(() => {
   void load();
   void loadArtifactStats();
   void loadSchedulerSettings();
+  void loadSystemSettings();
   schedulerTimer = setInterval(() => {
     void refreshSchedulerNextRun();
   }, 30000);
@@ -649,13 +699,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="page-head">
-    <div>
-      <p class="eyebrow">SETTINGS</p>
-      <h1>系统设置</h1>
-      <p class="muted">调度、代理、大模型、2FAuth、CFbox、Bitwarden、日志与截图和账户安全设置。</p>
-    </div>
-  </section>
+  <PageHeader
+    eyebrow="SETTINGS"
+    title="系统设置"
+    description="管理服务集成、大模型、日志与截图，以及代理、调度和系统显示偏好。"
+  />
 
   <el-alert
     v-if="loadError"
@@ -666,13 +714,48 @@ onUnmounted(() => {
     class="notice"
   />
 
-  <el-row :gutter="18">
+  <HorizontalTabs v-model="activeTab" :items="settingsTabs" aria-label="设置分类">
+  <el-row v-show="activeTab === 'models'" :gutter="18">
     <el-col :xs="24" :lg="24">
       <ModelSettingsCard @unauthorized="handleUnauthorized" />
     </el-col>
   </el-row>
-  <el-row :gutter="18" v-loading="loading">
-    <el-col :xs="24" :lg="12">
+  <el-card v-show="activeTab === 'system'" shadow="never" class="panel">
+    <template #header><strong>系统显示</strong></template>
+    <div class="resource-setting" :aria-busy="systemSettingsLoading || systemSettingsSaving">
+      <div>
+        <label id="system-resources-label" for="show-system-resources">显示系统资源占用</label>
+        <p id="system-resources-description" class="muted">
+          开启后，在数据面板展示宿主机 CPU 和内存占用；挂载 Docker Socket 后，会在总占用中区分 SiteFlow 服务。修改后自动保存。
+        </p>
+      </div>
+      <el-switch
+        id="show-system-resources"
+        v-model="showSystemResources"
+        aria-labelledby="system-resources-label"
+        aria-describedby="system-resources-description"
+        :loading="systemSettingsLoading || systemSettingsSaving"
+        :disabled="!systemSettings || systemSettingsLoading || systemSettingsSaving"
+        @change="saveSystemSettings"
+      />
+    </div>
+    <p v-if="systemSettingsLoading" class="muted" role="status">正在加载系统显示设置...</p>
+    <p v-else-if="systemSettingsSaving" class="muted" role="status">正在保存...</p>
+    <el-alert
+      v-if="systemSettingsError"
+      :title="systemSettingsError"
+      type="error"
+      :closable="false"
+      show-icon
+      class="notice"
+    />
+    <el-button v-if="!systemSettings && systemSettingsError" :loading="systemSettingsLoading" @click="loadSystemSettings">
+      重新加载
+    </el-button>
+  </el-card>
+
+  <el-row v-show="activeTab === 'system'" :gutter="18" v-loading="loading">
+    <el-col :xs="24" :lg="24">
       <el-card shadow="never" class="panel">
         <template #header>
           <div class="card-head">
@@ -725,8 +808,10 @@ onUnmounted(() => {
         <p v-if="proxyLocked" class="muted">已由 SITEFLOW_PROXY_URL 环境变量锁定。</p>
       </el-card>
     </el-col>
+  </el-row>
 
-    <el-col :xs="24" :lg="12">
+  <el-row v-show="activeTab === 'integrations'" :gutter="18" v-loading="loading">
+    <el-col :xs="24" :lg="24">
       <el-card shadow="never" class="panel">
         <template #header>
           <div class="card-head">
@@ -799,7 +884,7 @@ onUnmounted(() => {
       </el-card>
     </el-col>
 
-    <el-col :xs="24" :lg="12">
+    <el-col :xs="24" :lg="24">
       <el-card shadow="never" class="panel">
         <template #header>
           <div class="card-head">
@@ -868,7 +953,7 @@ onUnmounted(() => {
       </el-card>
     </el-col>
 
-    <el-col :xs="24" :lg="12">
+    <el-col :xs="24" :lg="24">
       <el-card shadow="never" class="panel">
         <template #header>
           <div class="card-head">
@@ -987,7 +1072,7 @@ onUnmounted(() => {
     </el-col>
   </el-row>
 
-  <el-card shadow="never" class="panel">
+  <el-card v-show="activeTab === 'system'" shadow="never" class="panel">
     <template #header>
       <div class="card-head">
         <div>
@@ -1092,7 +1177,7 @@ onUnmounted(() => {
     </div>
   </el-card>
 
-  <el-card shadow="never" class="panel" v-loading="artifactStatsLoading">
+  <el-card v-show="activeTab === 'logs'" shadow="never" class="panel" v-loading="artifactStatsLoading">
     <template #header>
       <div class="card-head">
         <div>
@@ -1161,42 +1246,29 @@ onUnmounted(() => {
       <span class="mono">SITEFLOW_ARTIFACT_CLEANUP_INTERVAL_SECONDS</span> 调整策略。
     </p>
   </el-card>
-
-  <el-card shadow="never" class="panel security-card">
-    <template #header>
-      <div class="card-head">
-        <strong>账户安全</strong>
-        <el-tag :type="sourceTagType(auth.user?.auth_source ?? 'unset')" size="small">
-          {{ authSourceLabel }}
-        </el-tag>
-      </div>
-    </template>
-    <p class="muted">
-      密码修改和退出登录在右上角账户菜单中操作。密码来源：{{ authSourceLabel }}。
-    </p>
-  </el-card>
+  </HorizontalTabs>
 </template>
 
 <style scoped>
-.page-head {
-  margin-bottom: 22px;
+.resource-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
 }
 
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
+.resource-setting label {
+  font-weight: 600;
 }
 
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
+.resource-setting p {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
-.page-head p {
-  margin: 0;
+.resource-setting .el-switch {
+  flex-shrink: 0;
 }
 
 .panel {
@@ -1210,16 +1282,19 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .card-head > div {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .current {
   margin-bottom: 12px;
+  overflow-wrap: anywhere;
 }
 
 .config-form {
@@ -1230,6 +1305,11 @@ onUnmounted(() => {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.form-actions .el-button,
+.artifact-actions .el-button {
+  margin-left: 0;
 }
 
 .notice {
@@ -1283,10 +1363,6 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
-.security-card {
-  margin-top: 2px;
-}
-
 .artifact-actions {
   display: flex;
   gap: 8px;
@@ -1336,6 +1412,18 @@ onUnmounted(() => {
 @media (max-width: 760px) {
   .artifact-stats-grid {
     grid-template-columns: 1fr;
+  }
+
+  .schedule-mode :deep(.el-radio-group) {
+    display: flex;
+    flex-wrap: wrap;
+    row-gap: 8px;
+    max-width: 100%;
+  }
+
+  .panel :deep(.el-card__body),
+  .panel :deep(.el-card__header) {
+    padding: 16px;
   }
 }
 </style>

@@ -6,6 +6,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { ApiError, apiRequest } from "@/api/client";
 import CopyConfigDialog from "@/components/CopyConfigDialog.vue";
 import ExportSelectionDialog from "@/components/ExportSelectionDialog.vue";
+import PageHeader from "@/components/PageHeader.vue";
 import SignalEditor from "@/components/SignalEditor.vue";
 import WorkflowStepEditor from "@/components/WorkflowStepEditor.vue";
 import WorkflowHistoryDialog from "@/components/WorkflowHistoryDialog.vue";
@@ -824,13 +825,8 @@ onMounted(load);
 
 <template>
   <section v-if="!editorOpen">
-    <div class="page-head">
-      <div>
-        <p class="eyebrow">TEMPLATES</p>
-        <h1>模板管理</h1>
-        <p class="muted">模板由有序功能步骤组成；可继承父模板，并按 step_key 覆盖。</p>
-      </div>
-      <div class="head-actions">
+    <PageHeader eyebrow="TEMPLATES" title="模板管理" description="模板由有序功能步骤组成；可继承父模板，并按 step_key 覆盖。">
+      <template #actions>
         <input
           ref="templateImportInput"
           type="file"
@@ -843,8 +839,8 @@ onMounted(load);
         </el-button>
         <el-button @click="exportOpen = true">导出模板</el-button>
         <el-button type="primary" @click="openCreate">新建模板</el-button>
-      </div>
-    </div>
+      </template>
+    </PageHeader>
 
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="notice" />
 
@@ -900,17 +896,15 @@ onMounted(load);
     @pointerdown="interactionStarted = true"
     @keydown="interactionStarted = true"
   >
-    <div class="page-head">
-      <div>
+    <PageHeader eyebrow="TEMPLATES" :title="title" description="步骤按列表从上到下执行；模板步骤固定，新增步骤使用上下移动调整顺序。">
+      <template #leading>
         <el-button link @click="closeEditor">← 返回模板列表</el-button>
-        <h1>{{ title }}</h1>
-        <p class="muted">步骤按列表从上到下执行；模板步骤固定，新增步骤使用上下移动调整顺序。</p>
-      </div>
-      <div class="head-actions">
+      </template>
+      <template #actions>
         <el-button @click="closeEditor">取消</el-button>
         <el-button type="primary" :loading="saving" @click="save">保存模板</el-button>
-      </div>
-    </div>
+      </template>
+    </PageHeader>
 
     <el-alert
       v-if="editorError"
@@ -1067,31 +1061,6 @@ onMounted(load);
 </template>
 
 <style scoped>
-.page-head {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 18px;
-  margin-bottom: 20px;
-}
-
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
-}
-
-.page-head p {
-  margin: 0;
-}
-
 .head-actions {
   display: flex;
   gap: 8px;
@@ -1194,11 +1163,6 @@ onMounted(load);
 @media (max-width: 760px) {
   .editor-page :deep(.el-card__header) {
     top: -16px;
-  }
-
-  .page-head {
-    align-items: flex-start;
-    flex-direction: column;
   }
 }
 </style>

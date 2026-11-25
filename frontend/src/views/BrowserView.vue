@@ -5,6 +5,7 @@ import { ElMessage } from "element-plus";
 
 import { ApiError, apiRequest } from "@/api/client";
 import BrowserBackendSettingsCard from "@/components/BrowserBackendSettingsCard.vue";
+import PageHeader from "@/components/PageHeader.vue";
 import VncViewer from "@/components/VncViewer.vue";
 import { useAuthStore } from "@/stores/auth";
 
@@ -250,14 +251,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="page-head">
-    <div>
-      <p class="eyebrow">LANES</p>
-      <h1>车道状态</h1>
-      <p class="muted">四类车道按需启动；任务占用和 VNC 查看会阻止空闲关闭。</p>
-    </div>
-    <el-button @click="loadLanes()">刷新状态</el-button>
-  </section>
+  <PageHeader eyebrow="LANES" title="车道状态" description="四类车道按需启动；任务占用和 VNC 查看会阻止空闲关闭。">
+    <template #actions>
+      <el-button @click="loadLanes()">刷新状态</el-button>
+    </template>
+  </PageHeader>
 
   <BrowserBackendSettingsCard @unauthorized="handleUnauthorized" />
 
@@ -417,31 +415,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.page-head {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 22px;
-}
-
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
-}
-
-.page-head p {
-  margin: 0;
-}
-
 .panel {
   border-radius: 16px;
   border-color: #e4e9f0;
@@ -592,11 +565,6 @@ onUnmounted(() => {
   .lane-grid,
   .settings-grid {
     grid-template-columns: 1fr;
-  }
-
-  .page-head {
-    align-items: flex-start;
-    flex-direction: column;
   }
 }
 </style>

@@ -84,7 +84,7 @@ try {
     } finally { seed = undefined; }
   };
 
-  assert.match(page, /<\/section>\s*<BrowserBackendSettingsCard @unauthorized="handleUnauthorized"\s*\/>\s*<el-card[^>]*v-loading="lanesLoading"/);
+  assert.match(page, /<\/PageHeader>\s*<BrowserBackendSettingsCard @unauthorized="handleUnauthorized"\s*\/>\s*<el-card[^>]*v-loading="lanesLoading"/);
   assert.doesNotMatch(source, /setInterval|localStorage|sessionStorage|console\.|v-html|show-password|clearable/);
   assert.equal((source.match(/apiRequest<unknown>\(/g) ?? []).length, 1);
   assert.doesNotMatch(source, /\/start|\/test|\/jobs|\/lane-settings/);

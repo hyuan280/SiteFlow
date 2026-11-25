@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { ApiError, apiRequest } from "@/api/client";
+import PageHeader from "@/components/PageHeader.vue";
 import { useAuthStore } from "@/stores/auth";
 import type {
   EmailNotificationView,
@@ -440,13 +441,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <section class="page-head">
-    <div>
-      <p class="eyebrow">NOTIFICATIONS</p>
-      <h1>通知设置</h1>
-      <p class="muted">任务结束后发送邮件或 HTTP 通知，并自定义通知标题和正文布局。</p>
-    </div>
-  </section>
+  <PageHeader eyebrow="NOTIFICATIONS" title="通知设置" description="任务结束后发送邮件或 HTTP 通知，并自定义通知标题和正文布局。" />
 
   <el-alert
     v-if="loadError"
@@ -1002,27 +997,6 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.page-head {
-  margin-bottom: 22px;
-}
-
-.eyebrow {
-  margin: 0 0 6px;
-  color: #409eff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-}
-
-.page-head h1 {
-  margin: 0 0 6px;
-  font-size: 26px;
-}
-
-.page-head p {
-  margin: 0;
-}
-
 .panel {
   border-radius: 16px;
   border-color: #e4e9f0;

@@ -7,6 +7,7 @@ import AssistantSettingsDialog from "@/components/AssistantSettingsDialog.vue";
 import AssistantTakeoverDialog from "@/components/AssistantTakeoverDialog.vue";
 import AssistantMarkdown from "@/components/AssistantMarkdown.vue";
 import AssistantInteractionReview from "@/components/AssistantInteractionReview.vue";
+import PageHeader from "@/components/PageHeader.vue";
 import { interactionPurposeLabel, siteConfigResult, operationResultLabel } from "@/utils/assistant-review";
 import { createAssistantMessageCache } from "@/utils/assistant-message-cache";
 import { ApiError, apiRequest } from "@/api/client";
@@ -821,14 +822,13 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="assistant-page">
-    <header class="page-heading">
-      <div><h1>智能助手</h1><p class="muted">对话梳理需求，观察网站，按授权单步验证，生成待人工审阅的配置提案。</p></div>
-      <div class="heading-actions">
+    <PageHeader class="assistant-header" eyebrow="AI ASSISTANT" title="智能助手" description="对话梳理需求，观察网站，按授权单步验证，生成待人工审阅的配置提案。">
+      <template #actions>
         <el-button @click="takeoverOpen = true">助手接管</el-button>
         <el-button @click="settingsOpen = true">助手设置</el-button>
         <el-button type="primary" :loading="creating" :disabled="creating" @click="createSession">新建会话</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHeader>
     <p v-if="createError" class="error-text" role="alert">{{ createError }}</p>
     <div class="assistant-grid">
       <aside class="sessions-panel" aria-label="助手会话">
@@ -1033,16 +1033,12 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .assistant-page { width: 100%; max-width: 1600px; height: 100%; min-height: 0; margin: 0 auto; display: flex; flex-direction: column; overflow: hidden; }
-.page-heading, .panel-heading, .workspace-heading, .composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.page-heading { margin-bottom: 12px; flex: none; }
-.heading-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
-.heading-actions .el-button { margin-left: 0; }
-h1 { margin: 0 0 8px; font-size: 26px; }
-.page-heading p { margin: 0; }
-.assistant-grid { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 18px; flex: 1; min-height: 0; }
+.panel-heading, .workspace-heading, .composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.assistant-header { margin-bottom: 12px; }
+.assistant-grid { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 4px; flex: 1; min-height: 0; }
 .sessions-panel, .chat-panel { min-width: 0; min-height: 0; border: 1px solid #e4e9f0; border-radius: 12px; background: #fff; overflow: hidden; display: flex; flex-direction: column; }
 .sessions-panel { padding: 14px; }
-.session-list { display: grid; align-content: start; gap: 8px; min-height: 0; overflow: auto; margin-top: 12px; }
+.session-list { display: grid; align-content: start; gap: 4px; min-height: 0; overflow: auto; margin-top: 12px; }
 .session-item { display: grid; gap: 7px; width: 100%; text-align: left; padding: 12px; border: 1px solid transparent; border-radius: 8px; background: #f8fafc; color: inherit; cursor: pointer; overflow-wrap: anywhere; }
 .session-item.selected { border-color: #b8d9ff; background: #eaf3ff; }
 .session-item:focus-visible { outline: 2px solid #409eff; }
@@ -1077,8 +1073,9 @@ h2 { font-size: 18px; margin: 0; overflow: hidden; text-overflow: ellipsis; whit
 .prompt-option { display: flex; align-items: start; gap: 8px; padding: 6px 0; }
 .prompt-field { display: grid; gap: 6px; margin-top: 12px; }
 .prompt-field input { width: 100%; border: 1px solid #c5cfdb; border-radius: 6px; padding: 8px; font: inherit; }
-.timeline { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 20px; }
-.message-card { border: 1px solid #e4e9f0; border-radius: 10px; padding: 14px; margin-bottom: 14px; overflow-wrap: anywhere; }
+.timeline { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 20px; display: flex; flex-direction: column; gap: 2px; }
+.timeline > * { flex-shrink: 0; }
+.message-card { border: 1px solid #e4e9f0; border-radius: 10px; padding: 14px; margin: 0; overflow-wrap: anywhere; }
 .role-user { margin-left: 8%; background: #f0f7ff; border-color: #d9eaff; }
 .role-tool { border-left: 3px solid #409eff; background: #fafbfd; }
 .role-system { background: #fdf6ec; }
@@ -1105,22 +1102,22 @@ pre { max-height: 440px; overflow: auto; white-space: pre-wrap; overflow-wrap: a
 .safety-rail button { flex: none; border: 0; background: transparent; color: #72551e; cursor: pointer; padding: 2px; }
 @keyframes pulse { to { opacity: 0.3; } }
 @media (prefers-reduced-motion: reduce) { .activity-dot { animation: none; } }
-@media (max-width: 1100px) { .assistant-grid { grid-template-columns: 180px minmax(0, 1fr); gap: 12px; } .workspace-heading { flex-direction: column; } }
+@media (max-width: 1100px) { .assistant-grid { grid-template-columns: 180px minmax(0, 1fr); gap: 2px; } .workspace-heading { flex-direction: column; } }
 @media (max-width: 720px) {
-  .assistant-grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: 48px minmax(0, 1fr); gap: 6px; }
+  .assistant-grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: 48px minmax(0, 1fr); gap: 1px; }
   .sessions-panel { flex-direction: row; align-items: center; padding: 4px 8px; gap: 8px; }
   .panel-heading { flex: none; gap: 4px; }
   .panel-heading strong, .sessions-panel > p { display: none; }
-  .session-list { display: flex; margin: 0; gap: 4px; overflow: auto; }
+  .session-list { display: flex; margin: 0; gap: 2px; overflow: auto; }
   .session-list .error-text { flex: 0 0 220px; max-height: 36px; overflow: auto; margin: 0; }
   .session-item { display: block; width: auto; flex: 0 0 100px; padding: 6px; }
   .session-item strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
   .session-item span, .session-item time, .session-item small { display: none; }
-  .page-heading { gap: 8px; margin-bottom: 6px; }
-  h1 { font-size: 20px; margin: 0; }
-  .page-heading p, .state-line small, .composer-actions > span { display: none; }
-  .heading-actions { gap: 4px; }
-  .heading-actions .el-button { padding: 6px 8px; }
+  .assistant-header { margin-bottom: 6px; }
+  .assistant-header :deep(.page-header__title) { font-size: 20px; }
+  .assistant-header :deep(.page-header__description), .state-line small, .composer-actions > span { display: none; }
+  .assistant-header :deep(.page-header__actions) { gap: 4px; }
+  .assistant-header :deep(.el-button) { padding: 6px 8px; }
   .timeline { padding: 12px; }
   .workspace-heading { padding: 8px 10px; gap: 6px; }
   .workspace-title { width: 100%; }
