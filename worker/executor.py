@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from worker.browser_backend import Desktop
 from worker.cfbox_response import resolve_cfbox_prediction
 
@@ -26,6 +27,9 @@ WAIT_UNTIL = {"domcontentloaded", "load", "networkidle"}
 SYSTEM_RESIGN_SIGNAL_KEY = "sys_resign_pending"
 CHECKPOINT_RESIGN_FEATURES = frozenset({"post.resign_loop", "post.resign_dialog"})
 PAGE_TIMEOUT_MS = 30000
+SCREENSHOT_TIMEOUT_SECONDS = 3.0
+SCREENSHOT_DIAGNOSTIC_SECONDS = 0.5
+SCREENSHOT_CLEANUP_SECONDS = 0.5
 SELECTOR_WAIT_MS = 10000
 SIGNAL_WAIT_MS = 3000
 FRAME_OP_TIMEOUT_SECONDS = 2.0
@@ -184,6 +188,70 @@ def _safe_name(value: Any) -> str:
     return cleaned[:80] or "unknown"
 
 
+async def _capture_page_screenshot(
+    page: Any,
+    log: Callable[[str, str], None],
+    *,
+    private: Any = None,
+) -> bytes:
+    try:
+        async with asyncio.timeout(SCREENSHOT_TIMEOUT_SECONDS + 0.25):
+            return await page.screenshot(type="png", timeout=SCREENSHOT_TIMEOUT_SECONDS * 1000)
+    except (PlaywrightTimeoutError, TimeoutError):
+        log("WARN", "page screenshot timeout; trying CDP viewport capture")
+
+    # Only aggregate font state is logged: font names and resource URLs may be private.
+    try:
+        async with asyncio.timeout(SCREENSHOT_DIAGNOSTIC_SECONDS):
+            fonts = await page.evaluate("""() => ({
+                loading: document.fonts.status === 'loading',
+                pending: [...document.fonts].filter(font => font.status === 'loading').length,
+                failed: [...document.fonts].filter(font => font.status === 'error').length
+            })""")
+        log("WARN", f"screenshot fonts: loading={fonts['loading'] is True}, "
+            f"pending={int(fonts['pending'])}, failed={int(fonts['failed'])}")
+    except Exception:
+        log("WARN", "screenshot font diagnostics unavailable")
+
+    session = None
+    try:
+        async with asyncio.timeout(SCREENSHOT_TIMEOUT_SECONDS):
+            if private is not None:
+                await private.validate_origin()
+            session = await page.context.new_cdp_session(page)
+            # Explicit viewport clip preserves device scale and scroll position;
+            # a bare CDP capture can use different dimensions on HiDPI displays.
+            metrics = await session.send("Page.getLayoutMetrics")
+            viewport = metrics["cssVisualViewport"]
+            size = page.viewport_size
+            scale = viewport["scale"]
+            width = size["width"] / scale if size else viewport["clientWidth"]
+            height = size["height"] / scale if size else viewport["clientHeight"]
+            device = await session.send("Runtime.evaluate", {
+                "expression": "window.devicePixelRatio", "returnByValue": True,
+            })
+            # New CDP sessions do not inherit Playwright's emulated device scale.
+            native_scale = metrics["contentSize"]["width"] / metrics["cssContentSize"]["width"]
+            capture_scale = scale * device["result"]["value"] / native_scale
+            result = await session.send("Page.captureScreenshot", {
+                "format": "png", "fromSurface": True, "captureBeyondViewport": False,
+                "clip": {"x": viewport["pageX"], "y": viewport["pageY"],
+                         "width": math.ceil(width), "height": math.ceil(height), "scale": capture_scale},
+            })
+            image = base64.b64decode(result["data"], validate=True)
+            if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError("Invalid CDP screenshot")
+            log("INFO", "CDP viewport screenshot captured")
+            return image
+    finally:
+        if session is not None:
+            try:
+                async with asyncio.timeout(SCREENSHOT_CLEANUP_SECONDS):
+                    await session.detach()
+            except Exception:
+                log("WARN", "screenshot CDP cleanup failed")
+
+
 class JobArtifacts:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.pages = None
@@ -285,7 +353,7 @@ class JobArtifacts:
         if not self.enabled or self.directory is None:
             return
         try:
-            image = await page.screenshot(type="png")
+            image = await _capture_page_screenshot(page, self.log)
         except Exception:
             self.log("WARN", "failure screenshot failed")
             return
@@ -1367,7 +1435,7 @@ async def _run_turnstile_detection(
                     image = await xdisplay.screenshot()
                     fallback_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
                 else:
-                    image = await page.screenshot(type="png")
+                    image = await _capture_page_screenshot(page, note, private=private)
                     viewport = page.viewport_size or {}
                     fallback_size = (
                         int(viewport.get("width") or SCREEN_WIDTH),
@@ -1597,7 +1665,13 @@ async def _run_turnstile_detection(
                             f"方式={click_mode}",
                         )
             except Exception as exc:
-                return "fail", f"CFbox 识别失败: {type(exc).__name__}: {str(exc)[:300]}", {}
+                phase = diagnostics.get("phase", "unknown")
+                failure = {
+                    "screenshot": "CF 截图失败",
+                    "cfbox_request": "CFbox 请求或响应处理失败",
+                }.get(phase, "CF 验证页面检查失败")
+                note("ERROR", f"Cloudflare failure phase={phase}, error={type(exc).__name__}")
+                return "fail", f"{failure}: {type(exc).__name__}", dict(diagnostics)
         diagnostics["phase"] = "poll_wait"
         if not await _sleep(1, cancel):
             return "canceled", "已取消", {}

@@ -1,12 +1,14 @@
 """Run CF probes against Chromium DOM, without contacting real sites or CFbox."""
 
 import asyncio
+import io
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
 from playwright.async_api import async_playwright
 
 from .test_worker_turnstile import fake_clock  # noqa: F401
@@ -30,14 +32,16 @@ SITE_CAP = (
 
 
 @asynccontextmanager
-async def dom_page(html="", documents=None):
+async def dom_page(html="", documents=None, browser_args=(), **context_options):
     if not CHROMIUM.is_file():
         pytest.skip("Local Chromium headless shell not installed")
     documents = documents or {}
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(executable_path=str(CHROMIUM), args=["--no-sandbox"])
+        browser = await playwright.chromium.launch(
+            executable_path=str(CHROMIUM), args=["--no-sandbox", *browser_args],
+        )
         try:
-            page = await browser.new_page(service_workers="block")
+            page = await browser.new_page(service_workers="block", **context_options)
 
             async def route(request_route):
                 url = request_route.request.url
@@ -83,6 +87,62 @@ def test_dom_marker_variants(html, expected):
             assert state["marker"] is expected
             assert "urls" not in state
             assert "secret" not in json.dumps(state)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("device_scale_factor,native,page_scale", [
+    (1, False, 1), (2, False, 1), (2, True, 1), (1, False, 1.25),
+])
+def test_font_loading_timeout_captures_current_viewport(monkeypatch, device_scale_factor, native, page_scale):
+    monkeypatch.setattr(executor, "SCREENSHOT_TIMEOUT_SECONDS", 0.2)
+
+    async def run():
+        logs = []
+        html = ('<style>body{margin:0}div{height:2000px}</style>'
+                '<div style="background:red"></div><div style="background:lime"></div>'
+                '<div style="background:blue"></div>')
+        options = ({"no_viewport": True, "browser_args": ["--force-device-scale-factor=2"]}
+                   if native else {"viewport": {"width": 320, "height": 240},
+                                   "device_scale_factor": device_scale_factor})
+        async with dom_page(html, **options) as page:
+            if page_scale != 1:
+                session = await page.context.new_cdp_session(page)
+                await session.send("Emulation.setPageScaleFactor", {"pageScaleFactor": page_scale})
+                await session.detach()
+            await page.evaluate("scrollTo(0, 2600)")
+            expected_size = await page.evaluate("[innerWidth * devicePixelRatio, innerHeight * devicePixelRatio]")
+            normal = await executor._capture_page_screenshot(page, lambda *args: logs.append(args))
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def hold_font(route):
+                started.set()
+                await release.wait()
+                await route.abort()
+
+            await page.route("**/stuck.woff2", hold_font)
+            try:
+                await page.evaluate("""() => {
+                    const font = new FontFace('PendingFont', 'url(/stuck.woff2)');
+                    document.fonts.add(font);
+                    font.load().catch(() => {});
+                }""")
+                async with asyncio.timeout(5):
+                    await started.wait()
+                    assert await page.evaluate("document.fonts.status") == "loading"
+                    fallback = await executor._capture_page_screenshot(page, lambda *args: logs.append(args))
+                    # Capture must succeed while the font request is still pending.
+                    assert await page.evaluate("document.fonts.status") == "loading"
+                for data in (normal, fallback):
+                    with Image.open(io.BytesIO(data)) as image:
+                        assert image.size == tuple(expected_size)
+                        assert image.convert("RGB").getpixel((160, 120)) == (0, 255, 0)
+                        assert image.convert("RGB").getpixel((image.width - 20, image.height - 20)) == (0, 255, 0)
+                assert any("CDP viewport screenshot captured" in message for _, message in logs)
+                assert any("loading=True, pending=1" in message for _, message in logs)
+                assert "stuck.woff2" not in repr(logs)
+            finally:
+                release.set()
 
     asyncio.run(run())
 

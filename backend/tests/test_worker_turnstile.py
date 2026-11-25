@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import io
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -201,6 +203,75 @@ def test_timeout_preserves_detection_phase():
     ))
     assert result[2]["phase"] == "screenshot"
     assert result[2]["page"]["text_readable"] is True
+
+
+def test_second_screenshot_font_timeout_still_requires_fresh_confirmation(
+    visual_error_scenario, monkeypatch,
+):
+    scenario = visual_error_scenario
+    scenario.predictions = ["absent"]
+    scenario.page.marker = False
+    buffer = io.BytesIO()
+    Image.new("RGB", (100, 100), "white").save(buffer, format="PNG")
+    png = buffer.getvalue()
+    original = scenario.page.screenshot
+    attempts = []
+
+    async def screenshot(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 2:
+            raise executor.PlaywrightTimeoutError("waiting for fonts to load...")
+        return await original(**kwargs)
+
+    async def send(method, *_args):
+        if method == "Page.getLayoutMetrics":
+            return {"cssVisualViewport": {"pageX": 0, "pageY": 0, "scale": 1},
+                    "contentSize": {"width": 100}, "cssContentSize": {"width": 100}}
+        if method == "Runtime.evaluate":
+            return {"result": {"value": 1}}
+        return {"data": base64.b64encode(png).decode("ascii")}
+
+    session = SimpleNamespace(send=AsyncMock(side_effect=send), detach=AsyncMock())
+    scenario.page.context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=session))
+    monkeypatch.setattr(scenario.page, "screenshot", screenshot)
+
+    result = scenario.run()
+
+    assert result[0] == "success"
+    assert result[2]["states"] == ["absent"] * 3
+    assert len(attempts) == len(scenario.calls) == 3
+    assert scenario.calls[-1][0] - scenario.calls[0][0] >= 2
+    assert scenario.submitted_images[1] == png
+    scenario.page.context.new_cdp_session.assert_awaited_once_with(scenario.page)
+    session.detach.assert_awaited_once_with()
+
+
+def test_screenshot_error_is_not_reported_as_cfbox_failure(visual_error_scenario, monkeypatch):
+    scenario = visual_error_scenario
+    monkeypatch.setattr(scenario.page, "screenshot", AsyncMock(side_effect=RuntimeError("private-url")))
+
+    result = scenario.run()
+
+    assert result[0] == "fail"
+    assert result[1] == "CF 截图失败: RuntimeError"
+    assert result[2]["phase"] == "screenshot"
+    assert not scenario.calls
+    assert "private-url" not in repr((result, scenario.logs))
+
+
+def test_private_challenge_rejection_does_not_attempt_screenshot(monkeypatch):
+    page = _CfStatePage(marker=False)
+    screenshot = AsyncMock()
+    monkeypatch.setattr(page, "screenshot", screenshot, raising=False)
+    private = SimpleNamespace(pin_challenge=AsyncMock(side_effect=RuntimeError("denied")))
+
+    result = asyncio.run(executor._run_turnstile(
+        page, {"wait_seconds": 2}, {"url": "http://cfbox.invalid"},
+        None, None, "general", private=private,
+    ))
+
+    assert result[0] == "fail"
+    screenshot.assert_not_awaited()
 
 
 @pytest.mark.parametrize("visible,failing,expected", [(False, True, True), (True, True, False), (True, False, True)])
