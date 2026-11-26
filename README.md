@@ -217,6 +217,7 @@ git diff --check
 ## 文档
 
 - [使用指南](docs/usage.md)：配置站点、编排流程、执行与排查。
+- [CookieCloud](docs/cookiecloud.md)：只读服务配置、PyCookieCloud 接入与 Cookie 域名排查。
 - [配置历史](docs/workflow-history.md)：版本快照、依赖追溯、恢复与并发保护。
 - [草稿校验](docs/workflow-drafts.md)：未保存配置的校验、继承解析与无写入预览接口。
 - [智能助手](docs/ai-assistant.md)：38 个普通交互工具及 1 个接管专用工具、持久化聊天、绑定站点 Cookie 私有注入/审核清除、授权观察/验证/导入、站点转模板、全局调度/取消、历史资料及失败接管边界。

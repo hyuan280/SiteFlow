@@ -258,12 +258,14 @@ class CredentialService:
 
     def resolve_cookies(self, site_id: int) -> list[dict] | None:
         self._site(site_id)
-        row = self._row(site_id)
+        return self.cookies_from_row(self._row(site_id))
+
+    def cookies_from_row(self, row: SiteCredential | None) -> list[dict] | None:
         if row is None or not row.cookies_ciphertext or not row.cookies_nonce:
             return None
         try:
             text = self.crypto.decrypt(
-                _aad(site_id, "cookies"),
+                _aad(row.site_id, "cookies"),
                 row.cookies_ciphertext,
                 row.cookies_nonce,
                 row.key_version,

@@ -10,6 +10,7 @@ import StringListField from "@/components/StringListField.vue";
 import { useAuthStore } from "@/stores/auth";
 import { formatServerDateTime } from "@/utils/datetime";
 import ModelSettingsCard from "@/components/ModelSettingsCard.vue";
+import CookieCloudSettingsCard from "@/components/CookieCloudSettingsCard.vue";
 import type { VisionView } from "@/types/integrations";
 
 interface ProxyView {
@@ -111,6 +112,7 @@ const settingsTabs = [
   { value: "integrations", label: "集成" },
   { value: "models", label: "大模型" },
   { value: "logs", label: "日志" },
+  { value: "cookiecloud", label: "CookieCloud" },
   { value: "system", label: "系统" },
 ];
 const systemSettings = ref<SystemSettingsView | null>(null);
@@ -720,6 +722,7 @@ onUnmounted(() => {
       <ModelSettingsCard @unauthorized="handleUnauthorized" />
     </el-col>
   </el-row>
+  <CookieCloudSettingsCard v-if="activeTab === 'cookiecloud'" @unauthorized="handleUnauthorized" />
   <el-card v-show="activeTab === 'system'" shadow="never" class="panel">
     <template #header><strong>系统显示</strong></template>
     <div class="resource-setting" :aria-busy="systemSettingsLoading || systemSettingsSaving">

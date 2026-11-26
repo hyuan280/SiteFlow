@@ -13,6 +13,15 @@ def ensure_trusted_urls_column(engine: Engine) -> None:
             ))
 
 
+def ensure_cookiecloud_all_sites_column(engine: Engine) -> None:
+    with engine.begin() as connection:
+        columns = inspect(connection).get_columns("cookiecloud_servers")
+        if not any(column["name"] == "all_sites" for column in columns):
+            connection.execute(text(
+                "ALTER TABLE cookiecloud_servers ADD COLUMN all_sites BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+
+
 def ensure_workflow_history_keys(engine: Engine) -> None:
     """Incremental migration: keep existing local revisions and stable identities."""
     with engine.begin() as connection:

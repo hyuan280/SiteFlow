@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from threading import BoundedSemaphore
 
@@ -13,6 +14,7 @@ from app.api.v1 import (
     assistant,
     assistant_takeover,
     config_ai,
+    cookiecloud,
     features,
     health,
     integrations,
@@ -34,7 +36,11 @@ from app.core.auth import LoginRateLimiter
 from app.core.config import Settings
 from app.core.crypto import CryptoService
 from app.core.db import Base, create_db_engine, create_session_factory
-from app.core.schema_updates import ensure_trusted_urls_column, ensure_workflow_history_keys
+from app.core.schema_updates import (
+    ensure_cookiecloud_all_sites_column,
+    ensure_trusted_urls_column,
+    ensure_workflow_history_keys,
+)
 from app.features.plugin_registry import clear_plugin_registry, refresh_plugin_registry
 from app.services.artifacts import ArtifactCleanupRunner
 from app.services.execution import ExecutionService
@@ -76,6 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     crypto = CryptoService(settings.master_key_bytes())
     engine = create_db_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    ensure_cookiecloud_all_sites_column(engine)
     ensure_trusted_urls_column(engine)
     ensure_workflow_history_keys(engine)
     session_factory = create_session_factory(engine)
@@ -142,6 +149,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    logging.getLogger("uvicorn.access").addFilter(cookiecloud.access_filter)
+    app.include_router(cookiecloud.settings_router)
+    app.include_router(cookiecloud.public_router)
     app.include_router(health.router)
     app.include_router(system.router)
     app.include_router(secrets.router)
