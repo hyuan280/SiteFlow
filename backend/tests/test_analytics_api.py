@@ -8,12 +8,15 @@ from app.models.execution import JobStep, Run, SiteJob
 from app.models.workflow import SiteResignRecord
 
 
-def _site(client: TestClient) -> dict:
+def _site(
+    client: TestClient, *, name: str = "analytics-site", enabled: bool = True
+) -> dict:
     response = client.post(
         "/api/v1/sites",
         json={
-            "name": "analytics-site",
+            "name": name,
             "base_url": "https://pt.example.com",
+            "enabled": enabled,
             "steps": [{"step_key": "open", "feature_type": "flow.open"}],
         },
     )
@@ -79,6 +82,117 @@ def _job(
         return job.id
     finally:
         session.close()
+
+
+def test_daily_matrix_counts_enabled_sites_once(client: TestClient) -> None:
+    successful = _site(client, name="successful", enabled=True)
+    failed = _site(client, name="failed", enabled=True)
+    notrun = _site(client, name="notrun", enabled=True)
+    disabled = _site(client, name="disabled", enabled=False)
+    disabled_notrun = _site(client, name="disabled-notrun", enabled=False)
+    for status in ("success", "fail", "success", "fail"):
+        _job(client, successful, status=status, message=status, step_status=status)
+    _job(client, failed, status="fail", message="failed", step_status="fail")
+    _job(client, disabled, status="success", message="disabled", step_status="success")
+
+    response = client.get("/api/v1/analytics/matrix?days=1&include_disabled=false")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["dates"]) == 1
+    today = body["dates"][0]
+    assert body["start_date"] == body["end_date"] == today
+    assert len(body["sites"]) == 3
+    rows = {row["site_id"]: row for row in body["sites"]}
+    assert set(rows) == {successful["id"], failed["id"], notrun["id"]}
+    assert all(row["enabled"] is True for row in rows.values())
+    assert rows[notrun["id"]]["cells"] == {}
+    assert set(rows[successful["id"]]["cells"]) == {today}
+    cell = rows[successful["id"]]["cells"][today]
+    assert cell["status"] == "success"
+    assert cell["attempts"] == 4
+    assert cell["counts"] == {"success": 2, "fail": 2}
+    assert set(rows[failed["id"]]["cells"]) == {today}
+    assert rows[failed["id"]]["cells"][today]["attempts"] == 1
+    # Dashboard counts each row once; an absent daily cell means notrun.
+    assert {
+        site_id: row["cells"].get(today, {}).get("status", "notrun")
+        for site_id, row in rows.items()
+    } == {successful["id"]: "success", failed["id"]: "fail", notrun["id"]: "notrun"}
+
+    response = client.get("/api/v1/analytics/matrix?days=1&include_disabled=true")
+    assert response.status_code == 200, response.text
+    inclusive = response.json()
+    assert inclusive["dates"] == [today]
+    assert len(inclusive["sites"]) == 5
+    all_rows = {row["site_id"]: row for row in inclusive["sites"]}
+    assert set(all_rows) == {*rows, disabled["id"], disabled_notrun["id"]}
+    for site_id, row in rows.items():
+        assert all_rows[site_id] == row
+    assert all_rows[disabled["id"]]["enabled"] is False
+    assert set(all_rows[disabled["id"]]["cells"]) == {today}
+    disabled_cell = all_rows[disabled["id"]]["cells"][today]
+    assert disabled_cell["status"] == "success"
+    assert disabled_cell["attempts"] == 1
+    assert disabled_cell["counts"] == {"success": 1}
+    assert all_rows[disabled_notrun["id"]]["enabled"] is False
+    assert all_rows[disabled_notrun["id"]]["cells"] == {}
+
+
+def test_daily_matrix_reflects_site_disable_and_reenable(client: TestClient) -> None:
+    site = _site(client, name="toggle-enabled")
+    notrun = _site(client, name="always-enabled")
+    _job(client, site, status="success", message="success", step_status="success")
+    response = client.get("/api/v1/analytics/matrix?days=1&include_disabled=false")
+    assert response.status_code == 200, response.text
+    initial = response.json()
+    assert len(initial["dates"]) == 1
+    today = initial["dates"][0]
+    assert len(initial["sites"]) == 2
+    initial_rows = {row["site_id"]: row for row in initial["sites"]}
+    assert set(initial_rows) == {site["id"], notrun["id"]}
+    original_cells = initial_rows[site["id"]]["cells"]
+    assert set(original_cells) == {today}
+    assert original_cells[today]["status"] == "success"
+
+    for enabled in (False, True):
+        response = client.put(
+            f"/api/v1/sites/{site['id']}",
+            json={
+                "name": site["name"],
+                "base_url": site["base_url"],
+                "enabled": enabled,
+                "steps": [{"step_key": "open", "feature_type": "flow.open"}],
+                "expected_revision": site["config_revision"],
+                "expected_history_key": site["history_key"],
+            },
+        )
+        assert response.status_code == 200, response.text
+        site = response.json()
+        assert site["enabled"] is enabled
+
+        response = client.get("/api/v1/analytics/matrix?days=1&include_disabled=false")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["dates"] == [today]
+        expected_ids = {site["id"], notrun["id"]} if enabled else {notrun["id"]}
+        assert len(body["sites"]) == len(expected_ids)
+        rows = {row["site_id"]: row for row in body["sites"]}
+        assert set(rows) == expected_ids
+        assert all(row["enabled"] is True for row in rows.values())
+        assert rows[notrun["id"]]["cells"] == {}
+        if enabled:
+            assert rows[site["id"]]["cells"] == original_cells
+
+        response = client.get("/api/v1/analytics/matrix?days=1&include_disabled=true")
+        assert response.status_code == 200, response.text
+        inclusive = response.json()
+        assert inclusive["dates"] == [today]
+        assert len(inclusive["sites"]) == 2
+        all_rows = {row["site_id"]: row for row in inclusive["sites"]}
+        assert set(all_rows) == {site["id"], notrun["id"]}
+        assert all_rows[site["id"]]["enabled"] is enabled
+        assert all_rows[site["id"]]["cells"] == original_cells
+        assert all_rows[notrun["id"]] == rows[notrun["id"]]
 
 
 def test_matrix_includes_successful_resign_dates(client: TestClient) -> None:

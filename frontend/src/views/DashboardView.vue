@@ -7,7 +7,7 @@ import { ApiError, apiRequest } from "@/api/client";
 import PageHeader from "@/components/PageHeader.vue";
 import ResourceRing from "@/components/ResourceRing.vue";
 import { useAuthStore } from "@/stores/auth";
-import type { TrendsView } from "@/types/analytics";
+import type { MatrixView } from "@/types/analytics";
 import type { Feature, RunDetail, RunSummary, SiteJobView, SiteOption, TemplateSummary } from "@/types/workflow";
 import { dashboardCards, dashboardStatus, dashboardStatuses, defaultDashboardLayout, parseDashboardLayout } from "@/utils/dashboard";
 import { formatServerDateTime } from "@/utils/datetime";
@@ -43,7 +43,7 @@ const templates = ref<TemplateSummary[]>([]);
 const features = ref<Feature[]>([]);
 const lanes = ref<LanesResponse | null>(null);
 const runningLanes = computed(() => lanes.value?.lanes.filter((lane) => lane.status === "running").length ?? 0);
-const trends = ref<TrendsView | null>(null);
+const dailyMatrix = ref<MatrixView | null>(null);
 const latestRun = ref<RunDetail | null>(null);
 const resources = ref<Resources | null>(null);
 const showResources = ref(false);
@@ -60,9 +60,20 @@ try { layout.value = parseDashboardLayout(localStorage.getItem(storageKey)); } c
 
 const visibleCards = computed(() => layout.value.filter((card) => card.key !== "resources" || showResources.value));
 const enabledSites = computed(() => sites.value.filter((site) => site.enabled).length);
-const slices = computed(() => dashboardStatuses.filter((item) => item.key !== "skipped").map((item) => ({
-  ...item, count: Number(trends.value?.[item.key as keyof TrendsView] ?? 0),
-})));
+const dailySites = computed(() => dailyMatrix.value?.sites.filter((site) => site.enabled) ?? []);
+const slices = computed(() => {
+  const counts: Record<string, number> = {};
+  for (const site of dailySites.value) {
+    const status = site.cells[dailyMatrix.value!.end_date]?.status ?? "not_run";
+    counts[status] = (counts[status] ?? 0) + 1;
+  }
+  return [...dashboardStatuses.filter((item) => item.key !== "skipped"),
+    { key: "not_run", label: "未运行", color: "#dcdfe6" }].map((item) => ({
+    ...item, count: counts[item.key] ?? 0,
+  }));
+});
+const dailySuccessRate = computed(() => dailySites.value.length
+  ? (slices.value.find((item) => item.key === "success")?.count ?? 0) / dailySites.value.length * 100 : 0);
 const pieStyle = computed(() => {
   const total = slices.value.reduce((sum, item) => sum + item.count, 0);
   if (!total) return { background: "#edf1f6" };
@@ -143,8 +154,8 @@ async function load(): Promise<void> {
       })(),
       (async () => {
         try {
-          const response = await apiRequest<TrendsView>("/analytics/trends?days=1");
-          if (active) trends.value = response;
+          const response = await apiRequest<MatrixView>("/analytics/matrix?days=1&include_disabled=false");
+          if (active) dailyMatrix.value = response;
         } catch (cause) { await captureError(cause, "今日分析"); }
       })(),
       (async () => {
@@ -253,19 +264,19 @@ onUnmounted(() => {
         </button>
       </div>
       <template v-else-if="card.key === 'analytics'">
-        <div v-if="trends" class="analytics-body">
+        <div v-if="dailyMatrix" class="analytics-body">
           <button type="button" class="pie-button" aria-label="查看今日运行分析" @click="openAnalytics">
-            <span class="pie-chart" :style="pieStyle"><span class="pie-center"><strong>{{ trends.total }}</strong><small>今日执行</small></span></span>
+            <span class="pie-chart" :style="pieStyle"><span class="pie-center"><strong>{{ dailySites.length }}</strong><small>启用站点</small></span></span>
           </button>
           <div class="chart-legend">
-            <div class="success-rate"><strong>{{ trends.success_rate.toFixed(1) }}<small>%</small></strong><span>成功率</span></div>
+            <div class="success-rate"><strong>{{ dailySuccessRate.toFixed(1) }}<small>%</small></strong><span>成功率</span></div>
             <button v-for="slice in slices" :key="slice.key" type="button" class="legend-row" @click="openAnalytics">
               <i :style="{ background: slice.color }" /><span>{{ slice.label }}</span><strong>{{ slice.count }}</strong>
             </button>
           </div>
         </div>
         <el-empty v-else description="暂无今日运行分析" :image-size="64" />
-        <p class="card-note">{{ trends?.start_date ?? '今日' }} · 按调度时区统计已结束任务，未运行时显示为空。</p>
+        <p class="card-note">{{ dailyMatrix?.end_date ?? '今日' }} · 仅统计当前启用站点，每站计一次；无当日结果计为未运行，同日成功优先。</p>
       </template>
 
       <template v-else-if="card.key === 'latest-run'">
@@ -334,18 +345,18 @@ onUnmounted(() => {
 .stat-card span, .stat-card small { display: block; color: #7a8794; font-size: 12px; }
 .stat-card strong { display: block; font-size: 30px; margin: 6px 0; }
 .dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
-.dashboard-card { min-width: 0; border: 1px solid #e4e9f0; border-radius: 16px; background: #fff; overflow: hidden; }
+.dashboard-card { min-width: 0; border: 1px solid #e4e9f0; border-radius: 16px; background: #fff; overflow: hidden; container-type: inline-size; }
 .dashboard-card.is-full { grid-column: 1 / -1; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 16px 20px; border-bottom: 1px solid #edf1f6; }
 .card-head h2 { margin: 0; font-size: 15px; }
 .card-note { color: #8a96a3; font-size: 12px; line-height: 1.7; margin: 0; padding: 12px 20px 16px; }
 .analytics-body { display: flex; align-items: center; justify-content: center; gap: 28px; padding: 22px 20px 4px; }
-.pie-button { padding: 0; background: none; border: 0; cursor: pointer; flex: none; border-radius: 50%; }
-.pie-chart { width: 172px; height: 172px; border-radius: 50%; display: grid; place-items: center; }
-.pie-center { display: grid; place-content: center; width: 122px; height: 122px; border-radius: 50%; background: white; }
+.pie-button { padding: 0; background: none; border: 0; cursor: pointer; flex: none; width: 243px; max-width: 100%; border-radius: 50%; }
+.pie-chart { width: 100%; aspect-ratio: 1; border-radius: 50%; display: grid; place-items: center; }
+.pie-center { display: grid; place-content: center; width: 74%; height: 74%; border-radius: 50%; background: white; }
 .pie-center strong { font-size: 30px; color: #1f2d3d; }
 .pie-center small { margin-top: 4px; color: #7a8794; }
-.chart-legend { width: 160px; min-width: 0; }
+.chart-legend { width: 160px; min-width: 0; flex: none; }
 .success-rate { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
 .success-rate strong { font-size: 24px; color: #509c2d; }
 .success-rate small, .success-rate span { font-size: 12px; white-space: nowrap; }
@@ -370,7 +381,7 @@ onUnmounted(() => {
 .layout-row strong { flex: 1; font-size: 13px; }
 .layout-row .el-button + .el-button { margin-left: 0; }
 .width-select { width: 90px; flex: none; }
-@media (max-width: 1150px) { .analytics-body { gap: 18px; } .pie-chart { width: 140px; height: 140px; } .pie-center { width: 100px; height: 100px; } }
+@container (max-width: 470px) { .analytics-body { flex-direction: column; gap: 20px; padding-inline: 14px; } .chart-legend { width: 243px; max-width: 100%; } }
 @media (max-width: 1050px) { .dashboard-grid { grid-template-columns: 1fr; } }
-@media (max-width: 600px) { .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } .stat-card { padding: 14px 10px; } .stat-card strong { font-size: 24px; } .stat-card small { font-size: 10px; } .card-head { padding: 14px; } .analytics-body { padding-inline: 14px; gap: 20px; } .chart-legend { width: 140px; } .layout-row { flex-wrap: wrap; } .layout-row strong { min-width: 100%; } }
+@media (max-width: 600px) { .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } .stat-card { padding: 14px 10px; } .stat-card strong { font-size: 24px; } .stat-card small { font-size: 10px; } .card-head { padding: 14px; } .layout-row { flex-wrap: wrap; } .layout-row strong { min-width: 100%; } }
 </style>

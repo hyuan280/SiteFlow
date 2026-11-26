@@ -35,7 +35,16 @@ const resourceView = {
   docker_available: false, siteflow_cpu_percent: null, siteflow_memory_percent: null,
   siteflow_memory_used_bytes: null, siteflow_container_count: 0, docker_error: null,
 };
-const trendsView = { total: 5, success: 3, fail: 1, deferred: 1, success_rate: 60, start_date: "2026-11-25" };
+const matrixCell = (status, counts = { [status]: 1 }) => ({
+  status, attempts: Object.values(counts).reduce((sum, count) => sum + count, 0), counts,
+  last_run_id: 812, last_job_id: 22, last_message: "",
+});
+const dailyMatrixView = {
+  start_date: "2026-11-25", end_date: "2026-11-25", dates: ["2026-11-25"], sites: [
+    { site_id: 101, name: "site-101", enabled: true, cells: { "2026-11-25": matrixCell("success") } },
+    { site_id: 102, name: "site-102", enabled: false, cells: { "2026-11-25": matrixCell("deferred") } },
+  ],
+};
 const lanesView = { worker_connected: true, lanes: [
   { key: "browser-1", status: "running" }, { key: "browser-2", status: "idle" },
   { key: "http-1", status: "running" }, { key: "http-2", status: "queued" },
@@ -63,8 +72,8 @@ const defaultResponse = path => {
     case "/templates": return [{ id: 301 }];
     case "/features": return [{ key: "flow.open" }, { key: "flow.result" }];
     case "/lanes": return lanesView;
-    case "/analytics/trends?days=1": return trendsView;
-    case "/analytics/trends?days=14": return { ...trendsView, points: [] };
+    case "/analytics/matrix?days=1&include_disabled=false": return dailyMatrixView;
+    case "/analytics/trends?days=14": return { total: 5, success: 3, fail: 1, deferred: 1, success_rate: 60, start_date: "2026-11-25", points: [] };
     case "/analytics/matrix?days=14&include_disabled=false": return { sites: [], dates: [] };
     case "/runs?limit=1": return [{ id: runView.id }];
     case `/runs/${runView.id}`: return runView;
@@ -131,7 +140,7 @@ const server = await createServer({
   plugins: [{ name: "dashboard-layout-harness", enforce: "pre", transform(source, id) {
     const name = id.split("/").at(-1);
     const exposed = {
-      "DashboardView.vue": "loading, refreshing, errors, sites, templates, features, lanes, runningLanes, trends, latestRun, resources, showResources, layoutDialog, layout, draftLayout, displayTimezone, visibleCards, enabledSites, finalJobs, slices, pieStyle, resourceMetrics, load, editLayout, moveCard, saveLayout, formatDate, openRun, openAnalytics",
+      "DashboardView.vue": "loading, refreshing, errors, sites, templates, features, lanes, runningLanes, dailyMatrix, dailySites, dailySuccessRate, latestRun, resources, showResources, layoutDialog, layout, draftLayout, displayTimezone, visibleCards, enabledSites, finalJobs, slices, pieStyle, resourceMetrics, load, editLayout, moveCard, saveLayout, formatDate, openRun, openAnalytics",
       "AnalyticsView.vue": "days, overviewLoading, failureLoading, error, failureError",
       "SettingsView.vue": "activeTab, settingsTabs, systemSettings, showSystemResources, systemSettingsLoading, systemSettingsSaving, systemSettingsError, loadSystemSettings, saveSystemSettings",
       "HorizontalTabs.vue": "scroller, panel, sizePanel, dragging, focusIndex, reveal, onWheel, onPointerDown, onPointerMove, stopDrag, onClick, onKeydown",
@@ -209,7 +218,7 @@ try {
   const defaults = defaultDashboardLayout();
   const keys = Object.keys(dashboardCards);
   const copyDashboard = ui => target => {
-    for (const key of ["loading", "refreshing", "errors", "sites", "templates", "features", "lanes", "trends", "latestRun", "resources", "showResources", "layout", "displayTimezone"])
+    for (const key of ["loading", "refreshing", "errors", "sites", "templates", "features", "lanes", "dailyMatrix", "latestRun", "resources", "showResources", "layout", "displayTimezone"])
       target[key].value = ui[key].value;
   };
   const cardTitles = html => [...html.matchAll(/<h2[^>]*>(.*?)<\/h2>/g)].map(match => match[1]);
@@ -379,7 +388,7 @@ try {
     storageFailure = true;
     const { ui } = await mount(Dashboard);
     assert.deepEqual(ui.layout.value, defaults);
-    assert.ok(ui.trends.value, "storage errors do not block dashboard requests");
+    assert.ok(ui.dailyMatrix.value, "storage errors do not block dashboard requests");
     ui.editLayout(); ui.moveCard(0, 1); ui.draftLayout.value[0].width = "full"; ui.saveLayout();
     assert.deepEqual(ui.layout.value, defaults, "failed storage cannot apply the edited draft");
     assert.equal(ui.layoutDialog.value, true);
@@ -536,14 +545,14 @@ try {
   });
 
   await test("each failed dashboard block leaves unrelated cards usable and a refresh can recover", async () => {
-    for (const failingPath of ["/templates", "/lanes", "/scheduler-settings", "/analytics/trends?days=1", "/runs?limit=1", `/runs/${runView.id}`, "/system-settings", "/system-resources"]) {
+    for (const failingPath of ["/templates", "/lanes", "/scheduler-settings", "/analytics/matrix?days=1&include_disabled=false", "/runs?limit=1", `/runs/${runView.id}`, "/system-settings", "/system-resources"]) {
       calls.length = 0;
       handler = ({ path }) => path === failingPath ? json({ detail: "isolated failure" }, 503)
         : json(path === "/system-settings" ? { show_system_resources: true } : defaultResponse(path));
       const { ui, app } = await mount(Dashboard);
       assert.equal(ui.loading.value, false); assert.equal(ui.refreshing.value, false);
       assert.equal(ui.errors.value.length, 1, failingPath); assert.match(ui.errors.value[0], /isolated failure/);
-      if (failingPath !== "/analytics/trends?days=1") assert.deepEqual(ui.trends.value, trendsView);
+      if (failingPath !== "/analytics/matrix?days=1&include_disabled=false") assert.deepEqual(ui.dailyMatrix.value, dailyMatrixView);
       if (!failingPath.startsWith("/runs")) assert.equal(ui.latestRun.value.id, runView.id);
       if (failingPath !== "/templates") assert.equal(ui.sites.value.length, 2);
       if (failingPath !== "/lanes") assert.deepEqual(ui.lanes.value, lanesView);
@@ -555,14 +564,14 @@ try {
       assert.match(html, /isolated failure/);
       assert.deepEqual(cardTitles(html), expectedTitles(ui.visibleCards.value));
       handler = undefined; await ui.load();
-      assert.deepEqual(ui.errors.value, []); assert.deepEqual(ui.trends.value, trendsView);
+      assert.deepEqual(ui.errors.value, []); assert.deepEqual(ui.dailyMatrix.value, dailyMatrixView);
       assert.equal(ui.latestRun.value.id, runView.id);
       unmount(app);
     }
   });
 
   await test("dashboard 401 clears authentication and replaces the route with login", async () => {
-    for (const failingPath of ["/sites?view=options&include_valid=true", "/lanes", "/scheduler-settings", "/analytics/trends?days=1", `/runs/${runView.id}`, "/system-settings", "/system-resources"]) {
+    for (const failingPath of ["/sites?view=options&include_valid=true", "/lanes", "/scheduler-settings", "/analytics/matrix?days=1&include_disabled=false", `/runs/${runView.id}`, "/system-settings", "/system-resources"]) {
       clearCount = 0; navigation.length = 0;
       handler = ({ path }) => path === failingPath ? json({ detail: "expired" }, 401)
         : json(path === "/system-settings" ? { show_system_resources: true } : defaultResponse(path));
@@ -643,7 +652,7 @@ try {
       assert.deepEqual(ui.errors.value, ["\u8f66\u9053\u72b6\u6001\uff1alanes offline"]);
       assert.equal(ui.sites.value.length, 2); assert.equal(ui.enabledSites.value, 1);
       assert.equal(ui.templates.value.length, 1); assert.equal(ui.features.value.length, 2);
-      assert.deepEqual(ui.trends.value, trendsView); assert.equal(ui.latestRun.value.id, runView.id);
+      assert.deepEqual(ui.dailyMatrix.value, dailyMatrixView); assert.equal(ui.latestRun.value.id, runView.id);
       assert.equal(ui.refreshing.value, false); assert.equal(ui.loading.value, false);
       handler = undefined; await ui.load();
       assert.deepEqual(ui.errors.value, []); assert.deepEqual(ui.lanes.value, lanesView);
@@ -661,6 +670,130 @@ try {
     ui.openAnalytics();
     assert.deepEqual(navigation, [{ action: "push", name: "analytics" }]);
     assert.equal(calls.length, before, "navigation does not reload dashboard data");
+  });
+
+  await test("today analytics counts each enabled site once, excludes disabled results and includes not-run sites in success rate", async () => {
+    const matrix = { ...dailyMatrixView, sites: [
+      { site_id: 101, name: "success-after-retries", enabled: true,
+        cells: { "2026-11-25": matrixCell("success", { success: 1, fail: 99 }) } },
+      { site_id: 102, name: "failed-retries", enabled: true,
+        cells: { "2026-11-25": matrixCell("fail", { fail: 100 }) } },
+      { site_id: 103, name: "not-started", enabled: true, cells: {} },
+      { site_id: 104, name: "disabled-result", enabled: false,
+        cells: { "2026-11-25": matrixCell("error", { error: 100 }) } },
+    ] };
+    handler = ({ path }) => json(path === "/analytics/matrix?days=1&include_disabled=false" ? matrix
+      : path === "/sites?view=options&include_valid=true" ? matrix.sites.map(site => ({ id: site.site_id, enabled: site.enabled }))
+      : defaultResponse(path));
+    const { ui } = await mount(Dashboard);
+    assert.deepEqual(ui.errors.value, []);
+    assert.equal(ui.enabledSites.value, 3);
+    assert.deepEqual(ui.dailySites.value.map(site => site.site_id), [101, 102, 103]);
+    assert.deepEqual(ui.slices.value.filter(slice => slice.count).map(({ key, count }) => [key, count]),
+      [["success", 1], ["fail", 1], ["not_run", 1]]);
+    assert.equal(ui.slices.value.reduce((sum, slice) => sum + slice.count, 0), 3,
+      "attempts and counts never multiply a site's contribution or override the server's success-priority status");
+    assert.equal(ui.dailySuccessRate.value, 1 / 3 * 100, "unrun enabled sites remain in the denominator");
+    const notRun = ui.slices.value.find(slice => slice.key === "not_run");
+    assert.equal(notRun.label, "\u672a\u8fd0\u884c"); assert.equal(notRun.color, "#dcdfe6");
+    const grayStop = ui.pieStyle.value.background.match(/#dcdfe6 ([\d.]+)% ([\d.]+)%/);
+    assert.ok(grayStop, "not-run sites have a gray segment");
+    assert.ok(Math.abs(Number(grayStop[1]) - 2 / 3 * 100) < 1e-10);
+    assert.ok(Math.abs(Number(grayStop[2]) - 100) < 1e-10);
+    const html = await render(Dashboard, copyDashboard(ui));
+    assert.match(html, /class="pie-center"[^>]*><strong[^>]*>3<\/strong><small[^>]*>\u542f\u7528\u7ad9\u70b9<\/small>/);
+    assert.match(html, /class="success-rate"[^>]*><strong[^>]*>33\.3<small[^>]*>%<\/small>/);
+    assert.match(html, /background:#dcdfe6[^>]*><\/i><span[^>]*>\u672a\u8fd0\u884c<\/span><strong[^>]*>1<\/strong>/);
+  });
+
+  await test("today analytics selects the server end_date cell, not the browser date or the first matrix date", async () => {
+    const browserDate = new Date().toISOString().slice(0, 10);
+    const serverDate = browserDate === "2001-01-02" ? "2001-01-03" : "2001-01-02";
+    const matrix = { start_date: "2001-01-01", end_date: serverDate, dates: ["2001-01-01", serverDate], sites: [
+      { site_id: 101, name: "server-success", enabled: true, cells: {
+        [browserDate]: matrixCell("error"), "2001-01-01": matrixCell("fail"), [serverDate]: matrixCell("success"),
+      } },
+      { site_id: 102, name: "only-other-days", enabled: true, cells: {
+        [browserDate]: matrixCell("success"), "2001-01-01": matrixCell("success"),
+      } },
+    ] };
+    handler = ({ path }) => json(path === "/analytics/matrix?days=1&include_disabled=false" ? matrix : defaultResponse(path));
+    const { ui } = await mount(Dashboard);
+    for (const timezone of ["Pacific/Kiritimati", "America/Los_Angeles", "UTC"]) {
+      ui.displayTimezone.value = timezone;
+      assert.deepEqual(ui.slices.value.filter(slice => slice.count).map(({ key, count }) => [key, count]),
+        [["success", 1], ["not_run", 1]]);
+      assert.equal(ui.dailySuccessRate.value, 50);
+      const html = await render(Dashboard, copyDashboard(ui));
+      assert.ok(html.includes(`${serverDate} \u00b7`), "the analytics note displays the server date as well");
+      assert.match(html, /class="success-rate"[^>]*><strong[^>]*>50\.0<small[^>]*>%<\/small>/);
+    }
+  });
+
+  await test("today analytics handles unavailable data, zero enabled sites and enabled sites with no results without invalid rings", async () => {
+    handler = ({ path }) => path === "/analytics/matrix?days=1&include_disabled=false"
+      ? json({ detail: "matrix unavailable" }, 503) : json(defaultResponse(path));
+    const { ui } = await mount(Dashboard);
+    assert.equal(ui.dailyMatrix.value, null);
+    assert.equal(ui.dailySites.value.length, 0); assert.equal(ui.dailySuccessRate.value, 0);
+    assert.equal(ui.pieStyle.value.background, "#edf1f6");
+    const unavailable = await render(Dashboard, copyDashboard(ui));
+    assert.match(unavailable, /\u6682\u65e0\u4eca\u65e5\u8fd0\u884c\u5206\u6790/);
+    assert.doesNotMatch(unavailable, /class="pie-chart"|NaN|Infinity/);
+    for (const sites of [[], dailyMatrixView.sites.filter(site => !site.enabled), [
+      { site_id: 101, name: "not-started", enabled: true, cells: {} },
+      { site_id: 102, name: "also-not-started", enabled: true, cells: {} },
+    ]]) {
+      handler = ({ path }) => json(path === "/analytics/matrix?days=1&include_disabled=false"
+        ? { ...dailyMatrixView, sites } : defaultResponse(path));
+      await ui.load();
+      assert.deepEqual(ui.errors.value, []);
+      const enabled = sites.filter(site => site.enabled).length;
+      assert.equal(ui.dailySites.value.length, enabled); assert.equal(ui.dailySuccessRate.value, 0);
+      assert.equal(ui.slices.value.find(slice => slice.key === "not_run").count, enabled);
+      assert.equal(ui.slices.value.reduce((sum, slice) => sum + slice.count, 0), enabled);
+      assert.equal(ui.pieStyle.value.background, enabled ? "conic-gradient(#dcdfe6 0% 100%)" : "#edf1f6");
+      const html = await render(Dashboard, copyDashboard(ui));
+      assert.match(html, new RegExp(`class="pie-center"[^>]*><strong[^>]*>${enabled}<\\/strong>`));
+      assert.match(html, /class="success-rate"[^>]*><strong[^>]*>0\.0<small[^>]*>%<\/small>/);
+      assert.doesNotMatch(html, /NaN|Infinity|\u6682\u65e0\u4eca\u65e5\u8fd0\u884c\u5206\u6790/);
+    }
+  });
+
+  await test("today analytics reload reflects disabling and re-enabling a site with existing results", async () => {
+    const { ui } = await mount(Dashboard);
+    for (const enabled of [true, false, true]) {
+      const sites = dailyMatrixView.sites.map(site => site.site_id === 102 ? { ...site, enabled } : site);
+      handler = ({ path }) => json(path === "/analytics/matrix?days=1&include_disabled=false" ? { ...dailyMatrixView, sites }
+        : path === "/sites?view=options&include_valid=true" ? sites.map(site => ({ id: site.site_id, enabled: site.enabled }))
+        : defaultResponse(path));
+      calls.length = 0; await ui.load();
+      assert.deepEqual(ui.errors.value, []);
+      assert.equal(calls.filter(call => call.path === "/analytics/matrix?days=1&include_disabled=false").length, 1);
+      assert.equal(ui.enabledSites.value, enabled ? 2 : 1);
+      assert.equal(ui.dailySites.value.length, enabled ? 2 : 1);
+      assert.equal(ui.slices.value.find(slice => slice.key === "success").count, 1);
+      assert.equal(ui.slices.value.find(slice => slice.key === "deferred").count, enabled ? 1 : 0);
+      assert.equal(ui.slices.value.reduce((sum, slice) => sum + slice.count, 0), enabled ? 2 : 1);
+      assert.equal(ui.dailySuccessRate.value, enabled ? 50 : 100);
+      assert.equal(ui.pieStyle.value.background, enabled
+        ? "conic-gradient(#67c23a 0% 50%, #b88230 50% 100%)" : "conic-gradient(#67c23a 0% 100%)");
+      const html = await render(Dashboard, copyDashboard(ui));
+      assert.match(html, new RegExp(`class="pie-center"[^>]*><strong[^>]*>${enabled ? 2 : 1}<\\/strong>`));
+      assert.match(html, new RegExp(`class="success-rate"[^>]*><strong[^>]*>${enabled ? "50" : "100"}\\.0<small[^>]*>%<\\/small>`));
+    }
+  });
+
+  await test("dashboard initial load, refresh and polling GET only the one-day enabled-site matrix, never today trends", async () => {
+    const { ui } = await mount(Dashboard);
+    await ui.load();
+    const timer = [...timers.values()].find(item => item.delay === 15000);
+    timer.callback(); await settle();
+    assert.deepEqual(ui.errors.value, []);
+    assert.deepEqual(calls.filter(call => call.path.startsWith("/analytics/")), Array.from({ length: 3 }, () => ({
+      path: "/analytics/matrix?days=1&include_disabled=false", method: "GET", body: undefined,
+    })));
+    assert.equal(calls.some(call => call.path.startsWith("/analytics/trends?")), false);
   });
 
   await test("analytics defaults all requests to 14 days and offers no today range or query override", async () => {
@@ -708,7 +841,7 @@ try {
     }
     assert.equal(dashboardStatus("future_status").label, "future_status");
     assert.match(ui.pieStyle.value.background, /^conic-gradient\(/);
-    ui.trends.value = { total: 0 }; assert.equal(ui.pieStyle.value.background, "#edf1f6");
+    ui.dailyMatrix.value = { ...dailyMatrixView, sites: [] }; assert.equal(ui.pieStyle.value.background, "#edf1f6");
   });
 
   await test("run deep links use stable run, job and site ids rather than names or list indexes", async () => {
@@ -735,13 +868,13 @@ try {
     calls.length = 0; document.hidden = true; timer.callback(); await settle(); assert.equal(calls.length, 0);
     document.hidden = false;
     let release;
-    handler = ({ path }) => path === "/analytics/trends?days=1" ? new Promise(resolve => { release = resolve; }) : json(defaultResponse(path));
+    handler = ({ path }) => path === "/analytics/matrix?days=1&include_disabled=false" ? new Promise(resolve => { release = resolve; }) : json(defaultResponse(path));
     timer.callback(); await settle(); assert.equal(ui.refreshing.value, true);
     const count = calls.length;
     await ui.load(); timer.callback(); await settle(); assert.equal(calls.length, count);
     unmount(app);
-    release(json({ ...trendsView, total: 999 })); await settle();
-    assert.equal(ui.trends.value.total, trendsView.total, "late responses cannot hydrate an unmounted dashboard");
+    release(json({ ...dailyMatrixView, end_date: "2099-12-31", sites: [] })); await settle();
+    assert.deepEqual(ui.dailyMatrix.value, dailyMatrixView, "late responses cannot hydrate an unmounted dashboard");
   });
 
   const copySettings = ui => target => {
