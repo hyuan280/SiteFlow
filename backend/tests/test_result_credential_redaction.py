@@ -23,11 +23,10 @@ def fingerprint(value):
     return len(value), hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-@pytest.mark.parametrize("response_format", ["content", "tool"])
 @pytest.mark.parametrize("use_vision", [False, True])
 @pytest.mark.parametrize("code", ["1234", "123456", "1234567890"])
 def test_execute_job_redacts_consumed_credentials(
-    monkeypatch, tmp_path, caplog, capsys, response_format, use_vision, code,
+    monkeypatch, tmp_path, caplog, capsys, use_vision, code,
 ):
     caplog.set_level("DEBUG")
     monkeypatch.setattr(executor, "ARTIFACT_ROOT", tmp_path)
@@ -75,11 +74,7 @@ def test_execute_job_redacts_consumed_credentials(
         f"entered {code}; visible 2026 9876543210."
     )
     text = json.dumps({"result": True, "reason": raw_reason})
-    message = {"content": text} if response_format == "content" else {"tool_calls": [{
-        "type": "function", "function": {
-            "name": "submit_workflow_result", "arguments": text,
-        },
-    }]}
+    message = {"content": text}
     requests = []
     original_client = httpx.AsyncClient
 
@@ -96,7 +91,7 @@ def test_execute_job_redacts_consumed_credentials(
         assert request.url.host == "provider.invalid"
         return httpx.Response(200, json={"choices": [{
             "message": message,
-            "finish_reason": "stop" if response_format == "content" else "tool_calls",
+            "finish_reason": "stop",
         }]})
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
@@ -155,7 +150,7 @@ def test_execute_job_redacts_consumed_credentials(
     assert vision.sanitize_judgment_reason(reason, {FINGERPRINTS: payload[FINGERPRINTS]}) == reason
     request_text = requests[-1].content.decode()
     assert set(json.loads(request_text)) == {
-        "model", "temperature", "messages", "tools", "tool_choice",
+        "model", "temperature", "messages",
     }
     log = (tmp_path / "run-1" / "job-1" / "job.log").read_text()
     assert reason in log

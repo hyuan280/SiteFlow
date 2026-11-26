@@ -297,11 +297,11 @@ post.resign_dialog
 
 可选模型判断要求「功能设置」中的总开关与步骤卡片的「开启模型判断」同时开启，并遵循全局判断范围。步骤开关默认关闭，旧步骤缺少该字段时保持关闭。站点/模板可通过 `llm_enabled` 开启、`llm_prompt` 提供业务判断标准，留空使用全局提示词；支持模板继承与站点覆盖。全局关闭时步骤模型设置保留但不生效。视觉模式仅发送页面截图，文本模式仅发送页面文本；模型明确结论替代原输出，请求失败或结论无效则步骤失败，不静默回退。
 
-结果判断与九宫格识别采用相同兼容策略：声明可选工具 `submit_workflow_result`，`tool_choice=auto`，不强制指定工具、不使用 required 或强制 response_format。模型可以调用一次该工具，也可以在无工具调用时直接返回正文 JSON，例如 `{"result":true,"reason":"简短可见依据"}`。`result` 必须为 boolean，`reason` 必须为 1 到 500 字符的非空简短依据；两条路径均拒绝额外字段、重复 JSON 键和非法 JSON。错误或多个工具调用不会再用正文兜底；不猜测自然语言布尔结论，不从 Markdown 中提取结果，不读取 reasoning_content，允许剥离正文前导且完整闭合的 think 块。
+结果判断仅通过 system 提示约束模型直接返回正文 JSON，不声明工具或设置 tool_choice，也不强制 response_format。例如 `{"result":true,"reason":"简短可见依据"}`。`result` 必须为 boolean，`reason` 必须为 1 到 500 字符的非空简短依据；拒绝额外字段、重复 JSON 键和非法 JSON。返回非空工具调用时视为无效响应，不读取工具参数；不猜测自然语言布尔结论，不从 Markdown 中提取结果，不读取 reasoning_content，允许剥离正文前导且完整闭合的 think 块。九宫格识别的工具协议不受影响。
 
 系统将不可编辑的输出协议放入 system 消息，用户业务标准使用独立消息，不把合并后的内容写回配置。功能和步骤卡片显示只读协议说明；旧自定义提示词不自动改写，但其中的输出格式不能替代固定协议。有效 false 仍表示判断步骤执行成功、站点任务失败。匹配原输出时保留配置消息，不匹配时显示模型判断值。
 
-成功依据经已知秘密脱敏、控制字符清理后记录日志及步骤 `data.judgment_reason`，不复制到任务 `outputs`。实际取用的凭据和 OTP 只增加任务内长度/哈希指纹，避免为脱敏长期缓存明文；指纹不发送给模型或写入结果。依据是模型生成文本，仍可能包含未识别的页面隐私，不能将脱敏视为完整 DLP。失败日志及步骤 data 区分 HTTP 错误（带状态码）、timeout、network_error、no_result、invalid_tool_call、invalid_json、schema_error、truncated、content_filtered、refused 等，并记录固定阶段和耗时；无工具时的正文解析标记 content 阶段，证据采集失败标记 evidence_error。不记录原始响应、参数、令牌或底层异常正文，不自动重试。
+成功依据经已知秘密脱敏、控制字符清理后记录日志及步骤 `data.judgment_reason`，不复制到任务 `outputs`。实际取用的凭据和 OTP 只增加任务内长度/哈希指纹，避免为脱敏长期缓存明文；指纹不发送给模型或写入结果。依据是模型生成文本，仍可能包含未识别的页面隐私，不能将脱敏视为完整 DLP。失败日志及步骤 data 区分 HTTP 错误（带状态码）、timeout、network_error、no_result、invalid_response、invalid_json、schema_error、truncated、content_filtered、refused 等，并记录固定阶段和耗时；正文解析标记 content 阶段，非空工具调用标记 invalid_response/provider_response，证据采集失败标记 evidence_error。不记录原始响应、参数、令牌或底层异常正文，不自动重试。
 
 ### 模型失败诊断
 

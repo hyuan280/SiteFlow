@@ -398,18 +398,32 @@ def test_only_scalar_envelope_fields_are_accepted(model_call):
 @pytest.mark.parametrize("source,code", [("tool_call", "invalid_tool_call"),
                                        ("tool_arguments", "invalid_json")])
 def test_tool_stage_diagnostics_never_fall_back(model_call, source, code):
-    if model_call.kind not in {"grid", "result"}:
-        pytest.skip("tool clients only")
+    if model_call.kind != "grid":
+        pytest.skip("grid tool client only")
     model_call.payload["choices"][0]["message"]["tool_calls"] = [{
         "type": "function", "function": {
-            "name": "wrong-tool" if source == "tool_call" else (
-                "submit_geetest_result" if model_call.kind == "grid" else "submit_workflow_result"
-            ),
+            "name": "wrong-tool" if source == "tool_call" else "submit_geetest_result",
             "arguments": "private-invalid-json",
         },
     }]
     error = failure(model_call, code, source)
     assert "private-invalid-json" not in repr(vars(error))
+
+
+@pytest.mark.parametrize("arguments", [
+    json.dumps({"result": False, "reason": "private-tool-reason"}), "private-invalid-json",
+])
+def test_result_tool_calls_are_provider_response_errors(model_call, arguments):
+    if model_call.kind != "result":
+        pytest.skip("result content-only contract")
+    model_call.payload["choices"][0]["message"]["tool_calls"] = [{
+        "type": "function", "function": {
+            "name": "submit_workflow_result", "arguments": arguments,
+        },
+    }]
+    error = failure(model_call, "invalid_response", "provider_response")
+    assert model_call.calls == 1
+    assert "private" not in repr(vars(error))
 
 
 def test_success_resets_scoped_log_filter(model_call, caplog):

@@ -62,13 +62,11 @@ def test_result_settings_default_roundtrip_and_reset(client, prompt):
     properties = view["config_schema"]["properties"]
     assert properties["llm_prompt"]["maxLength"] == 4000
     for text in (
-        "工具选择为 auto", "可优先调用一次 submit_workflow_result",
-        "未调用工具时直接返回正文 JSON", "result (boolean) 和 reason (string)",
-        "system 约束 JSON schema，不强制工具调用",
-        "多个工具调用、工具名称或参数无效均失败，不回退到正文 JSON",
+        "模型直接返回正文 JSON", "result (boolean) 和 reason (string)",
+        "system 约束 JSON schema", "不声明或接受工具调用", "正文 JSON 无效时步骤失败",
     ):
         assert text in properties["llm_enabled"]["description"]
-    assert "也可直接返回正文 JSON" in properties["llm_prompt"]["description"]
+    assert "模型直接返回正文 JSON" in properties["llm_prompt"]["description"]
     assert '{"result":true,"reason":"可见依据"}' in properties["llm_prompt"]["description"]
     assert "无需手写输出格式" in properties["llm_prompt"]["description"]
     assert "不合并保存" in properties["llm_prompt"]["description"]
@@ -76,7 +74,7 @@ def test_result_settings_default_roundtrip_and_reset(client, prompt):
     assert "不等于完整 DLP" in properties["llm_prompt"]["description"]
     for obsolete in (
         "必须只输出 True 或 False", "必须支持 OpenAI tool calling", "固定要求只调用一次",
-        "未调用、", "不接受纯文本 JSON", "response_format", "tool_choice",
+        "未调用、", "不接受纯文本 JSON", "response_format", "tool_choice", "submit_workflow_result",
     ):
         assert obsolete not in json.dumps(properties, ensure_ascii=False)
     assert view["defaults"] == {

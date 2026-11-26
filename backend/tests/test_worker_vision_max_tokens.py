@@ -90,7 +90,7 @@ def test_request_uses_only_exact_positive_configured_budget(vision_path, options
     expected_keys = {"model", "messages"}
     if case.path != "captcha":
         expected_keys.add("temperature")
-    if case.path in {"result", "grid"}:
+    if case.path == "grid":
         expected_keys.update(("tools", "tool_choice"))
         assert body["tool_choice"] == "auto"
     if options.get("max_tokens"):

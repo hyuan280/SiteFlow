@@ -556,10 +556,9 @@ class FlowResultConfig(FeatureConfig):
         strict=True,
         description=(
             "启用本步骤的大模型结果判断；还需启用全局大模型判断开关。"
-            "工具选择为 auto，可优先调用一次 submit_workflow_result，也可在未调用工具时"
-            "直接返回正文 JSON；两种方式均须符合固定 JSON schema："
-            "result (boolean) 和 reason (string)。system 约束 JSON schema，不强制工具调用；"
-            "多个工具调用、工具名称或参数无效均失败，不回退到正文 JSON"
+            "模型直接返回正文 JSON，须符合固定 JSON schema："
+            "result (boolean) 和 reason (string)。system 约束 JSON schema；"
+            "不声明或接受工具调用，正文 JSON 无效时步骤失败"
         ),
     )
     llm_prompt: Annotated[str, StringConstraints(strip_whitespace=True, max_length=4000)] = Field(
@@ -568,7 +567,7 @@ class FlowResultConfig(FeatureConfig):
             "可选的本步骤业务判断提示词；留空时使用全局提示词，也可继承模板提示词；"
             "需同时启用全局和本步骤大模型判断。仅填写业务判断规则，无需手写输出格式；"
             "worker 在运行时添加不可被业务提示词覆盖的 system 输出约束，不合并保存。"
-            '可优先通过工具 submit_workflow_result 提交，也可直接返回正文 JSON，示例：'
+            '模型直接返回正文 JSON，示例：'
             '{"result":true,"reason":"可见依据"}。'
             "reason 保存到步骤 data 并记录日志，可能包含页面隐私；系统要求不输出账号、密码、"
             "Cookie、验证码、令牌等敏感信息，已知密钥脱敏不等于完整 DLP 防护"

@@ -377,8 +377,8 @@ function errorValue(): string {
         <p class="muted">最多 4000 字符，仅填写业务判断规则，留空使用全局提示词；未覆盖时可继承模板提示词。已有自定义提示词不会自动改写。</p>
         <div class="muted" role="note" aria-label="系统输出协议（只读）">
           <strong>系统输出协议（只读）</strong>
-          <p>worker 在运行时添加固定 system 输出约束，不与业务提示词合并保存，也不能被业务提示词中的格式要求覆盖；仅约束 JSON schema，不强制工具调用，无需用户手写输出格式。</p>
-          <p>工具选择为 auto，可优先调用一次 <code>submit_workflow_result</code>，也可在未调用工具时直接返回正文 JSON。工具参数与正文 JSON 均须符合固定 schema <code>{result: boolean, reason: string}</code>，示例：<code>{"result":true,"reason":"可见依据"}</code>。存在工具调用时只接受一个有效的 <code>submit_workflow_result</code>；多个工具调用、工具名称或参数无效均失败，不回退到正文 JSON。</p>
+          <p>worker 在运行时添加固定 system 输出约束，不与业务提示词合并保存，也不能被业务提示词中的格式要求覆盖；模型直接返回正文 JSON，无需用户手写输出格式。</p>
+          <p>正文 JSON 须符合固定 schema <code>{result: boolean, reason: string}</code>，示例：<code>{"result":true,"reason":"可见依据"}</code>。不声明或接受工具调用；额外字段、类型错误或无效 JSON 均会导致步骤失败。</p>
           <p><code>reason</code> 将保存到步骤 data 并记录日志，判断依据可能包含页面隐私。系统要求不输出账号、密码、Cookie、验证码、令牌或其他敏感信息；已知密钥脱敏不等于完整 DLP 防护。</p>
         </div>
       </template>

@@ -640,12 +640,12 @@ A valid False conclusion is a successfully evaluated step that outputs false and
 fails the site task; a True conclusion outputs true. Model judgement replaces the
 configured result within the selected scope. Failed model calls produce no Boolean
 output and follow the step's error policy; choosing `continue` can therefore allow
-later steps to run. As with grid recognition, the worker declares the optional tool
-`submit_workflow_result` with `tool_choice=auto`, without a named/required choice or
-forced response format. It accepts either one valid tool call or, when there are
-no calls, a JSON object in message content. Both require exactly `result` (strict
-boolean) and `reason` (nonblank string, 1-500 characters). Invalid or multiple calls
-are not rescued by message content. Natural-language conclusions, Markdown,
+later steps to run. The worker uses a system prompt to require a JSON object directly
+in message content, without declaring tools, setting `tool_choice`, or forcing a
+response format. It requires exactly `result` (strict boolean) and `reason`
+(nonblank string, 1-500 characters). Nonempty tool calls are rejected as
+`invalid_response` at `provider_response`; tool arguments are never read. Grid
+recognition retains its separate tool protocol. Natural-language conclusions, Markdown,
 duplicate JSON keys, extra fields and malformed JSON are rejected. Balanced leading
 think blocks may be stripped from content; `reasoning_content` is never a result.
 The default step deadline allows the provider timeout plus screenshot overhead;
@@ -669,7 +669,7 @@ a template prompt with an empty string to use the global prompt. Reset controls
 remove the local override and restore inheritance. Input mode, model selection
 and judgment scope remain global.
 
-The tool returns JSON arguments such as:
+The model returns JSON content such as:
 
 ```json
 {"result": false, "reason": "The page still shows a pending check-in action."}
@@ -684,7 +684,7 @@ their prior semantics and are not replaced by the reason.
 Failures retain `reason=model_judgment_failed` and add a fixed `provider_error` code,
 `stage`, optional `http_status`, timeout metadata and sanitized provider fields as
 described in [Worker Model Errors](#worker-model-errors). Codes distinguish HTTP
-errors, timeout, network errors, missing results, wrong/multiple tool calls, invalid
+errors, timeout, network errors, missing results, unexpected tool calls, invalid
 JSON or schema, truncation, content filtering and refusal. Evidence collection
 errors use `evidence_error`. Logs include
 these bounded diagnostics and elapsed time, never raw provider bodies, arguments,
