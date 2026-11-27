@@ -9,6 +9,17 @@ class SystemSettings(BaseModel):
     show_system_resources: bool
 
 
+class ComponentBuild(BaseModel):
+    version: str | None = Field(max_length=128)
+    commit: str | None = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+class SystemVersions(BaseModel):
+    api: ComponentBuild
+    worker: ComponentBuild | None
+    bitwarden: ComponentBuild | None
+
+
 class SystemResources(BaseModel):
     model_config = ConfigDict(frozen=True)
 

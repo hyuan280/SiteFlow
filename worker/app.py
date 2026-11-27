@@ -49,6 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger("siteflow.worker")
 
 DATA_DIR = Path(os.environ.get("SITEFLOW_WORKER_DATA", "/app/data"))
+BUILD_INFO_PATH = Path(__file__).resolve().parents[1] / "build-info"
 PROXY_URL = os.environ.get("SITEFLOW_PROXY_URL", "").strip()
 PLUGIN_BROKER_URL = os.environ.get(
     "SITEFLOW_PLUGIN_BROKER_URL", "http://worker:6300/plugin-broker"
@@ -1131,6 +1132,14 @@ def create_app() -> FastAPI:
     def health() -> dict[str, Any]:
         status = app.state.manager.status()
         return {"ok": status["ok"], "lanes": len(status["lanes"])}
+
+    @app.get("/version")
+    def build_version() -> dict[str, str | None]:
+        try:
+            version, _, commit = BUILD_INFO_PATH.read_text(encoding="utf-8").partition("\n")
+        except (OSError, ValueError):
+            return {"version": None, "commit": None}
+        return {"version": version or None, "commit": commit.strip() or None}
 
     @app.get("/status")
     def status() -> dict[str, Any]:

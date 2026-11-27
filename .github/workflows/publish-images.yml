@@ -68,6 +68,7 @@ jobs:
           {
             echo "component=$component"
             echo "version=$version"
+            echo "commit=$(git rev-parse HEAD)"
             echo "image=$image"
             echo 'tags<<TAGS'
             echo "$image:$version"
@@ -83,6 +84,9 @@ jobs:
       - name: Build Frontend
         if: steps.release.outputs.component == 'web'
         working-directory: frontend
+        env:
+          SITEFLOW_BUILD_VERSION: ${{ steps.release.outputs.version }}
+          SITEFLOW_BUILD_COMMIT: ${{ steps.release.outputs.commit }}
         run: |
           npm ci --no-audit --no-fund
           npm run type-check
@@ -103,10 +107,10 @@ jobs:
           tags: ${{ steps.release.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.release.outputs.version }}
             org.opencontainers.image.licenses=MIT
           build-args: |
             PIP_INDEX_URL=https://pypi.org/simple
+            SITEFLOW_BUILD_VERSION=${{ steps.release.outputs.version }}
+            SITEFLOW_BUILD_COMMIT=${{ steps.release.outputs.commit }}
           cache-from: type=gha,scope=${{ steps.release.outputs.component }}
           cache-to: type=gha,mode=max,scope=${{ steps.release.outputs.component }}

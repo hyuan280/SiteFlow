@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import { promisify } from "node:util";
 
@@ -11,6 +12,17 @@ const BW_SERVER = (process.env.BW_SERVER || "").trim();
 const CLIENT_ID = (process.env.BW_CLIENTID || "").trim();
 const CLIENT_SECRET = (process.env.BW_CLIENTSECRET || "").trim();
 const MASTER_PASSWORD = process.env.BW_PASSWORD || "";
+
+function readBuildInfo() {
+  try {
+    const [version, commit] = readFileSync(new URL("./build-info", import.meta.url), "utf8").split("\n");
+    return { version: version || null, commit: commit || null };
+  } catch {
+    return { version: null, commit: null };
+  }
+}
+
+const buildInfo = readBuildInfo();
 
 const MULTI_PART_SUFFIXES = new Set([
   "co.uk",
@@ -326,6 +338,9 @@ function readBody(request) {
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://localhost");
   try {
+    if (request.method === "GET" && url.pathname === "/version") {
+      return send(response, 200, buildInfo);
+    }
     if (request.method === "GET" && url.pathname === "/health") {
       if (url.searchParams.get("deep") === "1" && configured()) {
         try {

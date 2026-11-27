@@ -3,12 +3,14 @@ import { computed, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from "element-plus";
 
+import SystemVersionsDialog from "@/components/SystemVersionsDialog.vue";
 import { useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
 const route = useRoute();
 const router = useRouter();
 
+const aboutDialog = ref(false);
 const passwordDialog = ref(false);
 const passwordFormRef = ref<FormInstance>();
 const passwordSaving = ref(false);
@@ -143,6 +145,12 @@ async function handleCommand(command: string): Promise<void> {
   }
 }
 
+async function handleExpiredSession(): Promise<void> {
+  aboutDialog.value = false;
+  auth.clear();
+  await router.replace({ name: "login" });
+}
+
 async function changePassword(): Promise<void> {
   if (!passwordFormRef.value) return;
   const valid = await passwordFormRef.value.validate().catch(() => false);
@@ -171,24 +179,46 @@ async function changePassword(): Promise<void> {
         </span>
       </router-link>
 
-      <el-dropdown trigger="hover" @command="handleCommand">
-        <button type="button" class="account-trigger">
-          <span class="avatar">{{ (auth.user?.username?.slice(0, 1) ?? "?").toUpperCase() }}</span>
-          <span class="account-text">
-            <strong>{{ auth.user?.username }}</strong>
-            <small>{{ authSourceLabel }}</small>
-          </span>
-          <span class="caret">▾</span>
+      <div class="topbar-actions">
+        <button
+          type="button"
+          class="about-trigger"
+          aria-label="关于 SiteFlow"
+          title="关于 SiteFlow"
+          aria-haspopup="dialog"
+          @click="aboutDialog = true"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 11v5 M12 8h.01" />
+          </svg>
         </button>
-        <template #dropdown>
-          <el-dropdown-menu>
-            <el-dropdown-item command="password" :disabled="!canChangePassword">
-              修改密码
-            </el-dropdown-item>
-            <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
-          </el-dropdown-menu>
-        </template>
-      </el-dropdown>
+        <el-dropdown trigger="hover" @command="handleCommand">
+          <button type="button" class="account-trigger">
+            <span class="avatar">{{ (auth.user?.username?.slice(0, 1) ?? "?").toUpperCase() }}</span>
+            <span class="account-text">
+              <strong>{{ auth.user?.username }}</strong>
+              <small>{{ authSourceLabel }}</small>
+            </span>
+            <span class="caret">▾</span>
+          </button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="password" :disabled="!canChangePassword">
+                修改密码
+              </el-dropdown-item>
+              <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+      </div>
     </header>
 
     <div class="app-body">
@@ -215,6 +245,8 @@ async function changePassword(): Promise<void> {
         <router-view />
       </section>
     </div>
+
+    <SystemVersionsDialog v-model="aboutDialog" @unauthorized="handleExpiredSession" />
 
     <el-dialog v-model="passwordDialog" title="修改管理员密码" width="min(440px, 92vw)">
       <el-form
@@ -299,6 +331,36 @@ async function changePassword(): Promise<void> {
   margin-top: 1px;
   color: #8a96a3;
   font-size: 11px;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.about-trigger {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #4b5b6b;
+  cursor: pointer;
+}
+
+.about-trigger:hover,
+.about-trigger:focus-visible {
+  background: #eaf3ff;
+  color: #2f7ed8;
+}
+
+.about-trigger svg {
+  width: 22px;
+  height: 22px;
 }
 
 .account-trigger {

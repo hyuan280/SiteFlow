@@ -17,7 +17,13 @@ RUN npm install -g --no-audit --no-fund --registry="$NPM_REGISTRY" "@bitwarden/c
 COPY bitwarden/server.mjs /app/server.mjs
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/siteflow/
 
-RUN mkdir -p /data /app && chown -R node:node /data /app
+ARG SITEFLOW_BUILD_VERSION=v0.0.0-dev
+ARG SITEFLOW_BUILD_COMMIT
+LABEL org.opencontainers.image.version=$SITEFLOW_BUILD_VERSION \
+      org.opencontainers.image.revision=$SITEFLOW_BUILD_COMMIT
+
+RUN printf '%s\n%s\n' "$SITEFLOW_BUILD_VERSION" "$SITEFLOW_BUILD_COMMIT" > /app/build-info \
+    && mkdir -p /data /app && chown -R node:node /data /app
 USER node
 
 EXPOSE 8090

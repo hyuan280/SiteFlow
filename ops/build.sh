@@ -14,12 +14,23 @@ if (( $# > 1 )); then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+declare -A versions commits
+for service in api worker web bitwarden; do
+  info="$(bash "$ROOT/ops/build-info.sh" "$service")"
+  read -r version commit <<< "$info"
+  versions[$service]="$version"
+  commits[$service]="$commit"
+done
+
 cd "$ROOT/frontend"
 
 npm ci --no-audit --no-fund
-npm run build
+SITEFLOW_BUILD_VERSION="${versions[web]}" SITEFLOW_BUILD_COMMIT="${commits[web]}" npm run build
 
 cd "$ROOT"
 for service in api worker web bitwarden; do
-  docker build "${build_args[@]}" -f "ops/Dockerfile.$service" -t "siteflow-$service" .
+  docker build "${build_args[@]}" \
+    --build-arg "SITEFLOW_BUILD_VERSION=${versions[$service]}" \
+    --build-arg "SITEFLOW_BUILD_COMMIT=${commits[$service]}" \
+    -f "ops/Dockerfile.$service" -t "siteflow-$service" .
 done

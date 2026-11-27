@@ -15,6 +15,12 @@ RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" -r /app/worker-requirements.t
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/siteflow/
 COPY worker /app/worker
 COPY proto/siteflow_proto /app/siteflow_proto
+ARG SITEFLOW_BUILD_VERSION=v0.0.0-dev
+ARG SITEFLOW_BUILD_COMMIT
+LABEL org.opencontainers.image.version=$SITEFLOW_BUILD_VERSION \
+      org.opencontainers.image.revision=$SITEFLOW_BUILD_COMMIT
+RUN printf '%s\n%s\n' "$SITEFLOW_BUILD_VERSION" "$SITEFLOW_BUILD_COMMIT" > /app/build-info
+
 EXPOSE 6300
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=5 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6300/health', timeout=2)"

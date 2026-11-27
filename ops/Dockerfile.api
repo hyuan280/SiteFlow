@@ -22,8 +22,13 @@ RUN useradd --create-home --uid 10001 siteflow \
     && mkdir -p /app/data \
     && chown -R siteflow:siteflow /app
 
-USER siteflow
+ARG SITEFLOW_BUILD_VERSION=v0.0.0-dev
+ARG SITEFLOW_BUILD_COMMIT
+LABEL org.opencontainers.image.version=$SITEFLOW_BUILD_VERSION \
+      org.opencontainers.image.revision=$SITEFLOW_BUILD_COMMIT
+RUN printf '%s\n%s\n' "$SITEFLOW_BUILD_VERSION" "$SITEFLOW_BUILD_COMMIT" > /app/build-info
 
+USER siteflow
 EXPOSE 8000
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=5 \

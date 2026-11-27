@@ -26,6 +26,14 @@ Web 发布会先构建前端。Worker 不下载或打包浏览器、KasmVNC 服�
 仅构建执行器及远程后端客户端；构建层使用 GitHub Actions 缓存。
 CI 使用官方 PyPI，宿主机构建仍默认使用清华 PyPI、阿里云 apt 源。
 
+## 查看运行版本
+
+登录后点击右上角用户名左侧的 ⓘ 图标，在「关于 SiteFlow」弹窗中查看 Web 前端、API 后端、Worker 和 Bitwarden 的构建版本及完整 Git commit。Bitwarden 显示的是 SiteFlow 封装镜像的版本；集成设置仍单独显示 Bitwarden CLI 的版本。
+
+通过 `bash ops/build.sh` 构建时，四个组件分别从当前提交的 Git 历史查找最近的对应标签。工作区干净且当前提交有对应标签时使用标签版本（如 `v1.0`）；否则追加 `-dev`（如 `v1.0-dev`），没有可达标签时用 `v0.0.0-dev`。仅有浅克隆时，先获取完整历史及标签才能正确推导上一个版本。开发构建的 commit 指向构建时的 `HEAD`，不包含未提交改动。
+
+发布工作流将发布版本与实际检出的完整 commit 同时写入镜像标签和运行产物。直接执行 `docker build` 或 `docker compose build` 不会自动推导 Git 元数据；本地请使用 `ops/build.sh`。
+
 ## GitHub 配置
 
 - 工作流使用仓库的 `GITHUB_TOKEN`，需要 `contents: read` 和 `packages: write`，无需配置个人访问令牌。

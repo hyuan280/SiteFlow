@@ -3,3 +3,8 @@ COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/siteflow/
 
 COPY ops/Caddyfile /etc/caddy/Caddyfile
 COPY frontend/dist /srv
+
+ARG SITEFLOW_BUILD_VERSION=v0.0.0-dev
+ARG SITEFLOW_BUILD_COMMIT
+LABEL org.opencontainers.image.version=$SITEFLOW_BUILD_VERSION \
+      org.opencontainers.image.revision=$SITEFLOW_BUILD_COMMIT
