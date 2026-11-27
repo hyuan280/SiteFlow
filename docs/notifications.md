@@ -6,7 +6,7 @@
 
 页面最上方的「通知布局」同时作用于邮件和 HTTP 通道的原任务通知。助手调查通知使用独立纯文本简报，不套用或修改此自定义布局。
 
-- 通知标题：1–200 字符，用于邮件主题和 HTTP 的 `title`。
+- 通知标题：1–200 字符，用于邮件主题和 HTTP 通知所选的标题字段。
 - 正文布局：1–20000 字符，支持 `{{变量}}` 占位符。
 - 正文格式：纯文本或 HTML。邮件按所选格式发送；HTTP 请求体始终附带 `format` 字段。
 - HTML 格式下，站点名、状态和消息等变量会被 HTML 转义；布局模板本身不转义。
@@ -51,7 +51,7 @@ siteflow_domain, summary
 
 每次运行进入最终状态后立即发送一次原任务通知，包括成功、失败、错误、等待人工、取消和中断，不等待助手或额外调用模型。注册时仅本地规划接管并去重；需新模型复查时在站点原始脱敏消息前加「助手复查中，结果稍后发出。原任务结果：」，复用则直接带历史结论，不发第二条调查通知。事件、渲染正文和通道目标冻结加密保存为 ready。通知在 API 进程内异步发送，不阻塞任务收尾；通道发送失败不影响运行结果。
 
-只有在「通知设置」中启用、且运行结果通过该通道筛选条件的通道才会在真实运行结束后发送。页面上的「发送测试」不受启用状态和筛选条件影响，但要求配置可用。
+只有在「通知设置」中启用、且运行结果通过该通道筛选条件的通道才会在真实运行结束后发送。页面上的「发送测试」使用当前通道表单，无需先保存，也不会保存修改。SMTP 密码和 HTTP 请求头留空时由后端沿用已有配置。测试不受启用状态和筛选条件影响。
 
 每个渠道独立保存三个开关：
 
@@ -80,21 +80,25 @@ siteflow_domain, summary
 
 ## HTTP 通知
 
+HTTP 助手调查通知支持在同一个请求中发送标题、接管结论和失败截图。
+
 字段：
 
 - 请求地址（http/https）
 - 请求方法：POST / PUT / PATCH
+- 标题字段：`title`（默认）、`subject`、`heading`。
+- 正文字段：`content`（默认）、`text`、`message`、`body`、`description`。只发送所选字段；依赖 `body` 的旧 Webhook 需选择 `body`。
+- 图片字段：无（默认）、`image`、`file` 或 `attachment`。
 - 请求头 JSON（可选）
 - 超时时间（1–120 秒，默认 10）
 
-原任务通知请求体：
+图片字段为「无」时使用 JSON。以下是使用默认标题和正文字段的原任务通知示例：
 
 ```json
 {
   "event": "run.finished",
   "title": "[SiteFlow] 运行任务通知 #128",
-  "body": "布局渲染后的正文",
-  "content": "与 body 相同，兼容使用 {content} 的 webhook 模板",
+  "content": "布局渲染后的正文",
   "format": "text",
   "run": {
     "run_id": 128,
@@ -124,7 +128,17 @@ siteflow_domain, summary
 
 请求头值不会通过 API 回显，只显示当前请求头名称。保存时留空保持现有请求头；输入 `{}` 清除全部请求头；输入完整 JSON 会整体替换。
 
-助手调查通知使用 `event: "assistant.investigation"`、`format: "text"`，有独立的 `title`、`body` 和相同的 `content`；来源字段 `run_id`、`run_status`、`job_id`、`job_status`、`site_id`、`site_name`、`conclusion`、`action_status` 位于顶层，不使用原任务通知的嵌套 `run` 对象或自定义布局。
+### 发送图片
+
+1. 在「通知设置 → HTTP 通知」中，按接收端要求选择标题和正文字段，再将图片字段设为 `image`、`file` 或 `attachment`。例如，接收端要求 `title`、`content`、`image`，就选择这三项。
+2. 点击「发送测试」验证接收端能否同时收到正文和内置的 `notification-test.png`。测试使用当前表单，不需要先保存。
+3. 测试通过后保存 HTTP 通知配置。
+
+选择图片字段后，系统自动用 `multipart/form-data` 发送，包含 boundary 的 `Content-Type` 由系统生成，无需手动设置。标题、正文和元数据作为表单字段发送，其中 `run` 是 JSON 字符串；图片以 `image/png` 文件上传，接收端需支持表单上传。
+
+定时调度和手动运行的原任务通知均不附带图片。若接收端只接受 JSON，请将图片字段设为「无」。
+
+助手调查通知使用 `event: "assistant.investigation"`、`format: "text"`，有独立的标题和正文。启用 HTTP 通道和「接收助手调查通知」并选择图片字段后，接管完成且有有效调查结论时，最多附带被接管站点任务最新的一张可用失败截图（PNG，最大 10 MiB）。没有可用截图时仍发送结论。来源字段 `run_id`、`run_status`、`job_id`、`job_status`、`site_id`、`site_name`、`conclusion`、`action_status` 位于顶层，不使用原任务通知的嵌套 `run` 对象或自定义布局。
 
 ## 环境变量与页面配置
 
@@ -171,6 +185,9 @@ SITEFLOW_NOTIFICATION_EMAIL_TO=admin@example.com,ops@example.com
 SITEFLOW_NOTIFICATION_HTTP_ENABLED=false
 SITEFLOW_NOTIFICATION_HTTP_URL=https://hooks.example.com/siteflow
 SITEFLOW_NOTIFICATION_HTTP_METHOD=POST
+SITEFLOW_NOTIFICATION_HTTP_TITLE_FIELD=title
+SITEFLOW_NOTIFICATION_HTTP_BODY_FIELD=content
+SITEFLOW_NOTIFICATION_HTTP_IMAGE_FIELD=none
 SITEFLOW_NOTIFICATION_HTTP_HEADERS='{"Authorization":"Bearer CHANGE_ME"}'
 SITEFLOW_NOTIFICATION_HTTP_TIMEOUT=10
 ```
@@ -191,5 +208,7 @@ POST   /api/v1/notifications/http/test
 ```
 
 `DELETE` 只清除数据库配置，环境变量配置保持不变。
+
+HTTP 配置的 `title_field`、`body_field` 和 `image_field` 支持 PUT 更新；省略保留原值，传 `null` 恢复默认。已保存的 `text_field` 和旧环境变量 `SITEFLOW_NOTIFICATION_HTTP_TEXT_FIELD` 仍可用作正文字段配置。
 
 邮件/HTTP 的 GET 视图及各自 PUT 请求支持布尔字段 `notify_assistant`，未保存记录时默认 true，PUT 省略保留原值。修改请求沿用登录及 CSRF 检查，通知开关不是模型可调用的发送接口。

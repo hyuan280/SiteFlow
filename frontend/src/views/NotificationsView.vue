@@ -6,8 +6,10 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { ApiError, apiRequest } from "@/api/client";
 import PageHeader from "@/components/PageHeader.vue";
 import { useAuthStore } from "@/stores/auth";
+import { HTTP_BODY_FIELDS, HTTP_TITLE_FIELDS } from "@/types/notifications";
 import type {
   EmailNotificationView,
+  HTTPImageField,
   HTTPNotificationView,
   NotificationFieldView,
   NotificationSettings,
@@ -50,6 +52,9 @@ const httpForm = reactive({
   notify_assistant: true,
   url: "",
   method: "POST" as "POST" | "PUT" | "PATCH",
+  title_field: "title" as (typeof HTTP_TITLE_FIELDS)[number],
+  body_field: "content" as (typeof HTTP_BODY_FIELDS)[number],
+  image_field: "none" as HTTPImageField,
   headers: "",
   timeout_seconds: 10,
 });
@@ -237,6 +242,12 @@ function applySettings(data: NotificationSettings): void {
   httpForm.method = ["POST", "PUT", "PATCH"].includes(method)
     ? (method as "POST" | "PUT" | "PATCH")
     : "POST";
+  httpForm.title_field = HTTP_TITLE_FIELDS.find((field) => field === data.http.title_field.value) ?? "title";
+  httpForm.body_field = HTTP_BODY_FIELDS.find((field) => field === data.http.body_field.value) ?? "content";
+  const imageField = fieldString(data.http.image_field);
+  httpForm.image_field = imageField === "image" || imageField === "file" || imageField === "attachment"
+    ? imageField
+    : "none";
   httpForm.headers = "";
   httpForm.timeout_seconds = fieldNumber(data.http.timeout_seconds, 10);
 }
@@ -333,7 +344,7 @@ async function saveEmail(): Promise<void> {
   }
 }
 
-function httpPayload(): Record<string, unknown> {
+function httpPayload(includeUnchangedFields = false): Record<string, unknown> {
   const http = settings.value?.http;
   if (!http) return { enabled: httpForm.enabled };
   const payload: Record<string, unknown> = {
@@ -344,6 +355,15 @@ function httpPayload(): Record<string, unknown> {
   };
   if (http.url.editable) payload.url = httpForm.url.trim();
   if (http.method.editable) payload.method = httpForm.method;
+  if (http.title_field.editable && (includeUnchangedFields || httpForm.title_field !== http.title_field.value)) {
+    payload.title_field = httpForm.title_field;
+  }
+  if (http.body_field.editable && (includeUnchangedFields || httpForm.body_field !== http.body_field.value)) {
+    payload.body_field = httpForm.body_field;
+  }
+  if (http.image_field.editable && (includeUnchangedFields || httpForm.image_field !== http.image_field.value)) {
+    payload.image_field = httpForm.image_field;
+  }
   if (http.timeout_seconds.editable) payload.timeout_seconds = httpForm.timeout_seconds;
   if (http.headers.editable && httpForm.headers.trim()) {
     let parsed: unknown;
@@ -414,9 +434,10 @@ async function testChannel(channel: "email" | "http"): Promise<void> {
   const testing = channel === "email" ? testingEmail : testingHttp;
   testing.value = true;
   try {
+    const payload = channel === "email" ? emailPayload() : httpPayload(true);
     const result = await apiRequest<NotificationTestResult>(
       `/notifications/${channel}/test`,
-      { method: "POST" },
+      { method: "POST", body: JSON.stringify(payload) },
     );
     if (result.ok) {
       ElMessage.success(result.message);
@@ -493,7 +514,7 @@ onMounted(() => {
                 <el-radio-button label="html">HTML</el-radio-button>
               </el-radio-group>
               <p class="muted field-hint">
-                邮件按所选格式发送；HTTP 通知同时发送纯文本 body 和 format 字段。
+                邮件按所选格式发送；HTTP 通知附带正文和 format 字段。
               </p>
             </el-form-item>
           </el-form>
@@ -720,13 +741,6 @@ onMounted(() => {
                       : 'SMTP 密码'
                   "
                 />
-                <span class="muted field-hint">
-                  当前：{{
-                    settings?.email.password.configured
-                      ? settings.email.password.masked ?? "已配置（不显示原文）"
-                      : "未配置"
-                  }}
-                </span>
               </el-form-item>
             </div>
             <el-form-item>
@@ -771,10 +785,10 @@ onMounted(() => {
           </el-form>
 
           <div class="form-actions">
+            <el-button :loading="testingEmail" @click="testChannel('email')">发送测试</el-button>
             <el-button type="primary" :loading="savingEmail" @click="saveEmail">
               保存邮件通知
             </el-button>
-            <el-button :loading="testingEmail" @click="testChannel('email')">发送测试</el-button>
             <el-button
               type="danger"
               plain
@@ -941,6 +955,50 @@ onMounted(() => {
                 />
               </el-form-item>
             </div>
+            <div class="field-grid">
+              <el-form-item>
+                <template #label>
+                  标题字段
+                  <el-tag :type="sourceTagType(settings?.http.title_field.source ?? 'unset')" size="small">
+                    {{ sourceLabel(settings?.http.title_field.source ?? "unset") }}
+                  </el-tag>
+                </template>
+                <el-select v-model="httpForm.title_field" :disabled="settings?.http.title_field.editable === false">
+                  <el-option v-for="field in HTTP_TITLE_FIELDS" :key="field" :label="field" :value="field" />
+                </el-select>
+                <span v-if="settings?.http.title_field.error" class="error">{{ settings.http.title_field.error }}</span>
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  正文字段
+                  <el-tag :type="sourceTagType(settings?.http.body_field.source ?? 'unset')" size="small">
+                    {{ sourceLabel(settings?.http.body_field.source ?? "unset") }}
+                  </el-tag>
+                </template>
+                <el-select v-model="httpForm.body_field" :disabled="settings?.http.body_field.editable === false">
+                  <el-option v-for="field in HTTP_BODY_FIELDS" :key="field" :label="field" :value="field" />
+                </el-select>
+                <span v-if="settings?.http.body_field.error" class="error">{{ settings.http.body_field.error }}</span>
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  图片字段
+                  <el-tag :type="sourceTagType(settings?.http.image_field.source ?? 'unset')" size="small">
+                    {{ sourceLabel(settings?.http.image_field.source ?? "unset") }}
+                  </el-tag>
+                </template>
+                <el-select v-model="httpForm.image_field" :disabled="settings?.http.image_field.editable === false">
+                  <el-option label="无（不发送图片）" value="none" />
+                  <el-option label="image" value="image" />
+                  <el-option label="file" value="file" />
+                  <el-option label="attachment" value="attachment" />
+                </el-select>
+                <span class="muted field-hint">
+                  选择图片字段后自动使用 multipart/form-data。正式通知中，仅助手调查通知可附带一张失败截图。
+                </span>
+                <span v-if="settings?.http.image_field.error" class="error">{{ settings.http.image_field.error }}</span>
+              </el-form-item>
+            </div>
             <el-form-item>
               <template #label>
                 请求头
@@ -968,10 +1026,10 @@ onMounted(() => {
           </el-form>
 
           <div class="form-actions">
+            <el-button :loading="testingHttp" @click="testChannel('http')">发送测试</el-button>
             <el-button type="primary" :loading="savingHttp" @click="saveHttp">
               保存 HTTP 通知
             </el-button>
-            <el-button :loading="testingHttp" @click="testChannel('http')">发送测试</el-button>
             <el-button
               type="danger"
               plain
@@ -984,11 +1042,6 @@ onMounted(() => {
           </div>
           <p v-if="httpLockedFields" class="muted">
             {{ httpLockedFields }} 个字段由环境变量锁定，不能修改；启用开关仍可调整。
-          </p>
-          <p class="muted">
-            请求体为 JSON，包含 <span class="mono">event</span>、
-            <span class="mono">title</span>、<span class="mono">body</span>、
-            <span class="mono">format</span> 和 <span class="mono">run</span> 详情。
           </p>
         </el-card>
       </el-col>

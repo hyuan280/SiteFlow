@@ -39,6 +39,9 @@ frozen at registration in a `ready` intent. Dispatch uses that snapshot rather
 than rereading later model results or settings. A task that needs a model turn
 therefore already has the reviewing annotation in its frozen event.
 
+Original task notifications have no image attachment. For HTTP targets with an
+image field configured, they use `multipart/form-data` without a file part.
+
 ## Separate Takeover Result Notification
 
 When a fresh takeover later finishes with `completed_analysis` or `updated` and
@@ -65,14 +68,18 @@ these settings makes no model calls. It is not a model-callable delivery request
 brief body, not the user's task-notification layout, even when that layout uses
 HTML. The title is `[SiteFlow] 助手调查结果 #<run_id>`. The body contains the site,
 source run/job IDs, original job status, investigation status ("仅调查" or
-"已更新配置但未重新验证"), and concise conclusion. It contains no images or full
-chat transcript.
+"已更新配置但未重新验证"), and concise conclusion. It contains no full chat transcript.
 
-HTTP uses `event: "assistant.investigation"`, with `title`, `body`, identical
-`content`, `format: "text"`, `run_id`, `run_status`, `job_id`, `job_status`,
+HTTP uses `event: "assistant.investigation"`, with the configured title and body
+fields (default `title` and `content`), `format: "text"`, `run_id`, `run_status`, `job_id`, `job_status`,
 `site_id`, `site_name`, `conclusion` and `action_status` at the top level. The
 original `run.finished` event retains its existing custom layout and nested
 `run` payload.
+
+When an HTTP image field is configured, the investigation form can attach one
+existing failure screenshot from the exact source job. The file is read at
+dispatch time. If no eligible screenshot is available, the conclusion is still
+sent without an attachment. See [HTTP notification settings](notifications.md#发送图片).
 
 An `updated` result means the configuration was saved; it explicitly says the
 workflow was not rerun to verify the fix. A `completed_analysis` result is a

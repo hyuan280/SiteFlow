@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
-from typing import Any
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, get_args
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.crypto import CryptoError, CryptoService
-from app.models.execution import Run, SiteJob
+from app.models.execution import JobArtifact, Run, SiteJob
 from app.models.integration import IntegrationConfig, utcnow
 from app.models.setting import AppSetting
 from app.schemas.integration import ConfigSource
@@ -29,8 +30,11 @@ from app.schemas.notification import (
     ChannelDeliveryResult,
     EmailNotificationUpdate,
     EmailNotificationView,
+    HTTPBodyField,
+    HTTPImageField,
     HTTPNotificationUpdate,
     HTTPNotificationView,
+    HTTPTitleField,
     NotificationFieldView,
     NotificationLayoutUpdate,
     NotificationLayoutView,
@@ -57,6 +61,11 @@ LAYOUT_KEY = "notification.layout"
 EMAIL_SECURITY_VALUES = {"ssl", "starttls", "none"}
 HTTP_METHOD_VALUES = {"POST", "PUT", "PATCH"}
 DEFAULT_HTTP_TIMEOUT = 10.0
+DEFAULT_HTTP_TITLE_FIELD = "title"
+DEFAULT_HTTP_BODY_FIELD = "content"
+MAX_HTTP_IMAGE_BYTES = 10 * 1024 * 1024
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+HTTP_TEST_IMAGE_PATH = Path(__file__).resolve().parents[1] / "assets" / "notification-test.png"
 DEFAULT_EMAIL_PORT = 587
 DEFAULT_EMAIL_SECURITY = "starttls"
 
@@ -257,6 +266,13 @@ def _http_errors(values: dict[str, Any], *, require_complete: bool) -> dict[str,
     if method.upper() not in HTTP_METHOD_VALUES:
         errors["method"] = "请求方法必须是 POST、PUT 或 PATCH"
 
+    if values.get("title_field") not in get_args(HTTPTitleField):
+        errors["title_field"] = "标题字段必须是 title、subject 或 heading"
+    if values.get("body_field") not in get_args(HTTPBodyField):
+        errors["body_field"] = "正文字段必须是 content、text、message、body 或 description"
+    if values.get("image_field") not in get_args(HTTPImageField):
+        errors["image_field"] = "图片字段必须是 none、image、file 或 attachment"
+
     headers = values.get("headers")
     if headers is not None:
         try:
@@ -298,6 +314,8 @@ class NotificationService:
             return {}, "通知配置不是合法 JSON"
         if not isinstance(parsed, dict):
             return {}, "通知配置必须是 JSON 对象"
+        if key == HTTP_CONFIG_KEY and "text_field" in parsed:
+            parsed.setdefault("body_field", parsed.pop("text_field"))
         return parsed, None
 
     def _save_channel(self, key: str, values: dict[str, Any]) -> None:
@@ -348,6 +366,10 @@ class NotificationService:
         values = {
             "url": _text(self.settings.notification_http_url),
             "method": _text(self.settings.notification_http_method),
+            "title_field": _text(self.settings.notification_http_title_field),
+            "body_field": _text(self.settings.notification_http_body_field)
+            or _text(self.settings.notification_http_text_field),
+            "image_field": _text(self.settings.notification_http_image_field),
             "headers": env_headers if self.settings.notification_http_headers else None,
             "timeout_seconds": self.settings.notification_http_timeout,
         }
@@ -470,6 +492,9 @@ class NotificationService:
         return {
             "url": self._pick(env, db, "url")[0],
             "method": self._pick(env, db, "method", "POST")[0],
+            "title_field": self._pick(env, db, "title_field", DEFAULT_HTTP_TITLE_FIELD)[0],
+            "body_field": self._pick(env, db, "body_field", DEFAULT_HTTP_BODY_FIELD)[0],
+            "image_field": self._pick(env, db, "image_field", "none")[0],
             "headers": self._pick(env, db, "headers", {})[0] or {},
             "timeout_seconds": self._pick(
                 env, db, "timeout_seconds", DEFAULT_HTTP_TIMEOUT
@@ -548,6 +573,9 @@ class NotificationService:
             available=not errors,
             url=field("url"),
             method=field("method", "POST"),
+            title_field=field("title_field"),
+            body_field=field("body_field"),
+            image_field=field("image_field", "none"),
             headers=NotificationFieldView(
                 value=None,
                 source=headers_source,
@@ -627,6 +655,8 @@ class NotificationService:
                 normalized[field] = _text(value)
             elif field == "method":
                 normalized[field] = (_text(value) or "").upper() or None
+            elif field in {"title_field", "body_field", "image_field"}:
+                normalized[field] = value
             elif field == "headers":
                 normalized[field] = validate_headers(value) if value is not None else None
             elif field == "timeout_seconds":
@@ -974,11 +1004,11 @@ class NotificationService:
 
     # ── delivery ───────────────────────────────────────────────────────
 
-    def _email_target(self) -> DeliveryTarget:
+    def _email_target(self, overrides: dict[str, Any] | None = None) -> DeliveryTarget:
         enabled = self._enabled("email")
         db, db_error = self._load_channel(EMAIL_CONFIG_KEY)
         env, env_errors = self._env_email()
-        values = self._email_values(db, env)
+        values = self._email_values({**db, **(overrides or {})}, env)
         errors = _email_errors(values, require_complete=True)
         if db_error:
             errors["config"] = db_error
@@ -996,11 +1026,11 @@ class NotificationService:
             error="；".join(dict.fromkeys(errors.values())) if errors else None,
         )
 
-    def _http_target(self) -> DeliveryTarget:
+    def _http_target(self, overrides: dict[str, Any] | None = None) -> DeliveryTarget:
         enabled = self._enabled("http")
         db, db_error = self._load_channel(HTTP_CONFIG_KEY)
         env, env_errors = self._env_http()
-        values = self._http_values(db, env)
+        values = self._http_values({**db, **(overrides or {})}, env)
         errors = _http_errors(values, require_complete=True)
         if db_error:
             errors["config"] = db_error
@@ -1074,15 +1104,38 @@ class NotificationService:
                 pass
         return f"邮件已发送到 {len(values['to_addresses'])} 个收件人"
 
+    def _http_job_screenshot(self, run_id: int, job_id: int) -> tuple[str, bytes] | None:
+        screenshots = self.session.query(JobArtifact).join(
+            SiteJob, SiteJob.id == JobArtifact.site_job_id,
+        ).filter(
+            JobArtifact.run_id == run_id,
+            JobArtifact.site_job_id == job_id,
+            SiteJob.run_id == run_id,
+            SiteJob.status.in_(UNSUCCESSFUL_STATUSES),
+            JobArtifact.kind == "screenshot",
+            JobArtifact.content_type == "image/png",
+            JobArtifact.size_bytes <= MAX_HTTP_IMAGE_BYTES,
+        ).order_by(JobArtifact.id.desc())
+        root = Path(self.settings.artifact_root).resolve()
+        for screenshot in screenshots:
+            try:
+                path = (root / screenshot.relative_path).resolve()
+                if not path.is_relative_to(root) or not path.is_file():
+                    continue
+                with path.open("rb") as image:
+                    content = image.read(MAX_HTTP_IMAGE_BYTES + 1)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if len(content) <= MAX_HTTP_IMAGE_BYTES and content.startswith(PNG_SIGNATURE):
+                return f"run-{run_id}-job-{screenshot.site_job_id}.png", content
+        return None
+
     def _send_http(self, target: DeliveryTarget, message: dict[str, str], event: dict[str, Any]) -> str:
         assert target.values is not None
         values = target.values
         if event.get("event") == "assistant.investigation":
             payload = {
                 "event": "assistant.investigation",
-                "title": message["title"],
-                "body": message["body"],
-                "content": message["body"],
                 "format": message["format"],
                 "run_id": event["run_id"],
                 "run_status": event["run_status"],
@@ -1096,23 +1149,46 @@ class NotificationService:
         else:
             payload = {
                 "event": "run.finished",
-                "title": message["title"],
-                "body": message["body"],
-                "content": message["body"],
                 "format": message["format"],
                 "run": event,
             }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "SiteFlow-Notifier/1.0",
-            **values.get("headers", {}),
-        }
+        title_field = values.get("title_field") or DEFAULT_HTTP_TITLE_FIELD
+        body_field = values.get("body_field") or values.get("text_field") or DEFAULT_HTTP_BODY_FIELD
+        payload[title_field] = message["title"]
+        payload[body_field] = message["body"]
+
+        headers = {"User-Agent": "SiteFlow-Notifier/1.0", **values.get("headers", {})}
+        image_field = values.get("image_field", "none")
+        request_body: dict[str, Any]
+        if image_field == "none":
+            headers = {"Content-Type": "application/json", **headers}
+            request_body = {"json": payload}
+        else:
+            # Let httpx generate Content-Type with the matching multipart boundary.
+            headers = {key: value for key, value in headers.items() if key.lower() != "content-type"}
+            parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]] = []
+            for key, value in payload.items():
+                field_value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                parts.append((key, (None, field_value)))
+            run_id = event["run_id"]
+            image = None
+            if payload["event"] == "assistant.investigation":
+                image = self._http_job_screenshot(run_id, event["job_id"])
+            elif run_id == 0:  # The synthetic event used by test_channel.
+                try:
+                    image = (HTTP_TEST_IMAGE_PATH.name, HTTP_TEST_IMAGE_PATH.read_bytes())
+                except OSError as exc:
+                    raise NotificationDeliveryError("无法读取内置通知测试图片") from exc
+            if image is not None:
+                filename, content = image
+                parts.append((image_field, (filename, content, "image/png")))
+            request_body = {"files": parts}
         with httpx.Client(timeout=float(values["timeout_seconds"])) as client:
             response = client.request(
                 str(values["method"]),
                 str(values["url"]),
-                json=payload,
                 headers=headers,
+                **request_body,
             )
             response.raise_for_status()
         return f"HTTP {response.status_code}"
@@ -1190,10 +1266,20 @@ class NotificationService:
             if target.enabled and not target.error and self._flag(target.channel, "assistant")
         ]
 
-    def test_channel(self, channel: str) -> NotificationTestResult:
+    def test_channel(
+        self, channel: str, payload: EmailNotificationUpdate | HTTPNotificationUpdate | None = None,
+    ) -> NotificationTestResult:
+        targets = None
+        if isinstance(payload, EmailNotificationUpdate):
+            overrides = self._normalize_email_updates(payload)
+            if not overrides.get("password"):
+                overrides.pop("password", None)
+            targets = [self._email_target(overrides)]
+        elif isinstance(payload, HTTPNotificationUpdate):
+            targets = [self._http_target(self._normalize_http_updates(payload))]
         event = self._sample_event()
         message = self._render(event)
-        results = self._send(message, event, channel=channel, require_enabled=False)
+        results = self._send(message, event, channel=channel, require_enabled=False, targets=targets)
         if not results:
             return NotificationTestResult(
                 ok=False,

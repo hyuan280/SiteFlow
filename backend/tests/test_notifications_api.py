@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+from email import policy
+from email.parser import BytesParser
+from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.models.execution import Run, SiteJob
+from app.models.execution import JobArtifact, Run, SiteJob
 from app.models.integration import IntegrationConfig
 from app.main import create_app
 from app.services.executor import ExecutionManager
 from app.services.notifications import (
     DeliveryTarget,
+    HTTP_TEST_IMAGE_PATH,
     NotificationDeliveryError,
     NotificationService,
 )
@@ -71,6 +76,8 @@ def test_notification_defaults_and_layout_roundtrip(client: TestClient) -> None:
     assert body["http"]["notify_manual"] is True
     assert body["http"]["notify_assistant"] is True
     assert body["http"]["method"]["value"] == "POST"
+    assert body["http"]["title_field"]["value"] == "title"
+    assert body["http"]["body_field"]["value"] == "content"
     assert body["http"]["timeout_seconds"]["value"] == 10
 
     response = client.put(
@@ -381,6 +388,49 @@ def test_notification_test_endpoints_use_saved_layout(
     assert "{{siteflow_domain}}" not in calls[0][1]["body"]
 
 
+def test_notification_tests_use_unsaved_config_without_persisting(client: TestClient, monkeypatch) -> None:
+    sent = {}
+
+    def send_email(self, target, message):
+        sent["email"] = target.values
+        return "email ok"
+
+    def send_http(self, target, message, event):
+        sent["http"] = target.values
+        return "http ok"
+
+    monkeypatch.setattr(NotificationService, "_send_email", send_email)
+    monkeypatch.setattr(NotificationService, "_send_http", send_http)
+    assert client.put("/api/v1/notifications/email", json=_email_payload()).status_code == 200
+    assert client.put("/api/v1/notifications/http", json=_http_payload()).status_code == 200
+    saved = client.get("/api/v1/notifications").json()
+
+    response = client.post("/api/v1/notifications/email/test", json={
+        "smtp_host": "draft.example.com", "to_addresses": ["draft@example.com"],
+    })
+    assert response.json()["ok"], response.text
+    assert sent["email"]["smtp_host"] == "draft.example.com"
+    assert sent["email"]["to_addresses"] == ["draft@example.com"]
+    assert sent["email"]["password"] == "smtp-password"
+
+    response = client.post("/api/v1/notifications/email/test", json={"password": "draft-password"})
+    assert response.json()["ok"], response.text
+    assert sent["email"]["password"] == "draft-password"
+
+    response = client.post("/api/v1/notifications/http/test", json={
+        "url": "https://draft.example.com/hook", "title_field": "subject",
+        "body_field": "message", "image_field": "file", "headers": {},
+    })
+    assert response.json()["ok"], response.text
+    assert sent["http"]["url"] == "https://draft.example.com/hook"
+    assert sent["http"]["title_field"] == "subject"
+    assert sent["http"]["body_field"] == "message"
+    assert sent["http"]["image_field"] == "file"
+    assert sent["http"]["headers"] == {}
+
+    assert client.get("/api/v1/notifications").json() == saved
+
+
 def test_html_layout_escapes_site_text(client: TestClient) -> None:
     response = client.put(
         "/api/v1/notifications/layout",
@@ -532,7 +582,7 @@ def test_email_timeout_has_actionable_message(client: TestClient, monkeypatch) -
     assert "465 通常使用 SSL" in message
 
 
-def test_http_payload_contains_content_alias(client: TestClient, monkeypatch) -> None:
+def test_http_payload_uses_default_title_and_content_fields(client: TestClient, monkeypatch) -> None:
     captured: dict = {}
 
     class FakeResponse:
@@ -579,8 +629,91 @@ def test_http_payload_contains_content_alias(client: TestClient, monkeypatch) ->
     finally:
         session.close()
     assert detail == "HTTP 200"
-    assert captured["json"]["body"] == "body text"
+    assert captured["json"]["title"] == "title"
+    assert "body" not in captured["json"]
     assert captured["json"]["content"] == "body text"
+
+
+def test_http_notification_sends_configured_multipart_fields(client: TestClient, monkeypatch) -> None:
+    requests = []
+
+    def capture(request):
+        requests.append(request)
+        return httpx.Response(204)
+
+    client_class = httpx.Client
+    monkeypatch.setattr(
+        "app.services.notifications.httpx.Client",
+        lambda **kwargs: client_class(transport=httpx.MockTransport(capture), **kwargs),
+    )
+
+    response = client.put("/api/v1/notifications/http", json={
+        **_http_payload(),
+        "title_field": "subject",
+        "body_field": "message",
+        "image_field": "attachment",
+        "headers": {"content-type": "application/json", "X-Source": "siteflow"},
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["http"]["title_field"]["value"] == "subject"
+    assert response.json()["http"]["body_field"]["value"] == "message"
+    assert response.json()["http"]["image_field"]["value"] == "attachment"
+
+    def parts(request):
+        content_type = request.headers["content-type"]
+        assert content_type.startswith("multipart/form-data; boundary=")
+        assert request.headers["x-source"] == "siteflow"
+        message = BytesParser(policy=policy.default).parsebytes(
+            f"Content-Type: {content_type}\r\n\r\n".encode() + request.content,
+        )
+        return {
+            part.get_param("name", header="content-disposition"): part
+            for part in message.iter_parts()
+        }
+
+    response = client.post("/api/v1/notifications/http/test")
+    assert response.json()["ok"], response.text
+    test_parts = parts(requests.pop())
+    test_image = HTTP_TEST_IMAGE_PATH.read_bytes()
+    assert test_parts["attachment"].get_filename() == "notification-test.png"
+    assert test_parts["attachment"].get_content_type() == "image/png"
+    assert test_parts["attachment"].get_payload(decode=True) == test_image
+    assert "失败" in test_parts["message"].get_payload(decode=True).decode()
+    assert "[SiteFlow]" in test_parts["subject"].get_payload(decode=True).decode()
+    assert not {"title", "body", "content"} & test_parts.keys()
+
+    settings = client.app.state.settings
+    root = Path(settings.artifact_root)
+    root.mkdir(exist_ok=True)
+    screenshot_path = root / "failure.png"
+    screenshot_path.write_bytes(test_image)
+    with client.app.state.session_factory() as session:
+        run = Run(mode="scheduled", trigger="schedule", status="fail", created_by="scheduler")
+        session.add(run)
+        session.flush()
+        job = SiteJob(run_id=run.id, site_name="失败站点", lane="general", status="fail")
+        session.add(job)
+        session.flush()
+        session.add(JobArtifact(
+            run_id=run.id, site_job_id=job.id, kind="screenshot",
+            relative_path=screenshot_path.name, content_type="image/png",
+            size_bytes=len(test_image),
+        ))
+        run_id = run.id
+        session.commit()
+        service = NotificationService(session, settings, client.app.state.crypto)
+        assert service.send_run(run_id)[0].ok
+        run_parts = parts(requests.pop())
+        assert json.loads(run_parts["run"].get_payload(decode=True))["run_id"] == run_id
+        assert "message" in run_parts and "attachment" not in run_parts
+
+    response = client.put("/api/v1/notifications/http", json={"image_field": "none"})
+    assert response.status_code == 200, response.text
+    response = client.post("/api/v1/notifications/http/test")
+    assert response.json()["ok"], response.text
+    payload = json.loads(requests.pop().content)
+    assert {"subject", "message"} <= payload.keys()
+    assert not {"title", "body", "content", "attachment"} & payload.keys()
 
 
 def test_run_finalization_schedules_notification(client: TestClient, monkeypatch) -> None:

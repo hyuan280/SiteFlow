@@ -85,6 +85,18 @@ class Settings(BaseSettings):
     notification_http_method: str | None = Field(
         default=None, validation_alias="SITEFLOW_NOTIFICATION_HTTP_METHOD"
     )
+    notification_http_title_field: str | None = Field(
+        default=None, validation_alias="SITEFLOW_NOTIFICATION_HTTP_TITLE_FIELD"
+    )
+    notification_http_body_field: str | None = Field(
+        default=None, validation_alias="SITEFLOW_NOTIFICATION_HTTP_BODY_FIELD"
+    )
+    notification_http_text_field: str | None = Field(
+        default=None, validation_alias="SITEFLOW_NOTIFICATION_HTTP_TEXT_FIELD"
+    )
+    notification_http_image_field: str | None = Field(
+        default=None, validation_alias="SITEFLOW_NOTIFICATION_HTTP_IMAGE_FIELD"
+    )
     notification_http_headers: str | None = Field(
         default=None, validation_alias="SITEFLOW_NOTIFICATION_HTTP_HEADERS"
     )

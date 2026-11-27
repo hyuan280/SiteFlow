@@ -100,15 +100,20 @@ def delete_http_notification(
 
 @router.post("/email/test", response_model=NotificationTestResult)
 def test_email_notification(
+    payload: EmailNotificationUpdate | None = None,
     service: NotificationService = Depends(get_service),
     _current: AuthSession = Depends(require_csrf),
 ) -> NotificationTestResult:
-    return service.test_channel("email")
+    return service.test_channel("email", payload)
 
 
 @router.post("/http/test", response_model=NotificationTestResult)
 def test_http_notification(
+    payload: HTTPNotificationUpdate | None = None,
     service: NotificationService = Depends(get_service),
     _current: AuthSession = Depends(require_csrf),
 ) -> NotificationTestResult:
-    return service.test_channel("http")
+    try:
+        return service.test_channel("http", payload)
+    except NotificationValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

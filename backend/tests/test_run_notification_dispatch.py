@@ -4,6 +4,7 @@ import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -12,10 +13,10 @@ from sqlalchemy import select
 
 from app.models.assistant_takeover import AssistantTakeoverAction
 from app.models.assistant_takeover_notice import AssistantTakeoverNotice
-from app.models.execution import Run, SiteJob
+from app.models.execution import JobArtifact, Run, SiteJob
 from app.models.run_notification import RunNotificationIntent
 from app.services.execution import ExecutionService
-from app.services.notifications import NotificationService
+from app.services.notifications import HTTP_TEST_IMAGE_PATH, NotificationService
 from app.services.run_notification_dispatch import RunNotificationDispatcher
 from tests.test_assistant_takeover import ctx, failed_job, grant  # noqa: F401
 from tests.test_notifications_api import _email_payload, _http_payload
@@ -330,7 +331,7 @@ def test_real_conclusion_http_body_and_structured_payload_agree(context, monkeyp
     dispatcher.dispatch_pending()
     assert len(captured) == 1
     payload = captured[0]
-    assert summary in payload["body"] and payload["body"] == payload["content"]
+    assert summary in payload["content"] and "body" not in payload
     assert payload["run"]["status"] == "fail" and payload["run"]["fail_count"] == 1
     assert payload["run"]["sites"][0]["job_id"] == job_id
     assert payload["run"]["sites"][0]["message"] == summary
@@ -826,15 +827,69 @@ def test_investigation_real_http_and_mail_agree_without_layout_or_secrets(contex
     assert len(requests) == len(mail) == 1
     payload = requests[0]
     assert payload["event"] == "assistant.investigation"
-    assert payload["body"] == payload["content"] == mail[0]["body"]
+    assert payload["content"] == mail[0]["body"] and "body" not in payload
     assert payload["title"] == mail[0]["title"]
     assert payload["format"] == mail[0]["format"] == "text"
-    assert payload["conclusion"] == summary and summary in payload["body"]
+    assert payload["conclusion"] == summary and summary in payload["content"]
     assert payload["action_status"] == "completed_analysis"
     assert payload["run_status"] == payload["job_status"] == "fail"
     assert "run" not in payload and "Wrong" not in payload["title"]
-    assert "{{" not in payload["body"] and "<b>" not in payload["body"]
+    assert "{{" not in payload["content"] and "<b>" not in payload["content"]
     assert "smtp-password" not in json.dumps(payload) and "hook-secret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("has_source_image", [True, False])
+def test_http_investigation_attaches_only_its_source_job_screenshot(
+    context, monkeypatch, has_source_image,
+):
+    from app.schemas.notification import HTTPNotificationUpdate
+
+    manager, action_id = context
+    summary = promote(context)
+    requests = []
+
+    def capture_request(self, method, url, *, files, headers):
+        requests.append(dict(files))
+        return Mock(status_code=200, raise_for_status=Mock())
+
+    monkeypatch.setattr("app.services.notifications.httpx.Client.request", capture_request)
+    root = Path(manager.settings.artifact_root)
+    root.mkdir(parents=True, exist_ok=True)
+    image = HTTP_TEST_IMAGE_PATH.read_bytes()
+    with manager.session_factory() as db:
+        service = NotificationService(db, manager.settings, manager.crypto)
+        service.update_http(HTTPNotificationUpdate(
+            **_http_payload(), image_field="attachment", notify_manual=False,
+        ))
+        action = db.get(AssistantTakeoverAction, action_id)
+        run_id, job_id = action.source_run_id, action.source_job_id
+        other_job = SiteJob(run_id=run_id, site_name="Other site", lane="general", status="fail")
+        db.add(other_job)
+        db.flush()
+        if has_source_image:
+            (root / "source.png").write_bytes(image)
+            db.add(JobArtifact(run_id=run_id, site_job_id=job_id, kind="screenshot",
+                               relative_path="source.png", content_type="image/png"))
+            db.flush()
+        (root / "other.png").write_bytes(image)
+        db.add(JobArtifact(run_id=run_id, site_job_id=other_job.id, kind="screenshot",
+                           relative_path="other.png", content_type="image/png"))
+        db.commit()
+
+    dispatcher = manager.executor.notification_dispatch
+    dispatcher.ensure(run_id)
+    dispatcher.dispatch_one(run_id)
+    dispatcher.ensure_investigation(action_id)
+    dispatcher.dispatch_pending()
+
+    assert len(requests) == 1
+    fields = requests[0]
+    assert fields["event"] == (None, "assistant.investigation")
+    assert summary in fields["content"][1]
+    if has_source_image:
+        assert fields["attachment"] == (f"run-{run_id}-job-{job_id}.png", image, "image/png")
+    else:
+        assert "attachment" not in fields
 
 
 @pytest.mark.parametrize("channel", ["email", "http"])

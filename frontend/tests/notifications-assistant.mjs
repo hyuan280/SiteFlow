@@ -41,6 +41,9 @@ const initialSettings = () => ({
     available: true,
     url: field("https://example.com/notify"),
     method: field("POST"),
+    title_field: field("title"),
+    body_field: field("content"),
+    image_field: field("none"),
     headers: field(null),
     header_names: [],
     timeout_seconds: field(10),
@@ -63,12 +66,19 @@ const mocks = {
     const body = options.body === undefined ? undefined : JSON.parse(options.body);
     requests.push({ url, method, body });
     if (url === "/notifications" && method === "GET") return structuredClone(persisted);
+    if (method === "POST" && /^\/notifications\/(email|http)\/test$/.test(url)) {
+      return { ok: true, message: "测试通知已发送", results: [] };
+    }
     if (url === "/notifications/email" && method === "PUT") {
       persisted = { ...persisted, email: { ...persisted.email, ...body } };
       return structuredClone(persisted);
     }
     if (url === "/notifications/http" && method === "PUT") {
-      persisted = { ...persisted, http: { ...persisted.http, ...body } };
+      const http = { ...persisted.http, ...body };
+      for (const key of ["url", "method", "timeout_seconds", "title_field", "body_field", "image_field"]) {
+        http[key] = key in body ? field(body[key]) : persisted.http[key];
+      }
+      persisted = { ...persisted, http };
       return structuredClone(persisted);
     }
     throw new Error(`unexpected request: ${method} ${url}`);
@@ -111,7 +121,7 @@ const server = await createServer({
         )
         .replace(
           "</script>",
-          "defineExpose({ emailForm, httpForm, settings, applySettings, emailPayload, httpPayload, saveEmail, saveHttp, load });\n</script>",
+          "defineExpose({ emailForm, httpForm, settings, applySettings, emailPayload, httpPayload, saveEmail, saveHttp, testChannel, load });\n</script>",
         );
     },
   }],
@@ -143,6 +153,20 @@ try {
   assert.equal(ui.emailForm.notify_assistant, true);
   assert.equal(ui.httpForm.notify_assistant, true);
 
+  ui.emailForm.smtp_host = "draft.example.com";
+  await ui.testChannel("email");
+  assert.equal(requests.at(-1).url, "/notifications/email/test");
+  assert.equal(requests.at(-1).body.smtp_host, "draft.example.com");
+  assert.ok(!("password" in requests.at(-1).body));
+  assert.equal(persisted.email.smtp_host.value, "smtp.example.com");
+
+  ui.httpForm.image_field = "file";
+  await ui.testChannel("http");
+  assert.equal(requests.at(-1).url, "/notifications/http/test");
+  assert.equal(requests.at(-1).body.image_field, "file");
+  assert.equal(requests.at(-1).body.body_field, "content");
+  assert.equal(persisted.http.image_field.value, "none");
+
   ui.emailForm.notify_assistant = false;
   await ui.saveEmail();
   assert.equal(requests.at(-1).url, "/notifications/email");
@@ -151,9 +175,15 @@ try {
   assert.equal(ui.httpForm.notify_assistant, true, "email setting does not change HTTP");
 
   ui.httpForm.notify_assistant = false;
+  ui.httpForm.title_field = "subject";
+  ui.httpForm.body_field = "message";
+  ui.httpForm.image_field = "attachment";
   await ui.saveHttp();
   assert.equal(requests.at(-1).url, "/notifications/http");
   assert.equal(requests.at(-1).body.notify_assistant, false);
+  assert.equal(requests.at(-1).body.title_field, "subject");
+  assert.equal(requests.at(-1).body.body_field, "message");
+  assert.equal(requests.at(-1).body.image_field, "attachment");
   assert.equal(ui.httpForm.notify_assistant, false);
   assert.equal(ui.emailForm.notify_assistant, false);
   assert.ok(notices.includes("邮件通知配置已保存"));
@@ -164,6 +194,9 @@ try {
   await ui.load();
   assert.equal(ui.emailForm.notify_assistant, false, "reload renders persisted email setting");
   assert.equal(ui.httpForm.notify_assistant, false, "reload renders persisted HTTP setting");
+  assert.equal(ui.httpForm.title_field, "subject");
+  assert.equal(ui.httpForm.body_field, "message");
+  assert.equal(ui.httpForm.image_field, "attachment");
 
   console.log("Notifications assistant regression passed");
 } finally {

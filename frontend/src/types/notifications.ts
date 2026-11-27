@@ -1,4 +1,7 @@
 export type NotificationSource = "env" | "db" | "unset";
+export const HTTP_TITLE_FIELDS = ["title", "subject", "heading"] as const;
+export const HTTP_BODY_FIELDS = ["content", "text", "message", "body", "description"] as const;
+export type HTTPImageField = "none" | "image" | "file" | "attachment";
 
 export interface NotificationFieldView {
   value: unknown;
@@ -45,6 +48,9 @@ export interface HTTPNotificationView {
   available: boolean;
   url: NotificationFieldView;
   method: NotificationFieldView;
+  title_field: NotificationFieldView;
+  body_field: NotificationFieldView;
+  image_field: NotificationFieldView;
   headers: NotificationFieldView;
   header_names: string[];
   timeout_seconds: NotificationFieldView;

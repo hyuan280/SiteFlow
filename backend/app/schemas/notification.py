@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from app.schemas.integration import ConfigSource
+
+HTTPTitleField = Literal["title", "subject", "heading"]
+HTTPBodyField = Literal["content", "text", "message", "body", "description"]
+HTTPImageField = Literal["none", "image", "file", "attachment"]
 
 
 class NotificationFieldView(BaseModel):
@@ -52,6 +56,9 @@ class HTTPNotificationView(BaseModel):
     available: bool
     url: NotificationFieldView
     method: NotificationFieldView
+    title_field: NotificationFieldView
+    body_field: NotificationFieldView
+    image_field: NotificationFieldView
     headers: NotificationFieldView
     header_names: list[str] = Field(default_factory=list)
     timeout_seconds: NotificationFieldView
@@ -91,6 +98,11 @@ class HTTPNotificationUpdate(BaseModel):
     notify_assistant: bool | None = None
     url: str | None = Field(default=None, max_length=2048)
     method: Literal["POST", "PUT", "PATCH"] | None = None
+    title_field: HTTPTitleField | None = None
+    body_field: HTTPBodyField | None = Field(
+        default=None, validation_alias=AliasChoices("body_field", "text_field"),
+    )
+    image_field: HTTPImageField | None = None
     headers: dict[str, str] | None = None
     timeout_seconds: float | None = Field(default=None, ge=1, le=120)
 
