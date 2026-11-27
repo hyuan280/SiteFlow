@@ -192,7 +192,8 @@ git diff --check
 
 ## 文档
 
-- [使用指南](docs/usage.md)：配置站点、编排流程、执行与排查。
+- [使用指南](docs/usage.md)：配置站点、编排流程和查看运行结果。
+- [故障排除](docs/troubleshooting.md)：按现象查找部署、模型、车道、助手和通知问题的检查步骤。
 - [CookieCloud](docs/cookiecloud.md)：只读服务配置、PyCookieCloud 接入与 Cookie 域名排查。
 - [配置历史](docs/workflow-history.md)：版本快照、依赖追溯、恢复与并发保护。
 - [草稿校验](docs/workflow-drafts.md)：未保存配置的校验、继承解析与无写入预览接口。

@@ -277,32 +277,9 @@ configuration, **not remote inspection of Manager's actual environment**; an
 environment key set only on an external Manager cannot be reliably detected.
 Keep Manager/CDP private; the card does not embed or proxy Manager's Settings page.
 
-Saving hot-updates Manager without restarting it, but license checks and the
-initial browser download can take several minutes. Wait for completion; there is
-no automatic write retry. A timeout, canceled request or invalid response after a
-dispatched PUT can leave its result unknown while Manager continues working.
-Worker then retains a sticky uncertain-write guard: `license.editable=false`
-persists across GET refreshes, even if a tier/version appears healthy. Refreshing
-the card or reloading the page does not clear that guard or prove completion.
-
-First verify through private Manager status/logs that the original write and
-download have actually finished; do not share keys or raw provider responses.
-Then drain active tasks and wait for viewers to finish before restarting Worker
-to clear the guard. **Do not restart just to bypass an active download**, and do
-not resubmit a write until its result has been reconciled. With no environment
-change, use the matching deployment command below, then refresh the card and
-decide manually whether another save is needed:
-
-```bash
-# GHCR deployment, only after Manager completion and task/viewer drain
-docker compose restart worker
-# Source deployment: alternative
-docker compose -f ops/docker-compose.yml restart worker
-```
-
-If environment inputs changed, recreate `api worker browser` as described above
-instead. Older Manager versions that lack the settings API remain read-only in
-the card and require an explicit upgrade for this feature.
+A timed-out save can leave a write guard active while Manager is still working.
+See [license save troubleshooting](troubleshooting.md#保存许可证超时或结果未知).
+Managers without the settings API remain read-only in the card.
 
 ### Legacy Keyless Rollback
 

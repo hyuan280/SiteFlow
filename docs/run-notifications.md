@@ -127,17 +127,9 @@ described below.
 ## Investigation Evidence
 
 A source task's authentication-selector failure and a later live-browser failure
-are separate facts. `ready` does not guarantee page survival during later async
-Fetch interception. Safe diagnostics retain `browser_response_interception_failed`
-and `response_event` / `continue_response` / `fail_request`, not raw exceptions or
-secrets; failures still clean up fail closed without automatic retry or weaker
-request policy. Authenticated closed-session tombstones retain known causes or
-410 `browser_closed`; wrong tokens still receive generic 404, and the API maps
-Worker 404 to `browser_session_unavailable`. Cookie generation/import failures
-also retain static reasons. See [lifecycle diagnostics](ai-assistant.md#生命周期诊断).
-Without the precise production exception, do not claim unsupported CDP, a proxy
-requirement or a URL fault. Unavailable observation does not rule out CAPTCHA or
-site issues, and none of these diagnostics changes source status or delivery.
+are separate facts. Unavailable observation does not establish the cause of the
+source failure or change its status or notification delivery. See
+[browser lifecycle troubleshooting](troubleshooting.md#生命周期诊断).
 
 ## Takeover Eligibility
 

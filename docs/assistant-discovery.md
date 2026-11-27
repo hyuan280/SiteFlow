@@ -123,27 +123,7 @@ inspect 包含根节点，其 offset/total 相对于指定根的捕获子树；�
 
 ### 登录时序与误判
 
-以下是已有任务 329 的排查证据，不是本文更新时新发起的测试。该运行仍为 `trigger: "manual"`、`created_by: "admin"`，不能称为助手来源运行，也没有迁移其来源。相关站点 98 保持配置修订 **3**；用户当前要求修复实现，不是修改在线配置，本次文档更新不保存站点、不修改生产数据、不刷新页面或重跑任务。
-
-| 时间或步骤 | 已有证据及含义 |
-| --- | --- |
-| `06:57:42.875` | 日志记录登录凭据已提交；提交不等于成功元素已可见。 |
-| `06:57:52.940` | 旧实现已经等待约 10 秒，再按每个选择器首个匹配的可见性报告登录成功元素未出现；这是当时的成功证据检查失败，不证明服务端拒绝登录。 |
-| `06:57:53.130` | 失败截图已呈现可见的已登录页面；截图晚于失败判定，不是判定瞬间的 DOM 证据。 |
-| `settle_home` | 目标与当前 URL 相同，跳过 GET 导航，日志耗时约 `0.008` 秒；不能把它说成刷新首页后才登录成功。 |
-| 后续等待与信号 | 再等待 3 秒后，`is_logged_in` 的选择器存在性检查命中；与提交步骤的可见性检查不同，且发生得更晚。 |
-
-**可见性、存在性和检查时间必须分开解释。** 旧成功检查只看每个选择器的首个匹配是否可见；首个隐藏、后续可见是可能的误判模式，SPA 成功元素晚于等待期限渲染也是可能模式。稍后的信号只需元素存在，隐藏元素也能命中，因此它与较早的可见性失败并不矛盾。现有证据没有当时的 `match_count` / `visible_count`，无法确定任务 329 究竟属于隐藏首匹配、延迟渲染还是其他情况；不能补写数量或把某一种解释当成定论。截图能显示已登录的视觉状态，**不能证明具体 DOM 属性、选择器匹配身份、匹配顺序或可见性判定值**。
-
-`auth.form_login.success_wait_seconds` 保持默认 **10 秒**，可配置为严格整数 **1-120**；任务 329 已经等待约 10 秒，不能把延长到 30 秒当作根因修复。`timeout_seconds` 必须另行覆盖凭据/秘密查询、定位、填写、点击和成功等待，不会因调高等待而自动延长；助手单步及轮次的外层上限仍有效。站点 98 的步骤总超时已为 **120 秒**，本次不修改在线配置，也不改动其他功能同名字段的默认值。
-
-提交后只读轮询主页面及**可见同源 iframe**，所有祖先 iframe 须可见且同源，`about:blank` / `srcdoc` 沿父链继承来源，不使用凭据 `trusted_urls` 扩大成功证据范围。检查各成功候选的多个匹配，任一匹配可见即可，不限于 `.first`；每轮最多 100 个 frame、每个选择器在各 frame 中最多 100 个匹配，共用一个等待期限。隐藏节点单独存在不通过；`success_selector` 留空只表示已提交、不证明登录成功。等待不自动刷新、导航或再次提交，超时也不是可安全重试的证明。这处理隐藏首匹配等通用模式，但不能证明任务 329 的具体 DOM 原因，亦不代表已在生产复测成功。
-
-超时后的诊断原因和匹配/可见计数是**超时后才采集的有界只读样本**，不是整个等待期间的历史记录，也不是同一瞬间的原子快照；采样间 DOM 仍可能变化。选择器索引按原步骤 `config.success_selector` 的配置索引（从 0 开始）核对，不是某个 DOM 匹配的序号；诊断不回显选择器值、表单值或凭据。即使稍后采样已有可见匹配，也不能证明等待期限内曾可见；采样仍无匹配也不能证明之前从未出现。
-
-诊断 `reason` 中，`visible_after_timeout` 表示采样时已有可见匹配，`matches_hidden` 表示采样读到匹配但未读到可见匹配，`selector_missing` 表示本次采样范围未读到匹配；`frame_scope_excluded` 表示有 frame 因范围限制被排除，`read_incomplete` 表示读取错误或达到边界，不能按完整零匹配解释。`selectors[].selector_index` 对应原配置索引；结合 `checked_count`、`read_errors`、`truncated` / `evidence_truncated` 和各 frame 的 `scope` / 静态错误码核对，不把这些原因当作任务 329 的历史根因或新的登录成功判定。
-
-工作流信号的 `include_selectors` / `exclude_selectors` 默认只判断存在，隐藏元素也可能命中；需要可见证据时可显式写 Playwright `:visible`，不自动追加、不改写已有配置或新增数据库列。`include_texts` / `exclude_texts` 则读取页面标题和各 frame 的 body `innerText`，通常不含 body 内隐藏后代文本，不应套用选择器存在性语义。助手 CSS 检查工具不支持 Playwright `:visible`，核验时使用其 `match_count` / `visible_count`，不能把零可见当作零匹配。
+提交后未等到成功元素，但截图显示已登录时，请区分提交时间、可见性判断及后续状态。诊断字段与历史时间线见[登录时序与误判](troubleshooting.md#登录时序与误判)。
 
 ### 图像与恢复
 
@@ -195,9 +175,7 @@ UI「截图预览」仅在当前页面内存展示、关闭清除，不调用模
 
 公共跨源导航/重定向尚未获批时，`browser_trust_required` 返回脱敏后的完整 `source_url`、`target_url`、各自的 `source_url_redacted` / `target_url_redacted`、`redacted_parameters`，以及 `target_origin` 和精确 origin 转义得到的 `trusted_url_pattern`。这只是被阻止的候选，不是已访问或已获信任的证据。工具卡片展示完整地址、待核对来源和脱敏警告；只有用户明确要求变更观察来源后，助手才可用 `update_site_config` 的 `observation.trusted_origins` 提交完整目标列表供精确审核，不再推荐旧 purpose 或打开目标设置。批准恢复原调用、替换来源列表、更新目标修订并释放旧浏览器，不自动导航、执行或重试；模型可在同轮安全重开/导航，不需另发消息。Worker 仍校验公共 DNS；额外来源不能用于单步执行、凭据发送或同源站点绑定，也不写入站点 `trusted_urls`，单步后仍保留原始同源限制。完整边界见 [完整 URL 与可信来源](ai-assistant.md#完整-url-与可信来源)。
 
-打开失败时，记录工具结果中安全的 `code`、`lane_key`、`reason`：`browser_dns_denied` 指向 Worker 本地 DNS/公共地址检查，**不证明需要代理**；`browser_url_denied` / `browser_redirect_denied` 指向 URL 或重定向边界，`browser_lane_busy` / `browser_lane_unavailable` 指向所选交互车道；不要输出原始异常或秘密。读取遇到 DNS/策略失败而 `page_retained: true` 时，没有证据但保留页面，不是登录结果；含已知秘密的当前 URL 拒绝仍致命，不套用保留页面例外。此前生产环境两次打开返回 403，尚无证据归因于通用车道停止，也没有生产复测证明已完整修复；没有具体原因时应说明未知，详见 [API 与排查](ai-assistant.md#api-与排查)。
-
-`ready` 不是页面后续存活保证：异步 Fetch 失败可随后关闭页面，保留 `browser_response_interception_failed` 与 `stage: response_event / continue_response / fail_request`，仍 fail closed 清理、不自动重试或放宽请求策略。正确令牌在有界关闭 tombstone 内可查已知原因或 410 `browser_closed`，错误令牌仍为通用 404；API 将 Worker 404 映射为 `browser_session_unavailable`，不再一律报 `browser_worker_error`。Cookie generation/导入失败也保留静态原因，详见[生命周期诊断](ai-assistant.md#生命周期诊断)。来源任务认证选择器失败与实时浏览器失效须分开；精确生产异常未记录时，不能宣称 CDP 不支持、代理/URL 故障，也不能因观察不可用就排除验证码或站点问题。
+浏览器打开或观察失败时，按返回的安全 `code`、`lane_key`、`reason` 检查，见[智能助手故障排除](troubleshooting.md#智能助手中断权限或浏览器失败)。
 
 ## 单步工具示例
 

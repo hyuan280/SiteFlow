@@ -169,18 +169,7 @@ docker compose -f ops/docker-compose.yml up -d --force-recreate api worker brows
 
 ### 保存超时或结果未知
 
-Manager 热保存涉及许可证检查及首次下载，可能需要数分钟，请等待结果；不会自动重试写入。PUT 已发送后超时、取消或响应异常，不代表 Manager 已停止处理。此时 Worker 会保留结果未知的粘性保护，`license.editable=false` 在 GET 刷新或重载页面后仍然有效；即使看到有效 tier/版本，也不证明原保存已完成。
-
-先通过私有 Manager 状态/日志确认原写入和下载**实际完成**，不要公开密钥或服务商原始响应；随后等待任务排空、viewer 结束，再重启 Worker 清除保护。**不要为绕过仍在进行的下载而重启，不要在结果核实前重复提交，也没有自动重试。** 未修改环境变量时按实际部署方式二选一：
-
-```bash
-# 仅在 Manager 完成且任务/viewer 排空之后，GHCR 部署
-docker compose restart worker
-# 源码部署，二选一
-docker compose -f ops/docker-compose.yml restart worker
-```
-
-重启后刷新卡片，核实状态再决定是否需要手动保存；如果同时改了环境变量，必须改用前述重建 `api worker browser` 命令。
+许可证保存超时后可能仍在下载，页面刷新不会解除写保护。按[许可证保存排查](troubleshooting.md#保存许可证超时或结果未知)核实后恢复。
 
 ### 从新版切回默认 Keyless 镜像
 
@@ -267,10 +256,4 @@ docker compose -f ops/docker-compose.yml down -v
 
 ## 9. 故障排查
 
-- `worker` 不可达：检查 `api` 内 `SITEFLOW_WORKER_URL`、Compose 网络、worker 健康状态。
-- 车道启动失败：检查内部令牌是否一致、许可证是否有效、tier 是否为 `keyless` / `free` / `pro`，以及下载网络/缓存。`none` 或未知 tier 会被拒绝；HTTP 402/403 提示许可证问题（包括可能的并发 profile 容量），不要通过粘贴服务商正文或密钥排查。
-- 容量等待超时或手动启动快速失败：检查活跃任务、viewer、任务页、隔离清理及 Worker profile 上限；先让自有工作安全结束，关闭不再需要的 viewer，不强停其他任务或删除 profile。`idle_stop_seconds=0` 不会阻止安全压力停机，但 viewer 会阻止。自动调度预检失败不创建 Run，后续轮询可再检查；不要因此自动重跑已执行业务步骤。
-- 许可证卡片保存结果未知或刷新后仍不可编辑：按[保存超时或结果未知](#保存超时或结果未知)核实 Manager 完成，再排空任务/viewer 并重启 Worker；刷新不会解除保护，不要绕过下载或自动重试。
-- VNC 黑屏：检查 `.vnc-screen` 容器、noVNC target 是否为 div、WebSocket 是否建立。
-- 代理站点失败：确认 `SITEFLOW_PROXY_URL`；系统不会回退直连。
-- 2FAuth 失败：确认 URL/Token，或查看 `docs/verification.md` 的绑定说明。
+Worker、车道、容量、VNC 或集成服务异常时，请按[故障排除](troubleshooting.md)中的对应现象检查。

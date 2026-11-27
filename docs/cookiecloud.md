@@ -40,10 +40,4 @@ URL 填设置页显示的完整端点，无需拼接 `/get/<uuid>`。PyCookieClo
 
 ## 常见问题
 
-| 现象 | 检查方式 |
-| --- | --- |
-| `get_decrypted_data()` 返回 `None` | 先用 `cloud.check_connection()` 检查端点是否可达。预检失败时检查服务器 ID、反向代理和部署版本；预检成功后仍失败，核对 UUID 和加密密码。 |
-| `get_decrypted_data()` 返回 `{}` | 拉取和解密已成功。检查是否选中了站点、站点是否已保存 Cookie，以及 Cookie 是否过期。 |
-| 数据有内容，但 `get_cookie_str()` 或 `get_cookie_value()` 返回 `None` | 这两个方法按域名键精确查询。`.example.com`、`example.com` 和 `www.example.com` 是不同的键；先看 `data` 的域名列表，再传入实际的键。 |
-
-例如，`cf_clearance` 若保存于 `.example.com`，就不会出现在 `www.example.com` 分组里。SiteFlow 不按名称过滤 `cf_clearance`；若所有分组都没有它，可核对站点设置中的 Cookie 更新时间与任务日志。Worker 在任务成功后按站点配置地址和初始 Cookie 提供的地址范围导出；只属于跳转后其他子域的 Cookie 可能不在该范围内。
+拉取失败、返回空数据或取不到指定域名的 Cookie 时，见 [CookieCloud 故障排查](troubleshooting.md#cookiecloud-拉取或域名匹配失败)。

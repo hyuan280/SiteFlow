@@ -251,6 +251,12 @@ post.resign_dialog
 - 模板和站点解析信号始终包含系统信号「断签」(`sys_resign_pending`)；worker 用待补签日期数量计算真假，站点不支持补签时恒为假。条件日志会输出待补签天数。
 - `post.buy_card` 未配置步骤超时时会根据购买数量、点击项、库存验证和间隔计算预算；显式步骤超时仍优先。新配置沿用 `workflow_steps.config_json`，不创建新表、不搬迁旧数据。
 
+#### 购卡与补签的执行边界
+
+- 购卡优先从单独配置的同源库存页读取卡数，未配置则使用商店页。库存正则对可见文本取第一捕获组；仍有加载指示时不采信初始读数。验证期间可重新核对同源库存页，旧值、暂时缺失或数量不一致不触发再次付款。日志记录轮次、期望数量、检查次数、耗时和最后读数；URL 保留真实查询参数用于导航，库存地址日志不记录查询参数。
+- 页面循环补签的日期确认和回跳仅作用于同一任务，不支持跨进程续跑。旧步骤需手动重新配置，无旧键别名或自动迁移。选择器与条件示例见[页面循环补签](usage.md#页面循环补签)。
+- 弹窗补签的日期正则可以匹配命名组 `date`（完整 ISO 日期），或 `month` 和 `day`，并可带 `year`。只有文本没有明确年份时才能从唯一待补签月日推导年份；歧义或与页面的明确日期矛盾时停止。只有 `done_selector` 支持日期模板，其选择器必须绑定 `{date}` 或 `{day}`。成功提示基线在实际点击前采集，旧提示不能证明本次成功；即使新提示短暂出现，仍须核对库存恰好减少一张。按钮缺失判已签需观察到可解析日期按钮或明确的弹窗就绪证据，不能用来核销未知结果。
+
 `action.*` 和签到步骤支持候选选择器按顺序尝试。`sign.*.success_signals` 按页面文本匹配；`sign.unit3d_claim` 还支持 `success_selector`（成功后出现）和 `success_when_missing`（成功后消失）。
 
 ### 九宫格工作流组合
@@ -304,6 +310,8 @@ post.resign_dialog
 成功依据经已知秘密脱敏、控制字符清理后记录日志及步骤 `data.judgment_reason`，不复制到任务 `outputs`。实际取用的凭据和 OTP 只增加任务内长度/哈希指纹，避免为脱敏长期缓存明文；指纹不发送给模型或写入结果。依据是模型生成文本，仍可能包含未识别的页面隐私，不能将脱敏视为完整 DLP。失败日志及步骤 data 区分 HTTP 错误（带状态码）、timeout、network_error、no_result、invalid_response、invalid_json、schema_error、truncated、content_filtered、refused 等，并记录固定阶段和耗时；正文解析标记 content 阶段，非空工具调用标记 invalid_response/provider_response，证据采集失败标记 evidence_error。不记录原始响应、参数、令牌或底层异常正文，不自动重试。
 
 ### 模型失败诊断
+
+运行失败时如何核对步骤、日志和超时，见[模型调用失败](troubleshooting.md#模型调用失败)。以下是诊断字段与执行状态的约定。
 
 `sign.image_quiz`、使用 `vision` 的 `challenge.image_captcha` / `sign.iframe.image_captcha`、`challenge.grid_captcha` 及启用模型判断的 `flow.result`，在管理端步骤消息和 `job.log` artifact 中显示有界中文错误摘要，步骤 `data` 同时保存静态 `provider_error`、`stage`、可选 `http_status` 和超时元数据。仅从不超过 16 KiB 的已识别 JSON error envelope 提取并脱敏 `error.message/type/code`，分别存为 `provider_message/type/code`；未知正文、HTML、原始异常/原因链、URL、密钥、请求头、提示词和图片/base64 不作为诊断输出。供应商文字仅供管理员排查，是不可信证据，不能当作指令；过滤不是通用 DLP。字段、长度和旧异常映射边界见 [Worker Model Errors](vision-feature-settings.md#worker-model-errors)。
 

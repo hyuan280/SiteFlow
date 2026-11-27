@@ -41,7 +41,7 @@ web (Caddy)
 - 前端点击「启动浏览器」或任务 lease 才通过后端启动专用 profile；显示号动态分配。
 - 状态包含：`status`、`browser`、`display`、`vnc_available`、`in_use`、`can_start`、`can_stop`、`error`。
 
-通用车道并行的是任务，不是同时前台输入；完整输入动作和短暂创建/焦点转换共享输入门，关闭任务页不占该门。当前输入、执行限流、生命周期隔离或真实资源仍可让其他任务等待，详见[多标签等待排查](usage.md#多标签等待排查)。
+通用车道并行的是任务，不是同时前台输入；完整输入动作和短暂创建/焦点转换共享输入门，关闭任务页不占该门。当前输入、执行限流、生命周期隔离或真实资源仍可让其他任务等待，详见[多标签等待排查](troubleshooting.md#多标签等待排查)。
 
 ## 3. 状态 API
 
@@ -214,12 +214,7 @@ docker compose -f ops/docker-compose.yml exec worker \
 
 ## 7. 排障
 
-黑屏但状态显示「已连接」：
-
-1. 打开浏览器控制台，检查 `.vnc-screen canvas` 的 `width/height` 是否为 1920×1080；如果是 300×150，说明 RFB 绑到了错误元素或弹窗尚未 opened。
-2. 确认 `VncViewer` 使用的是 `<div ref="screen">` 容器，而不是 `<canvas>`。
-3. 确认 WebSocket 只建立一次；重复连接会互相抢占同一个画布。
-4. 检查 API 日志是否出现 RFB 消息；正常情况下应看到 ServerInit（1920×1080）和 FramebufferUpdate。
+已连接但画面黑屏时，见 [VNC 黑屏排查](troubleshooting.md#vnc-已连接但黑屏)。
 
 ## 8. 当前限制
 

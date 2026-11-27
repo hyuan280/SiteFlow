@@ -397,7 +397,7 @@ Worker 管理端新增的[模型失败详情](vision-feature-settings.md#worker-
 
 工作流信号的包含/排除选择器默认是**存在性**检查，隐藏节点也可命中，与登录成功元素的**可见性**要求不同；需要可见证据时，可在工作流的 Playwright 选择器中显式使用 `:visible`，系统不自动追加或改写已保存配置，不新增信号数据库列或改变默认语义。这不适用于文本规则：`include_texts` / `exclude_texts` 匹配页面标题和各 frame 的 body `innerText`，通常不包含 body 内隐藏后代的文本，不是读取全部隐藏节点的 `textContent`。助手 `browser_check_selector` 仅支持 CSS，不能直接传 Playwright `:visible`，应检查其返回的 `visible_count`。
 
-稍后 `is_logged_in` 为 true 不能倒推提交步骤当时已满足可见成功条件。排查须区分首个匹配隐藏、后续匹配可见、延迟渲染及两种检查语义，不能只加长等待。超时后返回的原因及匹配/可见计数是**超时后的有界只读采样**，不是等待期间的历史证据或原子快照；页面可能在各项采样间变化。选择器索引对应原步骤 `config.success_selector` 的配置索引（从 0 开始），不是 DOM 匹配序号；按原配置核对，不回显选择器值、表单值或凭据。通用修复不是特定网站适配或实际生产认证验证。任务 329 的时间线、同 URL 导航跳过及截图证据限制见 [登录时序与误判](assistant-discovery.md#登录时序与误判)。
+稍后 `is_logged_in` 为 true 不能倒推提交步骤当时已满足可见成功条件。排查须区分首个匹配隐藏、后续匹配可见、延迟渲染及两种检查语义，不能只加长等待。超时后返回的原因及匹配/可见计数是**超时后的有界只读采样**，不是等待期间的历史证据或原子快照；页面可能在各项采样间变化。选择器索引对应原步骤 `config.success_selector` 的配置索引（从 0 开始），不是 DOM 匹配序号；按原配置核对，不回显选择器值、表单值或凭据。通用修复不是特定网站适配或实际生产认证验证。任务 329 的时间线、同 URL 导航跳过及截图证据限制见 [登录时序与误判](troubleshooting.md#登录时序与误判)。
 
 ### 凭据与请求边界
 
@@ -814,35 +814,11 @@ Worker 的 `/assistant-browser/*` 是 API 持有能力令牌调用的内部接�
 
 请求错误返回静态 `detail.code`，例如 `generation_disabled` / `model_unavailable` / `assistant_settings_invalid`（503）、`assistant_busy`（429）、`session_running` / `assistant_settings_conflict`（409）、`session_not_found`（404）、`invalid_request` / `secret_input`（422）、`request_limit`（413）、`request_timeout`（408）；登录和 CSRF 保留 401/403。已接受的后台轮次失败通常写入系统消息，例如 `[provider_timeout]`、`[provider_network]`、`[invalid_response:truncated]`、`[context_limit]`，不是把 202 改成错误响应。
 
-遇到中断先「刷新会话」核对状态和工具结果，再决定是否发送新消息；这不是刷新网站或重试步骤。`browser_reopen_required` 需请模型重新打开，`target_confirmation_required` 需让助手发起目标交互并由用户在 UI 确认；`browser_trust_required` 需核对完整 URL 与 `target_origin`，只有用户明确要求变更来源后才用 `update_site_config` 审核完整观察来源列表，不主动扩权或换通道绕过。`redacted_url_not_usable` 表示脱敏证据不能当作工作配置。持续 `browser_unavailable` 应检查配套 Worker 版本、交互车道占用、代理及 Worker 本地 DNS。`credential_binding_changed` 需重新核对绑定；`operation_already_used` 不可复用 ID，精确重试用原 ID 的 `retry_step`。`outcome_uncertain` 保留未知来源事实，当前非 post 单步按类别策略；`retry_authorization_required` 应核对当前宿主工具范围与绑定，不因旧文字声称必需人工审批。`auth_budget_exhausted` 等待真实新用户轮次，不换目标/浏览器重置。`screenshot_consent_required` 需独立图像同意，`model_vision_required` 需支持视觉的本轮配置，不能据此推断登录失败。不要粘贴凭据排障；已知 Key 检测不是通用 DLP，请自行审核请求、DOM、链接和输出。
-
-浏览器打开失败的工具结果返回安全的 `code`、`lane_key` 和 `reason`，例如 `code: "browser_unavailable"`、`lane_key: "proxy_interaction"`、`reason: "browser_dns_denied"`。按实际返回值排查，不把 Worker 原始异常、响应正文、凭据或未净化 URL 发送给模型：
-
-| `reason` | 排查含义 |
-| --- | --- |
-| `browser_dns_denied` | Worker 本地 DNS 解析失败或解析结果不符合公共地址限制；代理车道也受此限制，不证明需要代理。读取失败若 `page_retained: true` 则无证据但保留页面，不是登录失败结论 |
-| `browser_credential_endpoint_not_approved`（旧结果） | 旧端点策略诊断，不是缺少站点 ID、Bitwarden 故障或需网站专用适配；当前实现不要求逐表单批准 POST action |
-| `browser_url_denied` / `browser_redirect_denied` | URL 或导航/重定向违反公共地址、原始源执行等边界；不要绕过限制。可供用户确认的公共跨源候选另以 `browser_trust_required` 返回 |
-| `browser_lane_busy` | 所选交互车道占用或获取容量超时；核对该车道，不是通用车道 |
-| `browser_lane_unavailable` | 所选车道租约、启动或浏览器上下文不可用；检查该车道及 Worker 配套版本 |
-| `browser_access_denied` | Worker 返回 403，但未提供可识别的更具体安全原因；不能据此断言 DNS、代理或车道停止 |
-| `browser_response_interception_failed` | CDP Fetch 响应拦截处理失败；仅保留静态阶段 `response_event`、`continue_response` 或 `fail_request`，不包含原始异常或秘密 |
-| `browser_session_unavailable` | API 收到 Worker 404 的安全归一化原因，不再笼统归为 `browser_worker_error`；不是重启、代理或 URL 策略故障的证据 |
-| `browser_closed` / `browser_session_expired` | 已关闭或租约到期；不证明之前的网站操作失败或没有副作用 |
-| `browser_observation_unavailable` | 本次观察不可用，不等于页面没有登录表单、验证码或站点问题 |
-| `browser_cookies_invalid` / `browser_cookie_import_failed` | 私有 Cookie 种子校验/导入失败的静态原因；不要把 Cookie 原文交给模型排查 |
+会话中断、权限提示及 Worker 浏览器错误，按[智能助手故障排除](troubleshooting.md#智能助手中断权限或浏览器失败)处理。
 
 ### 生命周期诊断
 
-`browser_open` 或轮询返回 `ready` 只证明当时就绪，不保证页面在后续异步响应拦截期间仍存活。Fetch 失败仍 **fail closed**：隔离并清理本会话页面、CDP 和租约，撤销 ready 状态，不自动重试，也不放宽请求方法、同源、URL/DNS 或授权策略。安全结果保留 `browser_response_interception_failed` 及上述阶段；不记录或回传原始 CDP 异常、响应头/正文、Cookie、令牌或未净化 URL。
-
-关闭后，在 Worker 保留的有界 tombstone 窗口内，仍先验证能力令牌：正确令牌可取得已知静态关闭原因，未记录具体原因时返回 410 `browser_closed`；错误令牌仍只返回通用 404，不泄露关闭原因。tombstone 过期后不保证原因仍可查。API 将 Worker 404 归一化为 `browser_session_unavailable`，并只透传允许的静态原因/拦截阶段，不把未知响应正文当诊断。
-
-来源任务的认证选择器失败，与接管期间实时浏览器失效是两件事，应分别说明证据。若生产现场的精确异常未记录，只能报告原因未知；不能由通用 worker 错误、会话消失或拦截阶段断言 CDP 不支持、需要代理或 URL 有错。无法观察也不能据此排除验证码或站点自身问题。发现流程中的使用方式见[URL 证据与跨源确认](assistant-discovery.md#url-证据与跨源确认)。
-
-此前生产环境观察到两次 `browser_open` 返回 403；没有证据表明由 `general` 停止导致，具体根因尚未确认。明确交互车道及增加安全诊断不等于已经完整修复该生产问题，也不能把离线测试通过当作生产复测成功。缺少具体原因时应明确原因未知，保留安全诊断供排查。
-
-Cookie 清除是上述重开建议的例外：`clear_bound_site_cookies` 返回 `browser_reopen_required` 时只说明缺少 READY 原始绑定浏览器，不自动 `browser_open`。`cookie_binding_changed` 需重新核对显式绑定，不能改用同主机其他站点；`cookie_restore_unavailable` 不能通过把原始 Cookie 交给模型解决。generation 握手失败现在保留安全的 `reason`、`lane_key` 和 `stage: "cookie_restore"`，握手失败不解密 Cookie；私有导入的 `browser_cookies_invalid` / `browser_cookie_import_failed` 也保留静态原因，而非一律丢失为通用 worker 错误。清除后的部分/未知结果及同 ID 重放按[绑定站点 Cookie](#绑定站点-cookie)处理，不套用 `retry_step`。
+浏览器就绪不保证后续页面仍可用。静态关闭原因、Cookie 恢复错误及生命周期诊断见[故障排除](troubleshooting.md#生命周期诊断)。
 
 新增测试包含**真实 JS/Chromium 本地 fixtures**：隐式 GET 表单由 JS fetch POST 到不同的原始同源路径、原生 POST、查询编码保留、凭据 GET 泄露阻断、可信观察源跨源 POST 拒绝、PUT/DELETE 拒绝、截图遮罩和刷新不重提 POST。它们验证通用机制，不是网站专用补丁，也**没有验证实际 Fengchao 网站登录**、真实凭据或端到端签到。相关测试见 `backend/tests/test_assistant_js_login.py`、`test_assistant_browser_recovery.py`、`test_assistant_recovery_integration.py`、`test_assistant_retry.py`、`test_assistant_login_recovery.py` 和 `frontend/tests/assistant-recovery.mjs`；本地缺少 Chromium 时相应测试可跳过，不能把 skip 当作实测成功。
 

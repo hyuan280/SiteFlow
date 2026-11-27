@@ -24,7 +24,7 @@ Use the isolated [demo](../plugins/examples/demo/README.md) and
 database or real credentials. Tests skipped for missing optional dependencies
 are not evidence that those integrations passed.
 
-For 2FAuth, configure a service/account hint explicitly and confirm the matching
-account. Missing or ambiguous matches must not silently choose an account.
+For 2FAuth connection and account matching issues, see
+[service and integration troubleshooting](troubleshooting.md#服务部署与集成).
 Keep credentials, real service addresses, screenshots and machine-specific
 verification output out of version control.

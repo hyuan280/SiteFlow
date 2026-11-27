@@ -76,7 +76,7 @@ siteflow_domain, summary
 
 原任务邮件正文按邮件通道所选格式发送为 `text/plain` 或 `text/html`，标题作为 Subject。助手调查邮件始终使用独立的 `text/plain` 简报。
 
-常见端口：465 使用 SSL，587/25 使用 STARTTLS。部分云服务器或 ISP 会封锁 465/587，此时连接会超时；请确认网络出口允许 SMTP，或使用服务器提供的其他提交端口。
+常见端口：465 使用 SSL，587/25 使用 STARTTLS。连接超时或未送达时见[通知故障排查](troubleshooting.md#通知未送达与资源监控不可用)。
 
 ## HTTP 通知
 
