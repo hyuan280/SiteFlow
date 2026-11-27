@@ -58,13 +58,13 @@ services:
     restart: unless-stopped
 
   browser:
-    image: ${SITEFLOW_BROWSER_IMAGE:-cloakhq/cloakbrowser-manager@sha256:d3d9b86cfd94347f7356811cf8222c8bc48152725b053dc6ce2e68f541e00c14}
+    image: ${SITEFLOW_BROWSER_IMAGE:-cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989}
     environment:
       AUTH_TOKEN: "${SITEFLOW_BROWSER_TOKEN:?Set SITEFLOW_BROWSER_TOKEN}"
       CLOAKBROWSER_LICENSE_KEY: '${CLOAKBROWSER_LICENSE_KEY:-}'
       CLOAKBROWSER_AUTO_UPDATE: "false"
       CLOAKBROWSER_CACHE_DIR: /var/cache/cloakbrowser
-      CLOAKBROWSER_BINARY_PATH: '${CLOAKBROWSER_BINARY_PATH:-}'
+      CLOAKBROWSER_BINARY_PATH: '${CLOAKBROWSER_BINARY_PATH-/root/.cloakbrowser/chromium-146.0.7680.177.5/chrome}'
     volumes:
       - browser_data:/data
       - browser_cache:/var/cache/cloakbrowser

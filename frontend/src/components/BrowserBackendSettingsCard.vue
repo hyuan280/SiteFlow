@@ -40,6 +40,9 @@ const versionHint = computed(() => {
     return `此版本不高于参考版本 ${KEYLESS_VERSION_REFERENCE}，但当前 Manager 返回的许可等级优先：${tierLabels[value.license_tier]}，不能仅凭旧版本推断可无密钥运行。`;
   }
   if (!value.connected || value.error !== null) return "旧版本的许可模式尚未确认，请恢复 Manager 连接及正常状态后刷新。";
+  if (comparison === 0 && value.license_tier === "keyless") {
+    return `Manager 正在使用无密钥模式。Chromium ${KEYLESS_VERSION_REFERENCE} 是 SiteFlow 默认镜像自带的版本，无需配置 LICENSE_KEY。`;
+  }
   return `此版本不高于参考版本 ${KEYLESS_VERSION_REFERENCE}；仅支持旧版无密钥模式的 Manager 可能允许不使用密钥，实际以 Manager 支持和许可状态为准。`;
 });
 const tierLabel = computed(() => settings.value?.license_tier === "keyless" &&
@@ -189,8 +192,6 @@ onUnmounted(() => {
       </form>
       <p class="muted backend-hint">仅保存非空的新密钥，空白输入不会清除；清除须单独确认。Manager 首次下载浏览器可能需要数分钟，请等待结果；不会自动启动浏览器或重试任务。</p>
       <p class="muted backend-hint">免费版仅允许 1 个同时运行的 profile。同一车道的多个标签页共享 profile；不同车道使用不同 profile，容量不足时进入队列等待释放，不代表任务并发数可增加许可容量。</p>
-      <p class="muted backend-hint">profile 预算由部署环境 .env 中的 SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES 配置，默认 1，只接受整数 1..4；免费版硬上限始终为 1。此预算不是许可证权益，本页面不提供修改，接口也未返回当前实际配置值。</p>
-      <p class="muted backend-hint">修改后请按实际部署使用的 Compose 文件重建 worker：<code>docker compose up -d --force-recreate worker</code>，或 <code>docker compose -f ops/docker-compose.yml up -d --force-recreate worker</code>；仅 restart 不会加载新的环境配置。</p>
     </template>
   </el-card>
 </template>

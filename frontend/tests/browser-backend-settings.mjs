@@ -197,13 +197,7 @@ try {
   assert.match(lockedHtml, /免费版仅允许 1 个同时运行的 profile/);
   assert.match(lockedHtml, /多个标签页共享 profile/);
   assert.match(lockedHtml, /队列等待释放/);
-  assert.match(lockedHtml, /SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES/);
-  assert.match(lockedHtml, /部署环境 .env/);
-  assert.match(lockedHtml, /默认 1，只接受整数 1\.\.4/);
-  assert.match(lockedHtml, /免费版硬上限始终为 1/);
-  assert.match(lockedHtml, /接口也未返回当前实际配置值/);
-  assert.match(lockedHtml, /docker compose up -d --force-recreate worker/);
-  assert.match(lockedHtml, /docker compose -f ops\/docker-compose.yml up -d --force-recreate worker/);
+  assert.doesNotMatch(lockedHtml, /SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES|--force-recreate worker/);
   assert.doesNotMatch(lockedHtml, /不提供清除操作|可能超出免费许可容量/);
   const clearButton = html => [...html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)]
     .map(m => m[0]).find(button => button.includes("清除许可证"));

@@ -29,16 +29,14 @@ changing a URL alone does not make an arbitrary CDP server fully compatible.
 
 ## Manager Versions and Licensing
 
-Both Compose files default to the official image
-`cloakhq/cloakbrowser-manager@sha256:d3d9b86cfd94347f7356811cf8222c8bc48152725b053dc6ce2e68f541e00c14`;
-`SITEFLOW_BROWSER_IMAGE` can override it. The installed image was observed with
-wrapper 0.7.1 / Playwright 1.64.1. Upstream's v0.2.0 changelog requires a license
-even for the free tier and removes the bundled browser; v0.2.1 has also been
-released. The observed `/api/status` reported tier `none` and an empty binary
-version without a key, and the old bundled binary path did not exist. This is
-inspection evidence, not a successful operational test of the current image.
+Both Compose files default to the official keyless image
+`cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989`
+and its bundled Chromium `146.0.7680.177.5`. No license key is required for a
+fresh deployment using this default. Manager v0.2.0 and later require a license
+even for the free tier and do not bundle Chromium. To use one of these images,
+set `SITEFLOW_BROWSER_IMAGE` and explicitly set `CLOAKBROWSER_BINARY_PATH=`.
 
-Set `CLOAKBROWSER_LICENSE_KEY` to an upstream-issued free or paid license key.
+For a licensed image, set `CLOAKBROWSER_LICENSE_KEY` to an upstream-issued free or paid license key.
 Get a free key at https://cloakbrowser.dev/free. Set the variable in the deployment
 `.env`, or leave it empty/unset and use the
 [SiteFlow license card](#siteflow-license-card) to save a key in Manager.
@@ -62,33 +60,29 @@ A nonempty environment key takes precedence on Manager startup. Remove it from
 the deployment inputs (including any exported shell override) and recreate all
 three services before relying on Manager-saved settings. Hot updates apply to
 subsequent launches, not a promise to relicense live browsers.
-Without a valid key from either source the current browser cannot run; there is no keyless bypass for
-this image. The adapter accepts `keyless`, `free` and `pro` tiers without an exact
+Licensed images require a valid key from either source. The adapter accepts `keyless`, `free` and `pro` tiers without an exact
 binary-version gate, and rejects `none` or unknown tiers with static errors.
 Launch HTTP 402 is treated as profile-capacity rejection and HTTP 403 as license
 rejection, with static errors that do not expose the provider response body.
-API, CDP and VNC routes remain unchanged, but actual
-CDP, humanized input, desktop and VNC operation on this image remains unverified
-pending a valid license.
 
-The opt-in isolated `backend/tests/test_demo_e2e.py` fixture still defaults to the
-previous license-free image. To validate a current image, set
+The opt-in isolated `backend/tests/test_demo_e2e.py` fixture uses the same default
+keyless image. To validate a licensed image, set
 `SITEFLOW_DEMO_BROWSER_IMAGE` and a dedicated `SITEFLOW_DEMO_CLOAK_LICENSE_KEY`;
 `SITEFLOW_DEMO_BROWSER_BINARY_PATH` is optional and defaults empty for an override
 image. The key is forwarded privately to the disposable Manager, not reused from
 production. Never run `remote_browser_smoke.py` against the deployed Worker.
 
-The image digest pins Manager, **not** the separately downloaded browser.
+For licensed overrides, the image digest pins Manager, **not** the separately downloaded browser.
 `CLOAKBROWSER_AUTO_UPDATE=false` disables automatic updates, not the initial
 download or license/version checks. Both Compose files use the fixed browser-service
 environment `CLOAKBROWSER_CACHE_DIR=/var/cache/cloakbrowser` and mount
 `browser_cache:/var/cache/cloakbrowser`; this is internal Compose wiring, not a new
-deployment `.env` option. `CLOAKBROWSER_BINARY_PATH` stays empty by default so current
-images use that custom cache. `/root/.cloakbrowser` is left **unmounted** to preserve
-the old image's bundled binary path for an explicit legacy rollback.
+deployment `.env` option. An unset `CLOAKBROWSER_BINARY_PATH` selects the bundled
+keyless binary; an explicitly empty value lets a licensed image use the cache.
+`/root/.cloakbrowser` is left **unmounted** to preserve the default bundled binary.
 The health check allows ten minutes for the initial download before counting
 startup failures; a healthy Manager still does not prove a profile can launch.
-Do not set the old bundled path with the current image. The worker's independent
+Do not use the bundled path with an image that does not ship it. The worker's independent
 SDK `cloakbrowser==0.6.3` and `playwright==1.64.0` pins remain unchanged; they are
 not a claim that Manager's wrapper or downloaded browser has those versions.
 
@@ -308,21 +302,20 @@ docker compose -f ops/docker-compose.yml restart worker
 
 If environment inputs changed, recreate `api worker browser` as described above
 instead. Older Manager versions that lack the settings API remain read-only in
-the card and require an explicit upgrade for this feature; the legacy keyless
-rollback and current-image operational verification limits still apply.
+the card and require an explicit upgrade for this feature.
 
 ### Legacy Keyless Rollback
 
-The previously shipped image remains an explicit compatibility option. Set both
-variables together to use its bundled keyless Chromium 146.0.7680.177.5:
+To return from a licensed override to the Compose default, unset both
+`SITEFLOW_BROWSER_IMAGE` and `CLOAKBROWSER_BINARY_PATH` in `.env`, the shell, and
+any Compose overrides. The default is equivalent to:
 
 ```dotenv
 SITEFLOW_BROWSER_IMAGE=cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989
 CLOAKBROWSER_BINARY_PATH=/root/.cloakbrowser/chromium-146.0.7680.177.5/chrome
 ```
 
-That legacy image does not require `CLOAKBROWSER_LICENSE_KEY`; this does not
-remove the license requirement from current images. Before upgrading or rolling
+The default image does not require `CLOAKBROWSER_LICENSE_KEY`. Before upgrading or rolling
 back, stop jobs/viewers and back up `browser_data` plus `worker_data` (including
 `browser-profiles.json`) together, and preserve `browser_cache` separately.
 Browser profile/data downgrades are not guaranteed compatible; restoring the

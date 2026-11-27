@@ -3,7 +3,7 @@
 ## 1. 前置条件
 
 - Docker + Docker Compose。
-- 当前官方 CloakBrowser Manager 需要上游签发的许可证（免费版也需要），并需能完成首次浏览器下载及许可证/版本检查。没有 key 时不能启动浏览器，不提供绕过方式；旧 keyless 镜像仅作为显式回退选项。
+- Compose 默认使用自带 Chromium 的官方 CloakBrowser Manager keyless 镜像，新部署无需许可证。覆盖为新版 Manager 时，免费版也需要上游签发的许可证，并需能完成首次浏览器下载及许可证检查。
 - GHCR 镜像部署无需 Node.js；源码构建另需 Node.js 22/npm。
 - 可选：可达的 SOCKS5/HTTP(S) 代理、2FAuth 服务、Bitwarden 自托管保险库。
 - 图形验证码的 ddddocr 和 NexusPHP GD 5 模板识别已内置在 worker 镜像中，无需额外服务或配置；视觉模型方式需要配置大模型。
@@ -79,11 +79,20 @@ docker compose -f ops/docker-compose.yml ps
 
 ### Manager 镜像与兼容边界
 
-两份 Compose 默认使用 `cloakhq/cloakbrowser-manager@sha256:d3d9b86cfd94347f7356811cf8222c8bc48152725b053dc6ce2e68f541e00c14`，可用 `SITEFLOW_BROWSER_IMAGE` 覆盖。该 digest 只固定 Manager，不固定其独立下载的浏览器。`CLOAKBROWSER_AUTO_UPDATE=false` 保留，但不禁止首次下载、许可证或版本检查；两份 Compose 在 browser 内固定 `CLOAKBROWSER_CACHE_DIR=/var/cache/cloakbrowser`，挂载 `browser_cache:/var/cache/cloakbrowser`，不新增用户 `.env` 配置项。当前 `CLOAKBROWSER_BINARY_PATH` 默认为空，使用该自定义缓存；旧 bundled binary 路径在当前镜像中不存在。`/root/.cloakbrowser` 不挂载卷，保留显式回退时旧镜像自带的二进制路径。
+两份 Compose 默认固定为 `cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989`，使用随镜像附带的 keyless Chromium `146.0.7680.177.5`。不设置 `SITEFLOW_BROWSER_IMAGE` 和 `CLOAKBROWSER_BINARY_PATH` 即可使用这组默认值。`/root/.cloakbrowser` 不挂载卷，以保留镜像自带的二进制。
 
-首次下载期间健康检查提供 10 分钟启动宽限期，避免默认短时检查提前阻断 Worker 依赖；Manager 健康不等于许可证有效或 profile 已能启动。
+#### 使用其他 Manager 镜像
 
-已安装镜像观察到 wrapper 0.7.1 / Playwright 1.64.1；未提供许可证时 `/api/status` 为 tier `none`、二进制版本为空。上游 v0.2.0 起免费版也必须持有许可证且镜像不再附带浏览器，之后已有 v0.2.1 发布。这些是检查证据，不是当前镜像已成功运行的结论。API/CDP/VNC 路由未变；实际 CDP、humanized input、桌面与 VNC 仍待有效许可证验证。本次仅修改代码/配置/文档，不执行部署。
+如需使用不附带浏览器、要求许可证的新版 Manager，请同时覆盖镜像和二进制路径，例如：
+
+```dotenv
+SITEFLOW_BROWSER_IMAGE=cloakhq/cloakbrowser-manager@sha256:d3d9b86cfd94347f7356811cf8222c8bc48152725b053dc6ce2e68f541e00c14
+CLOAKBROWSER_BINARY_PATH=
+```
+
+显式空值让新版使用 `browser_cache:/var/cache/cloakbrowser`，再按[配置许可证](#配置许可证)填写上游签发的许可证。若所选镜像自带浏览器，则将该路径设为镜像实际提供的路径。镜像 digest 不固定单独下载的浏览器；`CLOAKBROWSER_AUTO_UPDATE=false` 不阻止首次下载或许可证检查。健康检查提供 10 分钟启动宽限期；Manager 健康不代表 profile 已可启动。
+
+已有部署切换镜像前，先等待任务和 viewer 结束并备份 `browser_data` 与 `worker_data`。使用当前部署的 Compose 文件执行 `docker compose pull browser`；本地构建部署加上 `-f ops/docker-compose.yml`。如果同时设置了许可证环境变量，按[配置许可证](#配置许可证)中的命令重建服务；仅调整镜像和二进制路径时，重建 `browser` 即可。
 
 Worker 保留 `cloakbrowser==0.6.3` / `playwright==1.64.0`，不按精确二进制版本拦截；接受 `keyless` / `free` / `pro`，静态拒绝 `none` 或未知 tier。启动时 HTTP 402 按 profile 容量拒绝处理，HTTP 403 按许可证拒绝处理，均使用静态提示，不透传服务商响应正文。
 
@@ -120,11 +129,20 @@ Worker 的 `SITEFLOW_BROWSER_MAX_ACTIVE_PROFILES` 只接受整数 `1..4`，默�
 
 原 `GET /browser/readiness` 仍仅为只读元数据，不启动浏览器，也不是启动成功证明或生产调度门禁。预检只预热首个浏览器，不持有租约或预留容量，随后仍可能与其他运行、助手或 viewer 竞争；成功不保证后续车道、连接或业务执行一定成功。业务步骤执行后，不因容量变化自动重放业务。详见[执行](execution.md#scheduled-browser-admission)及[浏览器后端](browser-backends.md#finite-profile-admission)。本次仅更新工作区文档/配置，不执行部署。
 
-修改 profile 上限后，应在任务与 viewer 排空后，用实际部署的 Compose 文件重建 Worker 以加载新环境（`restart` 不加载修改值）；这里不执行该操作。该 Worker 设置不替代许可证 ENV 变更时必须重建三个服务的规则。
+在部署使用的 `.env` 中修改 profile 预算；浏览器页面不提供修改入口，接口也不返回当前配置值。修改后等待任务及 viewer 结束，再按实际部署方式二选一重建 Worker。仅 `restart` 不会加载新的环境配置：
+
+```bash
+# GHCR 部署
+docker compose up -d --force-recreate worker
+# 源码部署
+docker compose -f ops/docker-compose.yml up -d --force-recreate worker
+```
+
+若同时修改许可证环境变量，按下节重建三个服务。
 
 ### 配置许可证
 
-从 https://cloakbrowser.dev/free 申请免费 key，或使用上游签发的付费 key，在部署使用的 `.env` 中配置：
+仅在选用要求许可证的 Manager 时需要配置。从 https://cloakbrowser.dev/free 申请免费 key，或使用上游签发的付费 key，在部署使用的 `.env` 中配置：
 
 ```dotenv
 CLOAKBROWSER_LICENSE_KEY=<your license key>
@@ -147,7 +165,7 @@ docker compose -f ops/docker-compose.yml up -d --force-recreate api worker brows
 
 卡片通过已认证的 `GET/PUT /api/v1/lanes/browser-settings`（PUT 另校验 CSRF）访问 API，再经带令牌的 Worker `/browser/settings` 访问 Manager。只转发 `license_key` 到 Manager `PUT /api/settings`，不改其他 Manager 设置；key 持久化在 `browser_data:/data`，API/Worker 不在数据库或 Worker 数据中重复保存。读取或保存不创建、修改、启动、停止或删除 profile，不改变任务/viewer 租约，也不自动启动浏览器或重跑任务；保存期间 Manager 可以验证授权并下载二进制。SiteFlow 不代理 Manager Settings 页面，不要直接对公网发布 Manager/CDP 端口。
 
-环境变量非空时卡片只读，Manager 启动时优先采用环境变量。若选择页面管理，应移除所有非空环境变量覆盖并重建 `api worker browser`。自定义外部 Manager 必须在 **API、Worker、Manager 三处配置相同的 key 环境变量**，或三处都留空/不设置以使用 Manager 保存值。服务商 API 无法报告环境变量来源；`env` 标签及锁定依据 API/Worker 本地配置，不是远程检查 Manager 的实际环境，无法可靠发现仅在外部 Manager 上设置的 ENV。热更新用于后续启动，不保证给已运行的浏览器重新授权。旧 Manager 缺少 settings API 时卡片只读，需明确升级才能使用该功能；不改变旧 keyless 回退与当前镜像待验证的兼容边界。
+环境变量非空时卡片只读，Manager 启动时优先采用环境变量。若选择页面管理，应移除所有非空环境变量覆盖并重建 `api worker browser`。自定义外部 Manager 必须在 **API、Worker、Manager 三处配置相同的 key 环境变量**，或三处都留空/不设置以使用 Manager 保存值。服务商 API 无法报告环境变量来源；`env` 标签及锁定依据 API/Worker 本地配置，不是远程检查 Manager 的实际环境，无法可靠发现仅在外部 Manager 上设置的 ENV。热更新用于后续启动，不保证给已运行的浏览器重新授权。缺少 settings API 的 Manager 在卡片中只读。
 
 ### 保存超时或结果未知
 
@@ -164,18 +182,13 @@ docker compose -f ops/docker-compose.yml restart worker
 
 重启后刷新卡片，核实状态再决定是否需要手动保存；如果同时改了环境变量，必须改用前述重建 `api worker browser` 命令。
 
-### 旧版 Keyless 回退
+### 从新版切回默认 Keyless 镜像
 
-仅在明确选择先前随附 keyless 浏览器的镜像时，同时配置以下两项；不能只把旧路径用于当前镜像：
-
-```dotenv
-SITEFLOW_BROWSER_IMAGE=cloakhq/cloakbrowser-manager@sha256:04b82e42fe74ec34352580da47b096695e6a8d08745f88e3f5fd821be5ebf989
-CLOAKBROWSER_BINARY_PATH=/root/.cloakbrowser/chromium-146.0.7680.177.5/chrome
-```
+删除 `.env`、shell 或 Compose 覆盖中的 `SITEFLOW_BROWSER_IMAGE` 与 `CLOAKBROWSER_BINARY_PATH`；二进制路径不要保留显式空值。按原有部署使用的 Compose 文件拉取 `browser`，再按[缓存挂载切换](#缓存挂载切换)中的命令重建。如同时移除许可证环境变量，按[配置许可证](#配置许可证)重建三个服务。
 
 该旧镜像无需许可证，不代表新镜像可以绕过许可证。升级/回退前先等待任务与 viewer 结束，成对备份 `browser_data` 和 `worker_data`（包含 `browser-profiles.json`），另行保留 `browser_cache`。浏览器 profile/数据不保证支持降级，必要时恢复匹配的升级前备份；移动缓存挂载并不解决数据降级兼容性。新布局中，显式旧 binary path 绕过 `/var/cache/cloakbrowser`，使用未挂载的镜像内路径，同一个缓存卷不会再遮蔽它；只有仍挂载 `/root/.cloakbrowser` 的旧 override 会继续遮蔽，应删除或调整该挂载，而不是换新缓存卷或删缓存。
 
-环境变量留空也不代表已恢复 keyless：Manager 在 `/data` 保存的 key/数据和 wrapper 的 `/var/cache/cloakbrowser/license.key` 仍可能影响结果，需明确核查两处。卡片清除只移除 Manager 保存值，不删除 wrapper 文件；不要为清除许可证而静默删除整个缓存。含密钥备份保持 `0600`，禁止在日志中输出 key。按上述缓存挂载切换步骤在任务/viewer 结束后重建 browser；同时改许可证 ENV 时重建三个服务。详见 [Browser Backends](browser-backends.md#legacy-keyless-rollback)。
+仅将许可证环境变量留空不会切换镜像。已有 Manager `/data` 与 wrapper 缓存中保存的许可证应一并核查；卡片清除只移除 Manager 保存值，不删除 wrapper 文件。不要为清除许可证而删除整个缓存。含密钥备份保持 `0600`，禁止在日志中输出 key。详见 [Browser Backends](browser-backends.md#legacy-keyless-rollback)。
 
 ## 4. 服务与端口
 

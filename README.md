@@ -46,7 +46,7 @@ SiteFlow 是一个站点自动化管理工具，当前主要用于 **PT 站点�
 
 ## 快速开始
 
-需要 Docker 和 Docker Compose。根目录 `docker-compose.yml` 使用 GHCR 发布镜像，无需在服务器安装 Node.js 或构建工具；浏览器由 Compose 直接拉取官方 CloakBrowser Manager 镜像，以 keyless 模式运行。
+使用仓库根目录的 `docker-compose.yml` 部署。只需 Docker 和 Docker Compose；服务镜像从 GHCR 拉取，无需在服务器安装 Node.js 或构建工具。浏览器默认使用官方 CloakBrowser Manager 的 keyless 镜像及其自带的 Chromium `146.0.7680.177.5`，无需设置 `CLOAKBROWSER_LICENSE_KEY`。`SITEFLOW_BROWSER_TOKEN` 用于保护内部 Manager 接口，仍需生成并填写。
 
 ```bash
 git clone https://github.com/hyuan280/SiteFlow.git
@@ -70,6 +70,8 @@ docker compose ps
 打开 **http://localhost:8088**。修改访问端口可在 `.env` 设置 `SITEFLOW_WEB_PORT`。
 
 首次部署前需确保所选版本已发布；私有 GHCR 镜像需要先登录。镜像版本、数据备份及 HTTPS 部署见 [部署与运维](docs/deployment.md) 和 [镜像发布](docs/releases.md)。
+
+如需使用要求许可证的新版 CloakBrowser Manager，见[使用其他 Manager 镜像](docs/deployment.md#使用其他-manager-镜像)。并发 profile 预算与 Worker 重建命令见[有限容量与调度预检](docs/deployment.md#有限容量与调度预检)。
 
 可选的 [Docker Socket 系统资源监控](docs/system-resources.md) 需单独启用，主 Compose 默认不挂载 socket；启用前请阅读权限风险说明。
 
@@ -164,9 +166,9 @@ docs/                  使用、配置、部署及开发文档
 docker-compose.yml     GHCR 镜像部署入口
 ```
 
-### 源码构建与镜像发布
+### 本地构建与镜像发布
 
-源码构建另需 Node.js 22+/npm，先按快速开始准备 `.env`：
+从源码本地构建时，使用 `ops/build.sh` 构建应用镜像，再通过 `ops/docker-compose.yml` 启动。浏览器仍默认使用同一官方 keyless 镜像。本地构建另需 Node.js 22+/npm，先按快速开始准备根目录的 `.env`：
 
 ```bash
 bash ops/build.sh
