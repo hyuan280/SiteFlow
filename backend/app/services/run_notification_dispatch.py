@@ -45,9 +45,9 @@ def _encrypt(crypto, key, payload):
     return crypto.encrypt(key, json.dumps(payload))
 
 
-def _targets_for_run(service, event):
+def _targets_for_run(service, event) -> list[DeliveryTarget]:
     return [
-        asdict(target) for target in service._targets()
+        target for target in service._targets()
         if target.enabled and service._accepts_run(target.channel, event)
     ]
 
@@ -148,10 +148,11 @@ def register_run_notification(db, settings, crypto, run_id):
     event = service._run_event(run_id, include_conclusions=False)
     service.apply_conclusions(event)
     service.annotate_assistant_pending(event, pending_job_ids)
+    targets = _targets_for_run(service, event)
     payload = {
         "event": event,
-        "message": service._render(event),
-        "targets": _targets_for_run(service, event),
+        "message": service.render_run_message(event, targets),
+        "targets": [asdict(target) for target in targets],
     }
     frozen = _encrypt(crypto, f"run-notification:{run_id}", payload)
     try:
@@ -262,10 +263,11 @@ class RunNotificationDispatcher:
         event = payload.get("event")
         if not isinstance(event, dict):
             raise ValueError("notification event missing")
-        if not isinstance(payload.get("message"), dict):
-            payload["message"] = service._render(event)
         if not isinstance(payload.get("targets"), list):
-            payload["targets"] = _targets_for_run(service, event)
+            payload["targets"] = [asdict(target) for target in _targets_for_run(service, event)]
+        if not isinstance(payload.get("message"), dict):
+            targets = [DeliveryTarget(**target) for target in payload["targets"]]
+            payload["message"] = service.render_run_message(event, targets)
         return payload
 
     async def start(self):

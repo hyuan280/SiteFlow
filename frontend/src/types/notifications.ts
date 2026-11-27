@@ -37,6 +37,7 @@ export interface EmailNotificationView {
   password: NotificationSecretView;
   from_address: NotificationFieldView;
   to_addresses: NotificationFieldView;
+  body_format: NotificationFieldView;
   error: string | null;
 }
 

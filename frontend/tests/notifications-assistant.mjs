@@ -31,6 +31,7 @@ const initialSettings = () => ({
     password: { configured: true, source: "db", editable: true, masked: "****abcd" },
     from_address: field("SiteFlow <siteflow@example.com>"),
     to_addresses: field(["one@example.com"]),
+    body_format: field("text"),
     error: null,
   },
   http: {
@@ -70,7 +71,10 @@ const mocks = {
       return { ok: true, message: "测试通知已发送", results: [] };
     }
     if (url === "/notifications/email" && method === "PUT") {
-      persisted = { ...persisted, email: { ...persisted.email, ...body } };
+      persisted = {
+        ...persisted,
+        email: { ...persisted.email, ...body, body_format: field(body.body_format) },
+      };
       return structuredClone(persisted);
     }
     if (url === "/notifications/http" && method === "PUT") {
@@ -154,9 +158,11 @@ try {
   assert.equal(ui.httpForm.notify_assistant, true);
 
   ui.emailForm.smtp_host = "draft.example.com";
+  ui.emailForm.body_format = "html";
   await ui.testChannel("email");
   assert.equal(requests.at(-1).url, "/notifications/email/test");
   assert.equal(requests.at(-1).body.smtp_host, "draft.example.com");
+  assert.equal(requests.at(-1).body.body_format, "html");
   assert.ok(!("password" in requests.at(-1).body));
   assert.equal(persisted.email.smtp_host.value, "smtp.example.com");
 

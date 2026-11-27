@@ -30,7 +30,6 @@ const testingHttp = ref(false);
 const layoutForm = reactive({
   title_template: "",
   body_template: "",
-  format: "text" as "text" | "html",
 });
 const emailForm = reactive({
   enabled: false,
@@ -44,6 +43,7 @@ const emailForm = reactive({
   password: "",
   from_address: "",
   to_addresses: "",
+  body_format: "text" as "text" | "html",
 });
 const httpForm = reactive({
   enabled: false,
@@ -216,7 +216,6 @@ function applySettings(data: NotificationSettings): void {
   settings.value = data;
   layoutForm.title_template = data.layout.title_template;
   layoutForm.body_template = data.layout.body_template;
-  layoutForm.format = data.layout.format;
 
   emailForm.enabled = data.email.enabled;
   emailForm.notify_success = data.email.notify_success;
@@ -232,6 +231,7 @@ function applySettings(data: NotificationSettings): void {
   emailForm.password = "";
   emailForm.from_address = fieldString(data.email.from_address);
   emailForm.to_addresses = fieldList(data.email.to_addresses).join(", ");
+  emailForm.body_format = data.email.body_format.value === "html" ? "html" : "text";
 
   httpForm.enabled = data.http.enabled;
   httpForm.notify_success = data.http.notify_success;
@@ -287,7 +287,6 @@ async function saveLayout(): Promise<void> {
         body: JSON.stringify({
           title_template: layoutForm.title_template,
           body_template: layoutForm.body_template,
-          format: layoutForm.format,
         }),
       }),
     );
@@ -323,6 +322,7 @@ function emailPayload(): Record<string, unknown> {
   if (email.password.editable && emailForm.password) payload.password = emailForm.password;
   if (email.from_address.editable) payload.from_address = emailForm.from_address.trim();
   if (email.to_addresses.editable) payload.to_addresses = splitAddresses(emailForm.to_addresses);
+  if (email.body_format.editable) payload.body_format = emailForm.body_format;
   return payload;
 }
 
@@ -508,24 +508,12 @@ onMounted(() => {
                 :placeholder="layoutBodyPlaceholder"
               />
             </el-form-item>
-            <el-form-item label="正文格式">
-              <el-radio-group v-model="layoutForm.format">
-                <el-radio-button label="text">纯文本</el-radio-button>
-                <el-radio-button label="html">HTML</el-radio-button>
-              </el-radio-group>
-              <p class="muted field-hint">
-                邮件按所选格式发送；HTTP 通知附带正文和 format 字段。
-              </p>
-            </el-form-item>
           </el-form>
         </div>
         <div class="preview-box">
           <div class="preview-label">预览</div>
           <strong class="preview-title">{{ layoutPreviewTitle }}</strong>
           <pre class="preview-body">{{ layoutPreviewBody }}</pre>
-          <p v-if="layoutForm.format === 'html'" class="muted field-hint">
-            预览按原文显示；实际邮件会以 HTML 渲染。
-          </p>
         </div>
       </div>
 
@@ -781,6 +769,12 @@ onMounted(() => {
               <span v-if="settings?.email.to_addresses.error" class="error">
                 {{ settings.email.to_addresses.error }}
               </span>
+            </el-form-item>
+            <el-form-item label="正文格式">
+              <el-radio-group v-model="emailForm.body_format">
+                <el-radio-button value="text">纯文本</el-radio-button>
+                <el-radio-button value="html">HTML</el-radio-button>
+              </el-radio-group>
             </el-form-item>
           </el-form>
 

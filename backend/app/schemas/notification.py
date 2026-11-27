@@ -45,6 +45,7 @@ class EmailNotificationView(BaseModel):
     password: NotificationSecretView
     from_address: NotificationFieldView
     to_addresses: NotificationFieldView
+    body_format: NotificationFieldView
     error: str | None = None
 
 
@@ -74,7 +75,7 @@ class NotificationSettingsView(BaseModel):
 class NotificationLayoutUpdate(BaseModel):
     title_template: str = Field(min_length=1, max_length=200)
     body_template: str = Field(min_length=1, max_length=20000)
-    format: Literal["text", "html"]
+    format: Literal["text", "html"] | None = None
 
 
 class EmailNotificationUpdate(BaseModel):
@@ -89,6 +90,7 @@ class EmailNotificationUpdate(BaseModel):
     password: str | None = Field(default=None, max_length=2048)
     from_address: str | None = Field(default=None, max_length=320)
     to_addresses: list[str] | None = None
+    body_format: Literal["text", "html"] | None = None
 
 
 class HTTPNotificationUpdate(BaseModel):

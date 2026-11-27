@@ -431,6 +431,44 @@ def test_notification_tests_use_unsaved_config_without_persisting(client: TestCl
     assert client.get("/api/v1/notifications").json() == saved
 
 
+def test_email_body_format_does_not_change_http_rendering(client: TestClient, monkeypatch) -> None:
+    sent = {}
+
+    def send_email(self, target, message):
+        sent["email"] = message
+        return "email ok"
+
+    def send_http(self, target, message, event):
+        sent["http"] = message
+        return "http ok"
+
+    monkeypatch.setattr(NotificationService, "_send_email", send_email)
+    monkeypatch.setattr(NotificationService, "_send_http", send_http)
+    assert client.put("/api/v1/notifications/email", json=_email_payload()).status_code == 200
+    assert client.put("/api/v1/notifications/http", json=_http_payload()).status_code == 200
+    layout = {"title_template": "Run {{run_id}}", "body_template": "{{sites}}"}
+    response = client.put("/api/v1/notifications/layout", json={**layout, "format": "html"})
+    assert response.json()["email"]["body_format"]["value"] == "html"
+    response = client.put("/api/v1/notifications/layout", json=layout)
+    assert response.json()["email"]["body_format"]["value"] == "html"
+
+    assert client.post("/api/v1/notifications/email/test").json()["ok"]
+    assert client.post("/api/v1/notifications/http/test").json()["ok"]
+    assert sent["email"]["format"] == "html" and "<br>" in sent["email"]["body"]
+    assert sent["http"]["format"] == "text" and "\n" in sent["http"]["body"]
+
+    response = client.post("/api/v1/notifications/email/test", json={"body_format": "text"})
+    assert response.json()["ok"]
+    assert sent["email"]["format"] == "text"
+    response = client.get("/api/v1/notifications")
+    assert response.json()["email"]["body_format"]["value"] == "html"
+
+    response = client.put("/api/v1/notifications/email", json={"body_format": "text"})
+    assert response.json()["email"]["body_format"]["value"] == "text"
+    assert client.post("/api/v1/notifications/email/test").json()["ok"]
+    assert sent["email"]["format"] == "text"
+
+
 def test_html_layout_escapes_site_text(client: TestClient) -> None:
     response = client.put(
         "/api/v1/notifications/layout",

@@ -486,6 +486,8 @@ class NotificationService:
             "password": self._pick(env, db, "password")[0],
             "from_address": self._pick(env, db, "from_address")[0],
             "to_addresses": self._pick(env, db, "to_addresses")[0],
+            # Keep the previously selected layout format for existing email configurations.
+            "body_format": db.get("body_format") or self._layout()["format"],
         }
 
     def _http_values(self, db: dict[str, Any], env: dict[str, Any]) -> dict[str, Any]:
@@ -542,6 +544,7 @@ class NotificationService:
             ),
             from_address=field("from_address"),
             to_addresses=field("to_addresses"),
+            body_format=field("body_format"),
             error="；".join(dict.fromkeys(errors.values())) if errors else None,
         )
 
@@ -601,6 +604,7 @@ class NotificationService:
         error = self._layout_error(payload.title_template, payload.body_template)
         if error:
             raise NotificationValidationError(error)
+        legacy_format = payload.format or self._layout()["format"]
         row = self.session.get(AppSetting, LAYOUT_KEY)
         if row is None:
             row = AppSetting(key=LAYOUT_KEY)
@@ -609,7 +613,7 @@ class NotificationService:
             {
                 "title_template": payload.title_template,
                 "body_template": payload.body_template,
-                "format": payload.format,
+                "format": legacy_format,
             },
             ensure_ascii=False,
         )
@@ -628,7 +632,7 @@ class NotificationService:
                 normalized[field] = _text(value)
             elif field == "smtp_port":
                 normalized[field] = int(value) if value is not None else None
-            elif field == "security":
+            elif field in {"security", "body_format"}:
                 normalized[field] = _text(value)
             elif field == "username":
                 normalized[field] = _text(value)
@@ -949,8 +953,9 @@ class NotificationService:
             ],
         }
 
-    def _render(self, event: dict[str, Any]) -> dict[str, str]:
+    def _render(self, event: dict[str, Any], *, body_format: str | None = None) -> dict[str, str]:
         layout = self._layout()
+        body_format = body_format or layout["format"]
         raw_context = dict(event)
         raw_context["siteflow_domain"] = self.settings.siteflow_domain.strip()
         sites = event.get("sites", [])
@@ -976,7 +981,7 @@ class NotificationService:
             f"推迟 {event['deferred_count']}，"
             f"等待人工 {event['waiting_count']}"
         )
-        if layout["format"] == "html":
+        if body_format == "html":
             body_context = {
                 key: html.escape(str(value)) if not isinstance(value, list) else value
                 for key, value in raw_context.items()
@@ -999,8 +1004,19 @@ class NotificationService:
         return {
             "title": render(layout["title_template"], raw_context),
             "body": render(layout["body_template"], body_context),
-            "format": layout["format"],
+            "format": body_format,
         }
+
+    def render_run_message(
+        self, event: dict[str, Any], targets: list[DeliveryTarget],
+    ) -> dict[str, str]:
+        message = self._render(event, body_format="text")
+        if any(
+            target.channel == "email" and (target.values or {}).get("body_format") == "html"
+            for target in targets
+        ):
+            message["email_html_body"] = self._render(event, body_format="html")["body"]
+        return message
 
     # ── delivery ───────────────────────────────────────────────────────
 
@@ -1220,7 +1236,14 @@ class NotificationService:
                 continue
             try:
                 if target.channel == "email":
-                    detail = self._send_email(target, message)
+                    email_message = message
+                    if "email_html_body" in message:
+                        email_message = {
+                            "title": message["title"],
+                            "body": message["email_html_body"],
+                            "format": "html",
+                        }
+                    detail = self._send_email(target, email_message)
                 else:
                     detail = self._send_http(target, message, event)
             except NotificationDeliveryError as exc:
@@ -1251,8 +1274,9 @@ class NotificationService:
 
     def send_run(self, run_id: int) -> list[ChannelDeliveryResult]:
         event = self._run_event(run_id)
-        message = self._render(event)
-        return self._send(message, event, require_enabled=True, respect_filters=True)
+        targets = self._targets()
+        message = self.render_run_message(event, targets)
+        return self._send(message, event, require_enabled=True, respect_filters=True, targets=targets)
 
     def send_event(
         self, event: dict[str, Any], message: dict[str, str], *, targets: list[DeliveryTarget],
@@ -1277,8 +1301,10 @@ class NotificationService:
             targets = [self._email_target(overrides)]
         elif isinstance(payload, HTTPNotificationUpdate):
             targets = [self._http_target(self._normalize_http_updates(payload))]
+        if targets is None:
+            targets = self._targets(channel)
         event = self._sample_event()
-        message = self._render(event)
+        message = self.render_run_message(event, targets)
         results = self._send(message, event, channel=channel, require_enabled=False, targets=targets)
         if not results:
             return NotificationTestResult(
